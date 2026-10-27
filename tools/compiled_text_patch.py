@@ -18,7 +18,8 @@ import subprocess
 import translation_patch
 
 MAGIC = translation_patch.MAGIC
-# Observed opcodes of the 33 has_t compiled-script resources. Native operations
+# Observed opcodes of the has_t compiled-script resources, extended below by
+# three original-script-verified KanojoStep handlers. Native operations
 # have no inline operands; values are pushed separately. These are BS word
 # opcodes, not the compact BP byte opcodes of the PE64 interpreter.
 OBSERVED = set(int(word, 16) for word in """
@@ -28,6 +29,10 @@ OBSERVED = set(int(word, 16) for word in """
 164 166 169 16c 170 171 174 176 177 185 18a 191 194 195 19d 1a1 1a3 1ab 1e0 1f0
 200 204 208 20a 20d 20e 20f 210 226 2a0 2c0 2c3 2c6 2c8 2dc 2e0 2e1 2e2 2f1 2f8 2fd 448 449 450 451 469 4b0 4b8
 """.split())
+# Original KanojoStep sysprg.arc: scrctrl1B0E, scrsys0C4B, scrgrp10737.
+# These read stack arguments, never the inline-word helper scrctrl06A3.
+# Bounded original disassembly: ghproj/kanojostep_translation/.
+OBSERVED.update((0x34, 0x10B, 0x225))
 OPERANDS = {0: 1, 1: 1, 2: 1, 3: 1, 8: 1, 9: 1, 10: 1,
             0x17: 1, 0x19: 1, 0x3F: 1, 0x7F: 2}
 # Preserve complete tags, printf-style substitutions and control units exactly.
@@ -54,7 +59,7 @@ class Instruction:
 
 
 class CompiledScript:
-    def __init__(self, payload):
+    def __init__(self, payload, code_size=None):
         if not payload.startswith(MAGIC) or len(payload) < 36:
             raise ValueError("unsupported compiled-script header")
         self.payload = payload
@@ -62,7 +67,9 @@ class CompiledScript:
         if not 36 <= self.code_base <= len(payload):
             raise ValueError("compiled-script header is out of bounds")
         code = payload[self.code_base:]
-        cursor, limit = 0, len(code)
+        cursor, limit = 0, len(code) if code_size is None else code_size
+        if code_size is not None and (not 0 <= limit <= len(code) or limit % 4):
+            raise ValueError("invalid compiled instruction boundary")
         self.instructions = []
         references = []
         while cursor < limit:
@@ -176,6 +183,61 @@ class CompiledScript:
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("text operands overlap semantic roles")
         return sorted(records, key=lambda record: record["operand_offset"])
+
+
+def normalize_changed_strings(original, replacement, encoding, errors="strict", overrides=None):
+    """Convert translated operands without guessing encodings of original data.
+
+    Both streams must have the same typed instruction layout. Original strings,
+    including CP932 debug paths and internal keys, keep their bytes. Only string
+    operands changed by the supplied translation use the explicit source codec.
+    Append UTF-8 strings and relocate their typed pointers; do not shift code.
+    """
+    source, target = CompiledScript(original), CompiledScript(replacement)
+    if len(source.instructions) != len(target.instructions):
+        raise ValueError("translation instruction count differs from original")
+    output, strings, allowed = bytearray(replacement), {}, set()
+    report = {"source_encoding": encoding, "unchanged_operands": 0,
+              "converted_operands": 0, "override_operands": 0, "invalid_text_operands": []}
+    for before, after in zip(source.instructions, target.instructions):
+        if (before.offset, before.opcode) != (after.offset, after.opcode):
+            raise ValueError("translation instruction layout differs from original")
+        if after.opcode not in (3, 0x7F):
+            continue
+        raw = target.raw_string(after.operands[0])
+        override = (overrides or {}).get(digest(raw))
+        if override is not None:
+            encoded = override["text"].encode(override["encoding"])
+            report["override_operands"] += 1
+        elif raw == source.raw_string(before.operands[0]) or raw.isascii():
+            report["unchanged_operands"] += 1
+            continue
+        else:
+            try:
+                text = raw.decode(encoding)
+            except UnicodeDecodeError as error:
+                if errors != "replace":
+                    raise ValueError(f"invalid {encoding} text operand at {after.offset:#x}") from error
+                text = raw.decode(encoding, errors="replace")
+                report["invalid_text_operands"].append({"instruction_offset": after.offset,
+                                                       "source_sha256": digest(raw)})
+            encoded = text.encode("utf-8")
+        if b"\0" in encoded:
+            raise ValueError("text override contains NUL")
+        if encoded == raw:
+            continue
+        if encoded not in strings:
+            strings[encoded] = len(output) - target.code_base
+            output.extend(encoded + b"\0")
+        position = target.code_base + after.offset + 4
+        struct.pack_into("<I", output, position, strings[encoded])
+        allowed.update(range(position, position + 4))
+        report["converted_operands"] += 1
+    if any(output[index] != value for index, value in enumerate(replacement) if index not in allowed):
+        raise ValueError("text normalization changed bytes outside typed string pointers")
+    # Reparse the complete output: every relocated string and branch is checked.
+    CompiledScript(bytes(output), code_size=target.code_size)
+    return bytes(output), report
 
 
 def inventory(args):

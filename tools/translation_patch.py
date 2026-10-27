@@ -8,9 +8,9 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import re
 import struct
 import subprocess
+import sys
 import tempfile
 import zlib
 
@@ -18,60 +18,9 @@ MAGIC = b"BurikoCompiledScriptVer1.00\0"
 MAX_BYTES = 256 * 1024 * 1024
 
 
-def embedded_scripts(data):
-    if data[:2] != b"MZ" or len(data) < 64:
-        raise ValueError("not a PE executable")
-    pe = struct.unpack_from("<I", data, 60)[0]
-    if data[pe:pe + 4] != b"PE\0\0":
-        raise ValueError("invalid PE signature")
-    count = struct.unpack_from("<H", data, pe + 6)[0]
-    table = pe + 24 + struct.unpack_from("<H", data, pe + 20)[0]
-    results = []
-    for index in range(count):
-        section = table + index * 40
-        name = data[section:section + 8].rstrip(b"\0")
-        raw_size, raw_offset = struct.unpack_from("<II", data, section + 16)
-        if name != b".enigma1":
-            continue
-        if raw_offset + raw_size > len(data):
-            raise ValueError("truncated .enigma1 section")
-        blob = data[raw_offset:raw_offset + raw_size]
-        base = blob.find(MAGIC)
-        if base < 0:
-            raise ValueError("no uncompressed compiled-script data in .enigma1")
-        # Observed EVB directory record: UTF16LE terminated name, kind u24=2,
-        # size u64, three FILETIME values, attributes u32, flags u24,
-        # offset u64 and stored size u64. Only verified uncompressed files.
-        for match in re.finditer(rb"(?:[a-zA-Z0-9_]\x00){3,}\x00\x00", blob[:base]):
-            q = match.end()
-            if q + 58 > base or blob[q:q + 3] != b"\x02\x00\x00":
-                continue
-            size, offset, stored = [struct.unpack_from("<Q", blob, q + n)[0]
-                                    for n in (3, 42, 50)]
-            if size != stored or size == 0 or base + offset + size > len(blob):
-                continue
-            payload = blob[base + offset:base + offset + size]
-            if not payload.startswith(MAGIC):
-                continue
-            resource = match[0].decode("utf-16le").rstrip("\0").lower()
-            results.append({"resource": resource, "payload": payload,
-                            "exe_offset": raw_offset + base + offset,
-                            "directory_offset": raw_offset + match.start()})
-        if not results:
-            raise ValueError("unsupported Enigma directory/compression layout")
-        # Do not silently accept gaps or overlaps as a complete extraction.
-        ordered = sorted(results, key=lambda entry: entry["exe_offset"])
-        cursor = raw_offset + base
-        for entry in ordered:
-            if entry["exe_offset"] != cursor:
-                raise ValueError("embedded script data is not a contiguous verified run")
-            cursor += len(entry["payload"])
-    if not results:
-        raise ValueError("supported .enigma1 script container not found")
-    names = [entry["resource"] for entry in results]
-    if len(names) != len(set(names)):
-        raise ValueError("duplicate embedded script resource")
-    return results
+def embedded_scripts(data, metadata=None):
+    from enigma_vfs import compiled_scripts
+    return compiled_scripts(data, metadata)
 
 
 
@@ -202,6 +151,20 @@ def utf8_texts(payload):
 
 
 def extract(args):
+    overrides = {}
+    override_path = getattr(args, "text_overrides", None)
+    if override_path:
+        if not args.changed_text_encoding:
+            raise ValueError("--text-overrides requires --changed-text-encoding")
+        document = json.loads(override_path.read_text(encoding="utf-8"))
+        if document.get("format") != "BGI-TEXT-ENCODING-OVERRIDES-1":
+            raise ValueError("unsupported text override format")
+        for item in document["strings"]:
+            key = item["source_sha256"]
+            if len(key) != 64 or len(bytes.fromhex(key)) != 32 or key in overrides or item["encoding"] not in ("utf-8", "cp932") or "\0" in item["text"]:
+                raise ValueError("invalid/duplicate text override")
+            item["text"].encode(item["encoding"])
+            overrides[key] = item
     if args.command == "extract-cpk":
         data, key = args.cpk.read_bytes(), args.key.read_bytes()
         entries, omitted = cpk_scripts(data, key, args.openssl)
@@ -211,9 +174,10 @@ def extract(args):
                            "omitted_non_script": omitted}
     else:
         data = args.exe.read_bytes()
-        entries = embedded_scripts(data)
-        source_metadata = {"source_exe_sha256": hashlib.sha256(data).hexdigest(),
-                           "extraction": "verified-uncompressed-enigma-script-run"}
+        source_metadata = {"source_exe_sha256": hashlib.sha256(data).hexdigest()}
+        entries = embedded_scripts(data, source_metadata)
+    if override_path:
+        source_metadata["text_overrides_sha256"] = hashlib.sha256(override_path.read_bytes()).hexdigest()
     index = archive_index(args.game)
     if args.out.exists():
         raise ValueError("output directory exists; choose a new directory")
@@ -235,6 +199,14 @@ def extract(args):
             source = original.read_bytes()
             if not source.startswith(MAGIC):
                 raise ValueError("original is not a compiled script: " + entry["resource"])
+            if getattr(args, "changed_text_encoding", None):
+                from compiled_text_patch import normalize_changed_strings
+                entry["payload"], entry["text_conversion"] = normalize_changed_strings(
+                    source, entry["payload"], args.changed_text_encoding, args.text_errors, overrides)
+                invalid = entry["text_conversion"]["invalid_text_operands"]
+                if invalid:
+                    offsets = ",".join(hex(item["instruction_offset"]) for item in invalid)
+                    print(f"warning: TRANSLATION_TEXT_INVALID resource={entry['resource']} operands={offsets} action=replace", file=sys.stderr)
             entry["original_size"] = len(source)
             entry["original_sha256"] = hashlib.sha256(source).hexdigest()
             resource_file = entry["resource"] + ".bin"
@@ -275,6 +247,12 @@ def main():
     extraction.add_argument("--exe", type=Path, required=True)
     extraction.add_argument("--engine", type=Path, default=Path("build/bgiplayer"))
     extraction.add_argument("--out", type=Path, required=True)
+    extraction.add_argument("--changed-text-encoding", choices=("gbk", "cp932"),
+                            help="convert changed typed string operands to UTF-8, keeping unchanged original bytes")
+    extraction.add_argument("--text-errors", choices=("strict", "replace"), default="strict",
+                            help="invalid source text rejects by default; explicit replace records affected operands")
+    extraction.add_argument("--text-overrides", type=Path,
+                            help="explicit source-SHA256-bound text/encoding overrides, e.g. for legacy name templates")
     cpk = commands.add_parser("extract-cpk", help="CPK v2 compiled text scripts, requiring OpenSSL 3")
     cpk.add_argument("--game", type=Path, required=True)
     cpk.add_argument("--cpk", type=Path, required=True)
