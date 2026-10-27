@@ -12,6 +12,7 @@
 namespace bgiplayer {
 struct GpuPixelKernels::Impl {};
 PixelKernelResult GpuPixelKernels::affine(const AffinePixels&) { return {}; }
+PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::background_mask(const BackgroundMaskPixels&) { return {}; }
 GpuPixelKernels::GpuPixelKernels(bool) : impl_(std::make_unique<Impl>()) {}
 GpuPixelKernels::~GpuPixelKernels() = default;
@@ -102,6 +103,13 @@ PixelKernelResult compose_host_fast_background_mask(const BackgroundMaskPixels& 
     if(!fast_rendering_enabled() || !choose_gpu(pixels,1024U*768U))return {};
     auto result=backend(true).background_mask(p);
     return result.success?record("background_mask",result,pixels):result;
+}
+
+PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& p) {
+    const uint64_t pixels=uint64_t(p.destination.width)*p.destination.height;
+    if(!fast_rendering_enabled() || !choose_gpu(pixels,512U*512U))return {};
+    auto result=backend(true).layer_composite(p);
+    return result.success?record("layer_composite",result,pixels):result;
 }
 
 }

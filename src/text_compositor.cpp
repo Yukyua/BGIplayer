@@ -1,6 +1,7 @@
 #include "bgiplayer/vm.hpp"
 #include "bgiplayer/glyph_style.hpp"
 #include "bgiplayer/text_measure.hpp"
+#include "bgiplayer/gpu_pixel_kernels.hpp"
 #include <bit>
 #include <iostream>
 
@@ -645,7 +646,7 @@ bool VM::record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
     if (target == graphics_surfaces_.end() || input == graphics_surfaces_.end() ||
         !materialize_graphics_pixels(target->second) || !materialize_graphics_pixels(input->second)) return false;
     auto& output = target->second;
-    const auto& image = input->second;
+    auto& image = input->second;
     const int64_t left = std::max<int64_t>(x, 0);
     const int64_t top = std::max<int64_t>(y, 0);
     const int64_t right = std::min<int64_t>(static_cast<int64_t>(x) + image.width - 1, static_cast<int64_t>(output.width) - 1);
@@ -664,6 +665,19 @@ bool VM::record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
             result[entry >> 3U] = static_cast<uint8_t>(entry & 7U);
         return result;
     }();
+    if(left<=right && top<=bottom) {
+        const auto width=static_cast<uint32_t>(right-left+1),height=static_cast<uint32_t>(bottom-top+1);
+        const auto d0=static_cast<uint64_t>(top)*output.stride+static_cast<uint64_t>(left)*4U;
+        const auto s0=static_cast<uint64_t>(top-y)*image.stride+static_cast<uint64_t>(left-x)*4U;
+        if(d0<=UINT32_MAX && s0<=UINT32_MAX && compose_host_layer_composite({
+            {output.pixels,static_cast<uint32_t>(d0),output.stride,width,height,output.format,4},
+            {image.pixels,static_cast<uint32_t>(s0),image.stride,width,height,2,4},
+            reciprocal_corrections}).success) {
+            refresh_bgra_mirror(output);
+            if(debug_enabled())bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
+            display_dirty_=true;return true;
+        }
+    }
     for (int64_t row = top; row <= bottom; ++row) {
         for (int64_t column = left; column <= right; column += 2) {
             const uint32_t count = column < right ? 2U : 1U;

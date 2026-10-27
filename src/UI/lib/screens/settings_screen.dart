@@ -90,7 +90,7 @@ class SettingsScreen extends StatelessWidget {
           const ListTile(
               contentPadding: EdgeInsets.zero,
               title: Text('程序版本'),
-              trailing: Text('0.1.0+1')),
+              trailing: Text('0.11')),
         ]));
   }
 }

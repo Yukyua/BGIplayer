@@ -41,6 +41,10 @@ struct BackgroundMaskPixels {
     std::array<int32_t,256> factors;
     uint32_t shift;
 };
+struct LayerCompositePixels {
+    GlyphBitmapView destination, source; // equally sized, pre-clipped views
+    std::span<const uint8_t> reciprocal_corrections;
+};
 struct PixelKernelResult {
     bool success = false;
     bool used_gpu = false;
@@ -61,6 +65,7 @@ public:
     PixelKernelResult scaled_alpha(const ScaledAlphaPixels& pixels);
     PixelKernelResult crossfade(const CrossfadePixels& pixels);
     PixelKernelResult affine(const AffinePixels& pixels);
+    PixelKernelResult layer_composite(const LayerCompositePixels& pixels);
     PixelKernelResult background_mask(const BackgroundMaskPixels& pixels);
 private:
     struct Impl;
@@ -75,6 +80,7 @@ PixelKernelResult compose_host_sprite_crossfade(const CrossfadePixels& pixels);
 PixelKernelResult compose_host_fast_affine(const AffinePixels& pixels);
 // Fast-policy dispatch, but integer mask results retain exact CPU byte values.
 PixelKernelResult compose_host_fast_background_mask(const BackgroundMaskPixels& pixels);
+PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& pixels);
 struct HostPixelKernelStatistics { uint64_t calls=0, gpu_dispatches=0, cpu_calls=0, approximate_dispatches=0; };
 HostPixelKernelStatistics host_pixel_kernel_statistics();
 }

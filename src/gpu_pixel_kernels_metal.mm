@@ -155,15 +155,58 @@ kernel void background_mask(device uchar* dst [[buffer(0)]],
         dst[di+c]=uchar(clamp(old+floor_shift(delta*factor,p.shift),0,255));
     }
 }
+
+struct Layer { uint ds,ss,d0,s0,width,height,format; };
+kernel void layer_composite(device uchar* dst [[buffer(0)]], device const uchar* src [[buffer(1)]],
+    device const uchar* corrections [[buffer(2)]], constant Layer& p [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    uint x=tid.x*2u,y=tid.y;
+    if(x>=p.width || y>=p.height)return;
+    uint count=min(2u,p.width-x),si=p.s0+y*p.ss+x*4u,di=p.d0+y*p.ds+x*4u;
+    uint a=src[si+3u],b=count==2u?uint(src[si+7u]):0u;
+    if(count==2u && a==0u && b==0u)return;
+    if(count==2u && (p.format==1u?(a>=254u && b>=254u):(a==255u && b==255u))) {
+        for(uint c=0;c<8u;++c)dst[di+c]=src[si+c];return;
+    }
+    for(uint i=0;i<count;++i) {
+        uint source=si+i*4u,out=di+i*4u,alpha=src[source+3u];
+        if(p.format==1u) {
+            uint factor=alpha>>1u;
+            if(factor==127u) {
+                for(uint c=0;c<3u;++c)dst[out+c]=src[source+c];
+                if(count==1u)dst[out+3u]=0;
+            } else if(factor!=0u) {
+                for(uint c=0;c<3u;++c) {
+                    int old=dst[out+c];dst[out+c]=uchar(old+floor_shift((int(src[source+c])-old)*int(factor),7));
+                }
+            }
+        } else {
+            if(count==1u && alpha==0u)continue;
+            if(count==1u && alpha==255u) {
+                for(uint c=0;c<4u;++c)dst[out+c]=src[source+c];continue;
+            }
+            uint da=dst[out+3u],dc=da*(256u-alpha),total=alpha*256u+dc;
+            int sw=total==0u?0:int((alpha<<16u)/total);
+            int dw=total==0u?0:int((dc<<8u)/total);
+            if(count==2u) {
+                uint fix=corrections[alpha*256u+da];
+                if(fix==1u)--sw;else if(fix==2u)++sw;else if(fix==3u)--dw;else if(fix==4u)++dw;
+            }
+            for(uint c=0;c<3u;++c)
+                dst[out+c]=uchar((uint(int(src[source+c])*sw+int(dst[out+c])*dw)&65535u)>>8u);
+            dst[out+3u]=uchar(total>>8u);
+        }
+    }
+}
 )MSL";
 }
 struct GpuPixelKernels::Impl {
     id<MTLDevice> device=nil;
     id<MTLCommandQueue> queue=nil;
-    id<MTLComputePipelineState> pipeline=nil,crossfade_pipeline=nil,affine_pipeline=nil,mask_pipeline=nil;
+    id<MTLComputePipelineState> pipeline=nil,crossfade_pipeline=nil,affine_pipeline=nil,mask_pipeline=nil,layer_pipeline=nil;
     id<MTLBuffer> destination=nil,source=nil,second=nil;
     ~Impl() {
-        [source release];[second release];[destination release];[pipeline release];[crossfade_pipeline release];[affine_pipeline release];[mask_pipeline release];[queue release];[device release];
+        [source release];[second release];[destination release];[pipeline release];[crossfade_pipeline release];[affine_pipeline release];[mask_pipeline release];[layer_pipeline release];[queue release];[device release];
     }
 };
 GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>()) {
@@ -185,6 +228,9 @@ GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>())
         [function release];
         function=[library newFunctionWithName:@"background_mask"];
         impl_->mask_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
+        [function release];
+        function=[library newFunctionWithName:@"layer_composite"];
+        impl_->layer_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
         [function release];[library release];
         if(impl_->pipeline && impl_->crossfade_pipeline)impl_->queue=[impl_->device newCommandQueue];
     }
@@ -396,6 +442,59 @@ PixelKernelResult GpuPixelKernels::background_mask(const BackgroundMaskPixels& p
         [encoder setBytes:args length:sizeof(args) atIndex:3];
         [encoder setBytes:p.factors.data() length:sizeof(p.factors) atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(p.right-p.left,p.bottom-p.top,1)
+            threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        [encoder endEncoding];[command commit];[command waitUntilCompleted];
+        if(timing)result.wait_ns=elapsed(wait);
+        if([command status]!=MTLCommandBufferStatusCompleted)return result;
+        const auto download=timing?Clock::now():Clock::time_point{};
+        std::memcpy(p.destination.pixels.data(),[impl_->destination contents],p.destination.pixels.size());
+        if(timing){result.download_ns=elapsed(download);result.total_ns=elapsed(start);}
+        result.success=true;result.used_gpu=true;return result;
+    }
+}
+
+PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels& p) {
+    PixelKernelResult result;
+    const bool timing=debug_enabled();const auto start=timing?Clock::now():Clock::time_point{};
+    const auto valid=[](const GlyphBitmapView& v,uint32_t format,uint32_t bpp) {
+        return v.format==format && v.bytes_per_pixel==bpp && v.width && v.height &&
+            v.pixels.size()<=UINT32_MAX && v.stride>=uint64_t(v.width)*bpp &&
+            uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*bpp<=v.pixels.size();
+    };
+    const auto overlaps=[](std::span<uint8_t> a,std::span<uint8_t> b) {
+        const uintptr_t x=reinterpret_cast<uintptr_t>(a.data()),y=reinterpret_cast<uintptr_t>(b.data());
+        return x<=y?y-x<a.size():x-y<b.size();
+    };
+    if(!available() || !impl_->layer_pipeline ||
+        !valid(p.destination,p.destination.format,4) || !valid(p.source,2,4) ||
+        (p.destination.format!=1 && p.destination.format!=2) ||
+        p.destination.width!=p.source.width || p.destination.height!=p.source.height ||
+        p.reciprocal_corrections.size()!=65536 ||
+        overlaps(p.destination.pixels,p.source.pixels))return result;
+    @autoreleasepool {
+        const auto upload=timing?Clock::now():Clock::time_point{};
+        const auto ensure=[&](id<MTLBuffer>& b,size_t size) {
+            if(b && [b length]>=size)return true;
+            [b release];b=[impl_->device newBufferWithLength:size options:MTLResourceStorageModeShared];return b!=nil;
+        };
+        if(!ensure(impl_->destination,p.destination.pixels.size()) ||
+            !ensure(impl_->source,p.source.pixels.size()) || !ensure(impl_->second,p.reciprocal_corrections.size()))return result;
+        std::memcpy([impl_->destination contents],p.destination.pixels.data(),p.destination.pixels.size());
+        std::memcpy([impl_->source contents],p.source.pixels.data(),p.source.pixels.size());
+        std::memcpy([impl_->second contents],p.reciprocal_corrections.data(),p.reciprocal_corrections.size());
+        if(timing)result.upload_ns=elapsed(upload);
+        const auto wait=timing?Clock::now():Clock::time_point{};
+        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+        if(!command || !encoder)return result;
+        const uint32_t args[]={p.destination.stride,p.source.stride,p.destination.byte_offset,
+            p.source.byte_offset,p.destination.width,p.destination.height,p.destination.format};
+        [encoder setComputePipelineState:impl_->layer_pipeline];
+        [encoder setBuffer:impl_->destination offset:0 atIndex:0];
+        [encoder setBuffer:impl_->source offset:0 atIndex:1];
+        [encoder setBuffer:impl_->second offset:0 atIndex:2];
+        [encoder setBytes:args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake((p.destination.width+1U)/2U,p.destination.height,1)
             threadsPerThreadgroup:MTLSizeMake(16,16,1)];
         [encoder endEncoding];[command commit];[command waitUntilCompleted];
         if(timing)result.wait_ns=elapsed(wait);
