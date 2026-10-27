@@ -1,0 +1,22 @@
+name: bgi_ui_demo
+description: Desktop game library and SDL2 engine launcher for BGIplayer.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  file_selector: ^1.1.0
+  path: ^1.9.1
+  path_provider: ^2.1.5
+
+dev_dependencies:
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/default_game_icon.png

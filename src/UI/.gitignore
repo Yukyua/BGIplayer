@@ -1,0 +1,26 @@
+.dart_tool/
+.packages
+build/
+
+# Self-contained toolchain for this demo (ignored, not source).
+.flutter-sdk/
+.flutter-home/
+.pub-cache/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+.idea/
+.vscode/
+android/.gradle/
+android/local.properties
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/ephemeral/
+macos/Pods/
+
+.DS_Store
+macos/Flutter/ephemeral/
+macos/Runner.xcworkspace/xcuserdata/
+macos/Runner.xcodeproj/xcuserdata/
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/

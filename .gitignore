@@ -1,0 +1,16 @@
+/build/
+/logs/
+*.o
+*.d
+*.dSYM/
+.DS_Store
+__pycache__/
+*.pyc
+*.snapshot
+*.snapshot.tmp
+/ghproj/
+/docs/
+/tests/
+/test/
+/skills/
+/AGENTS.md

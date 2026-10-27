@@ -1,0 +1,9 @@
+BGI_NATIVE_FLAVOR = device
+BGI_NATIVE_FLAVOR[sdk=iphonesimulator*] = simulator
+BGI_ROOT = $(SRCROOT)/../../..
+BGI_PREFIX = $(BGI_ROOT)/build/ios-native/$(BGI_NATIVE_FLAVOR)/prefix
+HEADER_SEARCH_PATHS = $(inherited) $(BGI_ROOT)/include $(BGI_ROOT)/build/ios-native/sources/SDL2-2.32.10/include $(BGI_PREFIX)/include $(BGI_PREFIX)/include/freetype2
+LIBRARY_SEARCH_PATHS = $(inherited) $(BGI_PREFIX)/lib
+CLANG_CXX_LANGUAGE_STANDARD = c++20
+OTHER_LDFLAGS = $(inherited) -lbgiplayer -lSDL2 -lavformat -lavcodec -lavutil -lswresample -lswscale -lfreetype -lz -liconv -lbz2 -framework UIKit -framework Foundation -framework CoreText -framework CoreFoundation -framework Metal -framework QuartzCore -framework AudioToolbox -framework AVFoundation -framework GameController -framework CoreMotion -framework CoreGraphics -framework OpenGLES -framework CoreHaptics -framework CoreMedia -framework VideoToolbox
+ARCHS = arm64
