@@ -166,40 +166,82 @@ std::optional<std::string> engine_identifier_from_pe(std::span<const uint8_t> da
     }
     if(result)return result;
     // Relocated PE32 builds retain the Sys0 dispatch-table ABI. Identify the
-    // E8 entry through the real byte dispatcher, not a string/file-name guess.
-    // Yubisaki FD2: dispatcher 00498AA1, table 00502418, E8 004982A0.
-    for(size_t at=3;at+22<=data.size();++at) {
-        constexpr std::array<uint8_t,6> dispatch{0x0f,0xb6,0xc8,0x8b,0x04,0x8d};
-        if(!std::equal(dispatch.begin(),dispatch.end(),data.begin()+static_cast<std::ptrdiff_t>(at-3)))continue;
-        if(data[at+7]!=0x85 || data[at+8]!=0xc0 || data[at+9]!=0x74 ||
-           data[at+11]!=0x56 || data[at+12]!=0xff || data[at+13]!=0xd0)continue;
-        const uint32_t table=read_u32(data,at+3);
+    // E8 entry through the byte dispatcher, not a string/file-name guess.
+    // Yubisaki FD2: 00498AA1 / table00502418; older compiler KanojoStep:
+    // 00491B4E / table00509300, using EAX index and ECX function pointer.
+    for(size_t at=0;at+17<=data.size();++at) {
+        constexpr std::array<uint8_t,6> modern_dispatch{0x0f,0xb6,0xc8,0x8b,0x04,0x8d};
+        constexpr std::array<uint8_t,6> old_dispatch{0x0f,0xb6,0xc0,0x8b,0x0c,0x85};
+        const auto current=data.subspan(at);
+        const bool modern=std::equal(modern_dispatch.begin(),modern_dispatch.end(),current.begin());
+        const bool older=std::equal(old_dispatch.begin(),old_dispatch.end(),current.begin());
+        if(!modern && !older)continue;
+        if(modern) {
+            if(current[10]!=0x85 || current[11]!=0xc0 || current[12]!=0x74 ||
+               current[14]!=0x56 || current[15]!=0xff || current[16]!=0xd0)continue;
+        } else {
+            // JNE skips the error arm and reaches push thread; call ECX.
+            if(current[10]!=0x85 || current[11]!=0xc9 || current[12]!=0x75)continue;
+            const size_t target=14U+current[13];
+            if(target+3>current.size() || current[target]!=0x56 ||
+               current[target+1]!=0xff || current[target+2]!=0xd1)continue;
+        }
+        const uint32_t table=read_u32(current,6);
         if(table>UINT32_MAX-0xe8U*4U)continue;
         const auto slot=image.at(table+0xe8U*4U,4);if(slot.empty())continue;
         const uint32_t wrapper=read_u32(slot,0);
         const auto code=image.at(wrapper,29);if(code.empty())continue;
         constexpr std::array<uint8_t,7> prefix{0x55,0x8b,0xec,0x8b,0x4d,0x08,0xe8};
+        if(!std::equal(prefix.begin(),prefix.end(),code.begin()))continue;
+        const uint32_t reader=wrapper+11+read_u32(code,7);
+        const auto read_code=image.at(reader,17);if(read_code.empty())continue;
+        // Both verified reader ABIs pop one operand and resolve its VM pointer.
+        const bool modern_reader=read_code[0]==0x51 && read_code[1]==0xe8 &&
+            read_code[6]==0x8b && read_code[7]==0xd1 && read_code[8]==0x8b &&
+            read_code[9]==0xc8 && read_code[10]==0xe8 &&
+            read_code[15]==0x59 && read_code[16]==0xc3;
+        const bool old_reader=read_code[0]==0x51 && read_code[1]==0xe8 &&
+            read_code[6]==0x8b && read_code[7]==0xd0 && read_code[8]==0xe8 &&
+            read_code[13]==0x83 && read_code[14]==0xc4 && read_code[15]==4 && read_code[16]==0xc3;
+        if(!modern_reader && !old_reader)continue;
+        uint32_t literal=0;uint32_t limit=128;
         constexpr std::array<uint8_t,7> suffix{0x83,0xc4,0x08,0x33,0xc0,0x5d,0xc3};
-        if(!std::equal(prefix.begin(),prefix.end(),code.begin()) || code[11]!=0x68 ||
-           code[16]!=0x50 || code[17]!=0xe8 ||
-           !std::equal(suffix.begin(),suffix.end(),code.begin()+22))continue;
-        const uint32_t reader=wrapper+11+read_u32(code,7),copy=wrapper+22+read_u32(code,18);
-        const auto read_code=image.at(reader,17);
-        if(read_code.empty() || image.at(copy,1).empty())continue;
-        // Pop thread operand, resolve VM pointer, return it; shared by all
-        // three verified PE32 binaries. Reject calls into the middle of code.
-        if(read_code[0]!=0x51 || read_code[1]!=0xe8 || read_code[6]!=0x8b ||
-           read_code[7]!=0xd1 || read_code[8]!=0x8b || read_code[9]!=0xc8 ||
-           read_code[10]!=0xe8 || read_code[15]!=0x59 || read_code[16]!=0xc3)continue;
-        std::string identifier;const uint32_t literal=read_u32(code,12);
-        for(uint32_t i=0;i<128;++i) {
-            if(literal>UINT32_MAX-i){identifier.clear();break;}
+        if(code[11]==0x68 && code[16]==0x50 && code[17]==0xe8 &&
+           std::equal(suffix.begin(),suffix.end(),code.begin()+22)) {
+            const uint32_t copy=wrapper+22+read_u32(code,18);
+            if(image.at(copy,1).empty())continue;
+            literal=read_u32(code,12);
+        } else {
+            // 004912B0: compiler-inlined constant copy, DWORD+DWORD+WORD+BYTE.
+            // Check every source address and destination offset before reading
+            // the literal. This remains relocation/name independent.
+            const auto copy=image.at(wrapper,52);if(copy.empty() || !old_reader)continue;
+            constexpr std::array<uint8_t,52> pattern{
+                0x55,0x8b,0xec,0x8b,0x4d,8,0xe8,0,0,0,0,
+                0x8b,0x0d,0,0,0,0,0x89,0x08,
+                0x8b,0x15,0,0,0,0,0x89,0x50,4,
+                0x66,0x8b,0x0d,0,0,0,0,0x66,0x89,0x48,8,
+                0x8a,0x15,0,0,0,0,0x88,0x50,10,0x33,0xc0,0x5d,0xc3};
+            bool matches=true;
+            for(size_t index=11;index<pattern.size();++index) {
+                if((index>=13 && index<17) || (index>=21 && index<25) ||
+                   (index>=31 && index<35) || (index>=41 && index<45))continue;
+                if(copy[index]!=pattern[index]){matches=false;break;}
+            }
+            if(!matches)continue;
+            literal=read_u32(copy,13);limit=11;
+            if(literal>UINT32_MAX-10U || read_u32(copy,21)!=literal+4U ||
+               read_u32(copy,31)!=literal+8U || read_u32(copy,41)!=literal+10U)continue;
+        }
+        std::string identifier;bool terminated=false;
+        for(uint32_t i=0;i<limit;++i) {
+            if(literal>UINT32_MAX-i)break;
             const auto byte=image.at(literal+i,1);
-            if(byte.empty() || (byte[0]!=0 && (byte[0]<0x20 || byte[0]>0x7e))){identifier.clear();break;}
-            if(byte[0]==0)break;
+            if(byte.empty() || (byte[0]!=0 && (byte[0]<0x20 || byte[0]>0x7e)))break;
+            if(byte[0]==0){terminated=true;break;}
             identifier.push_back(static_cast<char>(byte[0]));
         }
-        if(identifier.empty() || identifier.size()==128)continue;
+        if(identifier.empty() || !terminated)continue;
         if(result && *result!=identifier)throw Error("conflicting engine identifier wrappers");
         result=std::move(identifier);
     }
