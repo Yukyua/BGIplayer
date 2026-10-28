@@ -14,6 +14,7 @@ constexpr std::string_view header = "elapsed_ms,source,button,action,x,y";
 const char* source_name(ClickSource source) {
     switch (source) {
         case ClickSource::Mouse: return "mouse";
+        case ClickSource::Touch: return "touch";
         case ClickSource::Injected: return "injected";
         case ClickSource::Replay: return "replay";
     }
@@ -69,7 +70,7 @@ ClickInput::ClickInput(VM& vm, bool trace,
             const bool valid = split(line, fields) &&
                 number(fields[0], event.elapsed_ms) && number(fields[4], event.x) &&
                 number(fields[5], event.y) &&
-                (fields[1] == "mouse" || fields[1] == "injected" || fields[1] == "replay");
+                (fields[1] == "mouse" || fields[1] == "injected" || fields[1] == "replay" || fields[1] == "touch");
             if (!valid) throw Error("invalid click replay row " + std::to_string(line_number));
             if (fields[2] == "none" && fields[3] == "move") event.descriptor = 0;
             else if (fields[2] == "none" && fields[3] == "position") event.descriptor = 3;

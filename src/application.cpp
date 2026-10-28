@@ -5,6 +5,7 @@
 // Complete definition units for application.cpp.
 #include "bgiplayer/application.hpp"
 #include "bgiplayer/click_input.hpp"
+#include "bgiplayer/mobile_touch_input.hpp"
 #include "bgiplayer/keyboard_input.hpp"
 #include "bgiplayer/host_text_edit_bridge.hpp"
 #include "bgiplayer/sdl_window_mode.hpp"

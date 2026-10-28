@@ -9,7 +9,7 @@
 namespace bgiplayer {
 class VM;
 
-enum class ClickSource { Mouse, Injected, Replay };
+enum class ClickSource { Mouse, Injected, Replay, Touch };
 
 // Host diagnostics only: recorded times start at the backend input loop.
 // VM queues and waits retain their existing implementations and serialization.

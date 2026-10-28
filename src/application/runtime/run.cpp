@@ -492,6 +492,10 @@ int run(const Options& options) {
     } sdl_quit;
     SdlAudioBackend audio_backend;
     if (options.backend == "sdl2") {
+        if (host_window_platform() != HostWindowPlatform::Desktop) {
+            SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+            SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
+        }
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
             throw Error(std::string("SDL_Init failed: ") + SDL_GetError());
         }
@@ -2481,6 +2485,9 @@ int run(const Options& options) {
     std::optional<uint32_t> click_release_at;
     const uint32_t started = SDL_GetTicks();
     click_input.start(SDL_GetTicks64());
+    const bool mobile_touch_enabled = host_window_platform() != HostWindowPlatform::Desktop;
+    MobileTouchInput touch_input(std::max(4, int(vm.window_height(0) / 60U)));
+    bool touch_pointer_active = false;
     SdlKeyboardInput keyboard_input;
     keyboard_input.set_layout(host_keyboard_layout());
     auto text_edit_bridge = make_host_text_edit_bridge(
@@ -2529,6 +2536,31 @@ int run(const Options& options) {
         bool received_input = false;
         bool keyboard_window_switch_requested = false;
         while (SDL_PollEvent(&event) != 0) {
+            if (mobile_touch_enabled) {
+                if ((event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) &&
+                    event.button.which == SDL_TOUCH_MOUSEID) continue;
+                if (event.type == SDL_MOUSEMOTION && event.motion.which == SDL_TOUCH_MOUSEID) continue;
+                if (event.type == SDL_WINDOWEVENT &&
+                    (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
+                     event.window.event == SDL_WINDOWEVENT_MINIMIZED)) touch_input.cancel();
+                if (event.type == SDL_APP_WILLENTERBACKGROUND || event.type == SDL_QUIT)
+                    touch_input.cancel();
+                if (event.type == SDL_FINGERDOWN || event.type == SDL_FINGERUP ||
+                    event.type == SDL_FINGERMOTION) {
+                    if (click_input.replaying() || event.tfinger.touchId == SDL_MOUSE_TOUCHID) continue;
+                    touch_pointer_active = true;
+                    int logical_w = 0, logical_h = 0;
+                    SDL_RenderGetLogicalSize(renderer.get(), &logical_w, &logical_h);
+                    const int x = std::clamp(int(event.tfinger.x * logical_w), 0, std::max(0, logical_w - 1));
+                    const int y = std::clamp(int(event.tfinger.y * logical_h), 0, std::max(0, logical_h - 1));
+                    const auto phase = event.type == SDL_FINGERDOWN ? MobileTouchInput::Phase::Down :
+                        event.type == SDL_FINGERUP ? MobileTouchInput::Phase::Up : MobileTouchInput::Phase::Move;
+                    touch_input.finger(phase, event.tfinger.fingerId, x, y, SDL_GetTicks64());
+                    continue;
+                }
+                if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN ||
+                    event.type == SDL_MOUSEBUTTONUP) touch_pointer_active = false;
+            }
             if (event.type == SDL_KEYMAPCHANGED || event.type == SDL_KEYDOWN)
                 keyboard_input.set_layout(host_keyboard_layout());
             if (text_edit_bridge->handle_event(event)) {
@@ -2655,6 +2687,31 @@ int run(const Options& options) {
                 click_input.motion(SDL_GetTicks64(), logical_x, logical_y, ClickSource::Mouse);
             }
         }
+        if (mobile_touch_enabled) {
+            touch_input.expire(SDL_GetTicks64());
+            for (const auto& action : touch_input.next_frame()) {
+                SDL_Event pointer_event{};
+                if (action.descriptor) {
+                    pointer_event.type = action.down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+                    pointer_event.button.windowID = SDL_GetWindowID(window.get());
+                    pointer_event.button.which = SDL_TOUCH_MOUSEID;
+                    pointer_event.button.button = action.descriptor == 1 ? SDL_BUTTON_LEFT : SDL_BUTTON_RIGHT;
+                    pointer_event.button.state = action.down ? SDL_PRESSED : SDL_RELEASED;
+                    pointer_event.button.clicks = 1;
+                    pointer_event.button.x = action.x; pointer_event.button.y = action.y;
+                } else {
+                    pointer_event.type = SDL_MOUSEMOTION;
+                    pointer_event.motion.windowID = SDL_GetWindowID(window.get());
+                    pointer_event.motion.which = SDL_TOUCH_MOUSEID;
+                    pointer_event.motion.x = action.x; pointer_event.motion.y = action.y;
+                }
+                if (text_edit_bridge->handle_event(pointer_event)) sample_editor_keyboard();
+                else if (action.descriptor) click_input.button(SDL_GetTicks64(), action.descriptor,
+                    action.down, action.x, action.y, ClickSource::Touch);
+                else click_input.motion(SDL_GetTicks64(), action.x, action.y, ClickSource::Touch);
+                received_input = true;
+            }
+        }
         if (vm.host_text_edit().is_open() && vm.host_text_edit().visible())
             sample_editor_keyboard();
 #ifdef _WIN32
@@ -2683,7 +2740,7 @@ int run(const Options& options) {
         SDL_RenderWindowToLogical(
             renderer.get(), pointer_window_x, pointer_window_y,
             &pointer_x, &pointer_y);
-        if (!click_input.replaying() && !click_release_at)
+        if (!click_input.replaying() && !click_release_at && !touch_pointer_active)
             click_input.position(SDL_GetTicks64(), static_cast<int32_t>(pointer_x),
                                  static_cast<int32_t>(pointer_y), ClickSource::Mouse);
         received_input = click_input.replay_due(SDL_GetTicks64()) || received_input;

@@ -19,7 +19,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_bgiplayer_bgi_1ui_1demo_GameActivity_
  setenv("BGIPLAYER_FONT_DIR","/system/fonts",1);
  char lang[16];snprintf(lang,sizeof(lang),"%u",unsigned(language));setenv("BGI_ANDROID_LANGID",lang,1);
  SDL_SetHint(SDL_HINT_ORIENTATIONS,"LandscapeLeft LandscapeRight");
- SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS,"1");
+ SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS,"0");
 }
 extern "C" JNIEXPORT void JNICALL Java_com_bgiplayer_bgi_1ui_1demo_GameActivity_nativeStop(JNIEnv*,jclass) { SDL_Event event{};event.type=SDL_QUIT;SDL_PushEvent(&event); }
 
