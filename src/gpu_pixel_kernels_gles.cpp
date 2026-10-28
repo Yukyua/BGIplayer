@@ -3,6 +3,7 @@
 #ifdef __ANDROID__
 #include "bgiplayer/gpu_pixel_kernels.hpp"
 #include "bgiplayer/debug.hpp"
+#include "bgiplayer/rcpss_estimate_table.hpp"
 #include "bgiplayer/sprite_scaled_alpha.hpp"
 #include "bgiplayer/sprite_crossfade.hpp"
 #include <EGL/egl.h>
@@ -19,7 +20,7 @@ namespace {
 using Clock=std::chrono::steady_clock;
 const char* compute_source=R"GLSL(#version 310 es
 precision highp float;precision highp int;
-layout(local_size_x=16,local_size_y=16) in;
+layout(local_size_x=16,local_size_y=8) in;
 layout(std430,binding=0) buffer Destination {uint d[];};
 layout(std430,binding=1) readonly buffer Source {uint a[];};
 layout(std430,binding=2) readonly buffer Second {uint b[];};
@@ -112,7 +113,7 @@ void main(){
 )GLSL";
 const char* effector_displacement_source=R"GLSL(#version 310 es
 precision highp int;
-layout(local_size_x=16,local_size_y=16) in;
+layout(local_size_x=16,local_size_y=8) in;
 layout(std430,binding=0) writeonly buffer Destination {uint d[];};
 layout(std430,binding=1) readonly buffer Source {uint a[];};
 layout(std430,binding=2) readonly buffer FirstMap {uint m[];};
@@ -121,7 +122,7 @@ layout(location=0) uniform uint p[64];
 int s16(uint value){return int(value<<16u)>>16;}
 ivec4 unpack(uint c){return ivec4(c&255u,(c>>8u)&255u,(c>>16u)&255u,c>>24u);}
 uint pack(ivec4 c){return uint(c.x)|(uint(c.y)<<8u)|(uint(c.z)<<16u)|(uint(c.w)<<24u);}
-ivec4 sampleSource(int x,int y){if(x<0||y<0||uint(x)>=p[1]||uint(y)>=p[2])return ivec4(0);return unpack(a[(p[7]+uint(y)*p[4]+uint(x)*4u)>>2u]);}
+ivec4 sampleSource(int x,int y){if(x<0||y<0||uint(x)>=p[20]||uint(y)>=p[21])return ivec4(0);return unpack(a[(p[7]+uint(y)*p[4]+uint(x)*4u)>>2u]);}
 void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;if(x>=p[1]||y>=p[2])return;
  uint di=(p[6]+y*p[3]+x*4u)>>2u,strength=p[10];bool second=p[12]!=0u,bilinear=p[11]!=0u;
  if(!second&&strength==0u){d[di]=a[(p[7]+y*p[4]+x*4u)>>2u];return;}
@@ -145,7 +146,7 @@ void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;if(x>=p[1]|
 )GLSL";
 const char* effector_vector_source=R"GLSL(#version 310 es
 precision highp int;
-layout(local_size_x=16,local_size_y=16) in;
+layout(local_size_x=16,local_size_y=8) in;
 layout(std430,binding=0) writeonly buffer Destination {uint d[];};
 layout(std430,binding=1) readonly buffer Source {uint a[];};
 layout(std430,binding=2) readonly buffer NormalMap {uint m[];};
@@ -178,6 +179,56 @@ void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;if(x>=p[1]|
  d[(p[6]+y*p[3]+x*4u)>>2u]=pack(clamp(color,0,255));
 }
 )GLSL";
+const char* effector_transform_source=R"GLSL(#version 310 es
+precision highp int;
+layout(local_size_x=16,local_size_y=8) in;
+layout(std430,binding=0) writeonly buffer Destination {uint d[];};
+layout(std430,binding=1) readonly buffer Source {uint a[];};
+layout(location=0) uniform uint p[64];
+ivec4 unpack(uint c){return ivec4(c&255u,(c>>8u)&255u,(c>>16u)&255u,c>>24u);}
+uint pack(ivec4 c){return uint(c.x)|(uint(c.y)<<8u)|(uint(c.z)<<16u)|(uint(c.w)<<24u);}
+ivec4 sampleSource(int x,int y){if(x<0||y<0||uint(x)>=p[12]||uint(y)>=p[13])return ivec4(0);return unpack(a[(p[7]+uint(y)*p[4]+uint(x)*4u)>>2u]);}
+void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;if(x>=p[1]||y>=p[2])return;
+ uint qx=p[16]+x*p[18]+y*p[20],qy=p[17]+x*p[19]+y*p[21];
+ bool bilinear=p[10]!=0u;if(!bilinear){qx+=32768u;qy+=32768u;}
+ int ix=int(qx)>>16,iy=int(qy)>>16;ivec4 color=sampleSource(ix,iy);
+ if(bilinear){int fx=int((qx>>12u)&15u),fy=int((qy>>12u)&15u);
+  ivec4 top=color+((sampleSource(ix+1,iy)-color)*fx>>4),bl=sampleSource(ix,iy+1);
+  ivec4 bottom=bl+((sampleSource(ix+1,iy+1)-bl)*fx>>4);color=top+((bottom-top)*fy>>4);}
+ d[(p[6]+y*p[3]+x*4u)>>2u]=pack(clamp(color,0,255));
+}
+)GLSL";
+const char* effector_temporal_source=R"GLSL(#version 310 es
+precision highp int;precision highp float;
+layout(local_size_x=16,local_size_y=8) in;
+layout(std430,binding=0) buffer Scene {uint d[];};
+layout(std430,binding=1) buffer History {uint a[];};
+layout(std430,binding=3) readonly buffer Reciprocal {uint r[];};
+layout(location=0) uniform uint p[64];
+ivec4 unpack(uint c){return ivec4(c&255u,(c>>8u)&255u,(c>>16u)&255u,c>>24u);}
+uint pack(ivec4 c){return uint(c.x)|(uint(c.y)<<8u)|(uint(c.z)<<16u)|(uint(c.w)<<24u);}
+float reciprocal(uint total){uint bits=floatBitsToUint(total==0u?1.0:float(total)/65536.0);return uintBitsToFloat(r[(bits>>11u)&4095u]-((((bits>>23u)&255u)-127u)<<23u));}
+void main(){uint x=gl_GlobalInvocationID.x*2u,y=gl_GlobalInvocationID.y;if(x>=p[1]||y>=p[2])return;
+ uint count=min(2u,p[1]-x),strength=p[10],si=(p[6]+y*p[3]+x*4u)>>2u,hi=(p[7]+y*p[4]+x*4u)>>2u;
+ uint colors[2];colors[0]=d[si];colors[1]=count==2u?d[si+1u]:0u;
+ if(strength>0u&&strength<=256u&&x<p[12]&&y<p[13]){
+  uint blendCount=min(2u,p[12]-x),h0=a[hi],h1=blendCount==2u?a[hi+1u]:0u;
+  bool skip=p[11]==2u&&(h0>>24u)==0u&&(blendCount==1u||(h1>>24u)==0u);
+  if(!skip)for(uint i=0u;i<blendCount;++i){uint old=i==0u?h0:h1;ivec4 history=unpack(old),scene=unpack(colors[i]);
+   if(strength==256u&&(p[11]==1u||(blendCount==1u&&history.w==255)||(blendCount==2u&&(h0>>24u)==255u&&(h1>>24u)==255u)))colors[i]=old;
+   else if(p[11]==1u)colors[i]=pack(history+((scene-history)*int((256u-strength)>>1u)>>7));
+   else{uint ha=uint(history.w),sa=uint(scene.w),hw,sw,alpha;
+    if(blendCount==2u){uint first=ha*strength,second=sa*(65536u-first),total=(first<<8u)+second;float estimate=reciprocal(total);
+     hw=uint(estimate*float(first));sw=uint((estimate*float(second))/256.0);alpha=total>>16u;}
+    else{uint first=ha*strength,second=(sa*(65536u-first))>>8u,total=first+second;
+     if(total==0u){hw=0u;sw=0u;alpha=0u;}else{hw=(first<<8u)/total;sw=(second<<8u)/total;alpha=total>>8u;}}
+    ivec4 result=(history*int(hw)+scene*int(sw))&ivec4(65535);result=result>>8;result.w=int(alpha);colors[i]=pack(result);
+   }
+  }
+ }
+ for(uint i=0u;i<count;++i){d[si+i]=colors[i];a[hi+i]=colors[i];}
+}
+)GLSL";
 GLuint make_compute_program(const char* source,const char* label){
  GLuint shader=glCreateShader(GL_COMPUTE_SHADER);glShaderSource(shader,1,&source,nullptr);glCompileShader(shader);
  GLint okay=0;glGetShaderiv(shader,GL_COMPILE_STATUS,&okay);
@@ -195,9 +246,9 @@ struct RestoreContext {
 int32_t truncate_sse(double value){return value>=-2147483648.0&&value<2147483648.0?static_cast<int32_t>(value):INT32_MIN;}
 }
 struct GlesDevice {
- EGLDisplay display=EGL_NO_DISPLAY;EGLContext context=EGL_NO_CONTEXT;EGLSurface surface=EGL_NO_SURFACE;GLuint program=0,blur_program=0,displacement_program=0,vector_program=0,buffers[5]{};size_t capacities[5]{};std::recursive_mutex mutex;std::string name="CPU";
- ~GlesDevice(){if(context!=EGL_NO_CONTEXT){RestoreContext restore;if(eglMakeCurrent(display,surface,surface,context)){glDeleteBuffers(5,buffers);if(program)glDeleteProgram(program);if(blur_program)glDeleteProgram(blur_program);if(displacement_program)glDeleteProgram(displacement_program);if(vector_program)glDeleteProgram(vector_program);}eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);eglDestroyContext(display,context);}if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);/* SDL owns the shared EGLDisplay lifetime. */}
- PixelKernelResult dispatch(std::span<uint8_t> dst,std::span<const uint8_t> src,std::span<const uint8_t> second,std::vector<uint32_t>& args,bool paired=false,bool approximate=false,GLuint resident_source=0,bool separable_blur=false,GLuint special_program=0,std::span<const uint8_t> auxiliary={}){
+ EGLDisplay display=EGL_NO_DISPLAY;EGLContext context=EGL_NO_CONTEXT;EGLSurface surface=EGL_NO_SURFACE;GLuint program=0,blur_program=0,displacement_program=0,vector_program=0,transform_program=0,temporal_program=0,buffers[5]{};size_t capacities[5]{};std::recursive_mutex mutex;std::string name="CPU";
+ ~GlesDevice(){if(context!=EGL_NO_CONTEXT){RestoreContext restore;if(eglMakeCurrent(display,surface,surface,context)){glDeleteBuffers(5,buffers);if(program)glDeleteProgram(program);if(blur_program)glDeleteProgram(blur_program);if(displacement_program)glDeleteProgram(displacement_program);if(vector_program)glDeleteProgram(vector_program);if(transform_program)glDeleteProgram(transform_program);if(temporal_program)glDeleteProgram(temporal_program);}eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);eglDestroyContext(display,context);}if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);/* SDL owns the shared EGLDisplay lifetime. */}
+ PixelKernelResult dispatch(std::span<uint8_t> dst,std::span<const uint8_t> src,std::span<const uint8_t> second,std::vector<uint32_t>& args,bool paired=false,bool approximate=false,GLuint resident_source=0,bool separable_blur=false,GLuint special_program=0,std::span<const uint8_t> auxiliary={},std::span<uint8_t> second_output={}){
   std::lock_guard lock(mutex);PixelKernelResult result;const bool timing=debug_enabled();auto start=timing?Clock::now():Clock::time_point{};
   if(!program||(separable_blur&&!blur_program)||dst.empty()||args[1]==0||args[2]==0)return result;
   RestoreContext restore;if(!eglMakeCurrent(display,surface,surface,context))return result;
@@ -221,15 +272,22 @@ struct GlesDevice {
     const bool vertical=args[12]>=2;glUniform1ui(0,vertical?1u:0u);
     glDispatchCompute(((vertical?args[20]:args[21])+63)/64,1,1);
    }
-  }else if(special_program){glUseProgram(special_program);glUniform1uiv(0,static_cast<GLsizei>(args.size()),args.data());glDispatchCompute((args[1]+15)/16,(args[2]+15)/16,1);}
-  else{glUseProgram(program);uint32_t width=paired?(args[1]+1)/2:args[1];glDispatchCompute((width+15)/16,(args[2]+15)/16,1);}
+  }else if(special_program){glUseProgram(special_program);glUniform1uiv(0,static_cast<GLsizei>(args.size()),args.data());uint32_t width=paired?(args[1]+1)/2:args[1];glDispatchCompute((width+15)/16,(args[2]+7)/8,1);}
+  else{glUseProgram(program);uint32_t width=paired?(args[1]+1)/2:args[1];glDispatchCompute((width+15)/16,(args[2]+7)/8,1);}
   glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT|GL_SHADER_STORAGE_BARRIER_BIT);
   GLsync fence=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);if(!fence)return result;GLenum status=glClientWaitSync(fence,GL_SYNC_FLUSH_COMMANDS_BIT,1000000000ULL);glDeleteSync(fence);
   if(timing)result.wait_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-wait).count();
   if((status!=GL_ALREADY_SIGNALED&&status!=GL_CONDITION_SATISFIED)||glGetError()!=GL_NO_ERROR)return result;
   auto download=timing?Clock::now():Clock::time_point{};glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[0]);void* mapped=glMapBufferRange(GL_SHADER_STORAGE_BUFFER,0,static_cast<GLsizeiptr>(dst.size()),GL_MAP_READ_BIT);if(!mapped)return result;
   // Publish only after the complete readback succeeds, preserving CPU fallback.
-  std::vector<uint8_t> readback(dst.size());std::memcpy(readback.data(),mapped,readback.size());if(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER)!=GL_TRUE||glGetError()!=GL_NO_ERROR)return result;std::memcpy(dst.data(),readback.data(),readback.size());
+  std::vector<uint8_t> readback(dst.size());std::memcpy(readback.data(),mapped,readback.size());if(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER)!=GL_TRUE||glGetError()!=GL_NO_ERROR)return result;
+  std::vector<uint8_t> secondary_readback;
+  if(!second_output.empty()){
+   glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[1]);mapped=glMapBufferRange(GL_SHADER_STORAGE_BUFFER,0,static_cast<GLsizeiptr>(second_output.size()),GL_MAP_READ_BIT);if(!mapped)return result;
+   secondary_readback.resize(second_output.size());std::memcpy(secondary_readback.data(),mapped,secondary_readback.size());
+   if(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER)!=GL_TRUE||glGetError()!=GL_NO_ERROR)return result;
+  }
+  std::memcpy(dst.data(),readback.data(),readback.size());if(!second_output.empty())std::memcpy(second_output.data(),secondary_readback.data(),secondary_readback.size());
   if(timing){result.download_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-download).count();result.total_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();}result.success=true;result.used_gpu=true;result.approximate=approximate;return result;
  }
 };
@@ -276,6 +334,8 @@ GpuPixelKernels::GpuPixelKernels(bool enabled):impl_(std::make_unique<Impl>()){
  impl_->device->blur_program=make_compute_program(effector_blur_source,"effector_blur");
  impl_->device->displacement_program=make_compute_program(effector_displacement_source,"effector_displacement");
  impl_->device->vector_program=make_compute_program(effector_vector_source,"effector_vector");
+ impl_->device->transform_program=make_compute_program(effector_transform_source,"effector_transform");
+ impl_->device->temporal_program=make_compute_program(effector_temporal_source,"effector_temporal");
  glGenBuffers(5,impl_->device->buffers);if(auto name=glGetString(GL_RENDERER))impl_->device->name=reinterpret_cast<const char*>(name);
 }
 std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const uint8_t> pixels){
@@ -341,6 +401,7 @@ PixelKernelResult GpuPixelKernels::effector_displacement(const EffectorDisplacem
   !valid(p.destination)||!valid(p.source)||!valid(p.first)||(p.second&&!valid(*p.second)))return {};
  std::vector<uint32_t>a(64);a[1]=p.destination.width;a[2]=p.destination.height;a[3]=p.destination.stride;
  a[4]=p.source.stride;a[5]=p.first.stride;a[6]=p.destination.byte_offset;a[7]=p.source.byte_offset;a[8]=p.first.byte_offset;
+ a[20]=p.source.width;a[21]=p.source.height;
  a[10]=p.strength;a[11]=p.bilinear;a[12]=p.second.has_value();if(p.second){a[13]=p.second->stride;a[14]=p.second->byte_offset;}
  return impl_->device->dispatch(p.destination.pixels,p.source.pixels,p.first.pixels,a,false,false,0,false,
   impl_->device->displacement_program,p.second?p.second->pixels:std::span<const uint8_t>{});
@@ -354,6 +415,21 @@ PixelKernelResult GpuPixelKernels::effector_vector(const EffectorVectorPixels& p
  const auto coefficients=std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(p.coefficients.data()),p.coefficients.size_bytes());
  return impl_->device->dispatch(p.destination.pixels,p.source.pixels,p.normal.pixels,a,false,false,0,false,
   impl_->device->vector_program,coefficients);
+}
+PixelKernelResult GpuPixelKernels::effector_transform(const EffectorTransformPixels& p){
+ if(!available()||!impl_->device->transform_program||!valid_effector_transform(p)||!valid(p.destination)||!valid(p.source)||
+  (!p.bilinear&&(p.source.width>32767||p.source.height>32767||p.source.stride>131068)))return {};
+ std::vector<uint32_t>a(64);a[1]=p.destination.width;a[2]=p.destination.height;a[3]=p.destination.stride;a[4]=p.source.stride;
+ a[6]=p.destination.byte_offset;a[7]=p.source.byte_offset;a[10]=p.bilinear;a[12]=p.source.width;a[13]=p.source.height;
+ for(unsigned i=0;i<6;++i)a[16+i]=uint32_t(p.matrix[i]);
+ return impl_->device->dispatch(p.destination.pixels,p.source.pixels,{},a,false,false,0,false,impl_->device->transform_program);
+}
+PixelKernelResult GpuPixelKernels::effector_temporal(const EffectorTemporalPixels& p){
+ if(!available()||!impl_->device->temporal_program||!valid_effector_temporal(p)||!valid(p.scene)||!valid(p.history)||p.history.stride<uint64_t(p.scene.width)*4)return {};
+ std::vector<uint32_t>a(64);a[1]=p.scene.width;a[2]=p.scene.height;a[3]=p.scene.stride;a[4]=p.history.stride;
+ a[6]=p.scene.byte_offset;a[7]=p.history.byte_offset;a[10]=p.strength;a[11]=p.scene.format;a[12]=p.history.width;a[13]=p.history.height;
+ const auto& table=detail::kRcpSsEstimateTable;const auto bytes=std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(table.data()),sizeof(table));
+ return impl_->device->dispatch(p.scene.pixels,p.history.pixels,{},a,true,false,0,false,impl_->device->temporal_program,bytes,p.history.pixels);
 }
 PixelKernelResult GpuPixelKernels::background_mask(const BackgroundMaskPixels& p){
  if(!available()||!valid(p.destination)||!valid(p.source)||!valid(p.mask,1)||p.destination.format!=1||p.source.format!=1||p.mask.format!=3||p.left>=p.right||p.top>=p.bottom||p.right>p.destination.width||p.bottom>p.destination.height||uint64_t(p.source_left)+p.right-p.left>p.source.width||uint64_t(p.source_top)+p.bottom-p.top>p.source.height||uint64_t(p.mask_left)+p.right-p.left>p.mask.width||uint64_t(p.mask_top)+p.bottom-p.top>p.mask.height||(p.shift!=7&&p.shift!=12)||overlap(p.destination.pixels,p.source.pixels)||overlap(p.destination.pixels,p.mask.pixels))return {};
