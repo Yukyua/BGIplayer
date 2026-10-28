@@ -25,7 +25,9 @@ public:
     [[nodiscard]] bool available() const;
 
     bool load(bool bgm, uint32_t channel, DecodedAudio audio,
-              double playback_rate);
+              double playback_rate, std::span<const uint8_t> bgm_encoded = {});
+    bool reload_cached_bgm(uint32_t channel, std::span<const uint8_t> encoded,
+                           double playback_rate);
     void stop(bool bgm, uint32_t channel);
     bool trigger_effect(uint32_t channel);
     bool play_oneshot(DecodedAudio audio);
@@ -59,6 +61,9 @@ private:
     void mix(int16_t* stream, int length);
     static void audio_callback(void* userdata, uint8_t* stream,
                                int length);
+    bool load_shared(bool bgm, uint32_t channel,
+                     std::shared_ptr<const DecodedAudio> clip,
+                     double playback_rate);
     Track& track(bool bgm, uint32_t channel);
     const Track& track(bool bgm, uint32_t channel) const;
 
@@ -70,6 +75,11 @@ private:
     uint32_t next_one_shot_ = 0;
     uint32_t device_id_ = 0;
     bool initialized_ = false;
+    // One immutable host-side decode result; never part of VM save state.
+    std::vector<uint8_t> cached_bgm_encoded_;
+    std::shared_ptr<const DecodedAudio> cached_bgm_clip_;
+    uint32_t cached_bgm_sample_rate_ = 0;
+    uint32_t cached_bgm_channels_ = 0;
 };
 
 }  // namespace bgiplayer

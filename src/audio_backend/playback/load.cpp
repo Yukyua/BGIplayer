@@ -6,18 +6,67 @@
 namespace bgiplayer {
 bool SdlAudioBackend::load(
     bool bgm, uint32_t channel, DecodedAudio audio,
-    double playback_rate) {
+    double playback_rate, std::span<const uint8_t> bgm_encoded) {
     if (!available() ||
         (bgm && channel >= bgm_tracks_.size()) ||
         (!bgm && channel >= effect_tracks_.size()) ||
         audio.samples.empty() || playback_rate <= 0.0) {
         return false;
     }
+    constexpr std::size_t cache_limit = 64U * 1024U * 1024U;
+    if (bgm && !bgm_encoded.empty() && bgm_encoded.size() <= cache_limit &&
+        audio.samples.size() <= (cache_limit - bgm_encoded.size()) / sizeof(int16_t) &&
+        audio.samples.capacity() > (cache_limit - bgm_encoded.size()) / sizeof(int16_t))
+        audio.samples.shrink_to_fit();
+    auto clip = std::make_shared<const DecodedAudio>(std::move(audio));
+    if (bgm) {
+        constexpr std::size_t limit = cache_limit;
+        bool cacheable = !bgm_encoded.empty() &&
+            bgm_encoded.size() <= limit &&
+            clip->samples.capacity() <= (limit - bgm_encoded.size()) / sizeof(int16_t);
+        std::vector<uint8_t> encoded;
+        if (cacheable) encoded.assign(bgm_encoded.begin(), bgm_encoded.end());
+        if (encoded.capacity() > limit ||
+            clip->samples.capacity() > (limit - encoded.capacity()) / sizeof(int16_t)) {
+            cacheable = false;
+            std::vector<uint8_t>().swap(encoded);
+        }
+        std::scoped_lock lock(mutex_);
+        cached_bgm_encoded_ = std::move(encoded);
+        cached_bgm_clip_ = cacheable ? clip : nullptr;
+        cached_bgm_sample_rate_ = cacheable ? DecodedAudio::kSampleRate : 0;
+        cached_bgm_channels_ = cacheable ? DecodedAudio::kChannels : 0;
+    }
+    return load_shared(bgm, channel, std::move(clip), playback_rate);
+}
+
+bool SdlAudioBackend::reload_cached_bgm(
+    uint32_t channel, std::span<const uint8_t> encoded,
+    double playback_rate) {
+    std::shared_ptr<const DecodedAudio> clip;
+    {
+        std::scoped_lock lock(mutex_);
+        if (!cached_bgm_clip_ ||
+            cached_bgm_sample_rate_ != DecodedAudio::kSampleRate ||
+            cached_bgm_channels_ != DecodedAudio::kChannels ||
+            encoded.size() != cached_bgm_encoded_.size() ||
+            !std::equal(encoded.begin(), encoded.end(), cached_bgm_encoded_.begin()))
+            return false;
+        clip = cached_bgm_clip_;
+    }
+    return load_shared(true, channel, std::move(clip), playback_rate);
+}
+
+bool SdlAudioBackend::load_shared(
+    bool bgm, uint32_t channel, std::shared_ptr<const DecodedAudio> clip,
+    double playback_rate) {
+    if (!available() || !clip || clip->samples.empty() || playback_rate <= 0.0 ||
+        (bgm && channel >= bgm_tracks_.size()) ||
+        (!bgm && channel >= effect_tracks_.size())) return false;
     {
         std::scoped_lock lock(mutex_);
         Track& slot = track(bgm, channel);
-        slot.clip =
-            std::make_shared<const DecodedAudio>(std::move(audio));
+        slot.clip = std::move(clip);
         slot.position = 0.0;
         slot.playback_rate = playback_rate;
         slot.observed_effect_generation = 0;

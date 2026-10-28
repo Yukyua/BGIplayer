@@ -11,6 +11,22 @@ std::vector<uint8_t> Memory::read_bytes(uint32_t address, std::size_t size,
         const auto& bytes=heap_allocations_.at(location.allocation);
         return {bytes.begin(),bytes.begin()+static_cast<std::ptrdiff_t>(size)};
     }
+    // Ordinary heap handles describe a contiguous allocation. Resolve once
+    // for bulk transfers, retaining the scalar path for tagged-boundary and
+    // invalid accesses (including their original exception behavior).
+    if (size != 0 && size <= 0x04000000U &&
+        uint64_t(address) + size - 1U <= UINT32_MAX &&
+        (address >> 26U) == ((address + static_cast<uint32_t>(size - 1U)) >> 26U) &&
+        decode_heap_handle(address)) {
+        try {
+            const auto location = resolve(address, base, size);
+            const auto& bytes = heap_allocations_.at(location.allocation);
+            const auto begin = bytes.begin() + static_cast<std::ptrdiff_t>(location.offset);
+            return {begin, begin + static_cast<std::ptrdiff_t>(size)};
+        } catch (const BpFault&) {
+            // The byte loop below reports the same failing byte as before.
+        }
+    }
     std::vector<uint8_t> result;
     result.reserve(size);
     for (std::size_t index = 0; index < size; ++index) {

@@ -15,6 +15,33 @@ NativeSignal NativeRegistry::invoke(uint8_t family, uint8_t sub, VM& vm,
                 << static_cast<unsigned>(sub);
         throw std::runtime_error(message.str());
     }
-    return handler(vm, thread);
+    if (!debug_trace(DebugTrace::GpuFrames)) return handler(vm, thread);
+    const auto start = std::chrono::steady_clock::now();
+    const uint32_t ip = thread.ip;
+    const uint32_t segment = vm.has_active_code_resource()
+        ? vm.active_code_resource_base() : 0xFFFFFFFFU;
+    const auto& stack = thread.stack.values();
+    const uint32_t arg0 = stack.empty() ? 0U : stack.back();
+    const uint32_t arg1 = stack.size() < 2U ? 0U : stack[stack.size() - 2U];
+    const auto result = handler(vm, thread);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    if (elapsed >= 2000000) {
+        std::string source = "<main>";
+        if (segment != 0xFFFFFFFFU) {
+            const auto prefix = std::to_string(segment) + ":";
+            for (const auto& [key, bytes] : vm.resource_cache()) {
+                (void)bytes;
+                if (key.starts_with(prefix)) { source = key.substr(prefix.size()); break; }
+            }
+        }
+        std::cerr << "NATIVE_COST family=0x" << std::hex << unsigned(family)
+                  << " sub=0x" << unsigned(sub) << " ip=0x" << ip
+                  << " arg0=0x" << arg0 << " arg1=0x" << arg1
+                  << " segment=0x" << segment << std::dec
+                  << " thread=" << thread.id << " script=" << std::quoted(source)
+                  << " total_ns=" << elapsed << '\n';
+    }
+    return result;
 }
 }  // namespace bgiplayer

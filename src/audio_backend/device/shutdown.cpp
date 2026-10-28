@@ -11,5 +11,9 @@ void SdlAudioBackend::shutdown() {
         device_id_ = 0;
     }
     initialized_ = false;
+    std::scoped_lock lock(mutex_);
+    cached_bgm_clip_.reset();
+    std::vector<uint8_t>().swap(cached_bgm_encoded_);
+    cached_bgm_sample_rate_ = cached_bgm_channels_ = 0;
 }
 }  // namespace bgiplayer

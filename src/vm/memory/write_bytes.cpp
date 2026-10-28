@@ -11,6 +11,21 @@ void Memory::write_bytes(uint32_t address, std::span<const uint8_t> data,
         auto& bytes=heap_allocations_.at(location.allocation);
         std::copy(data.begin(),data.end(),bytes.begin()); return;
     }
+    if (!data.empty() && data.size() <= 0x04000000U &&
+        uint64_t(address) + data.size() - 1U <= UINT32_MAX &&
+        (address >> 26U) == ((address + static_cast<uint32_t>(data.size() - 1U)) >> 26U) &&
+        decode_heap_handle(address)) {
+        try {
+            const auto location = resolve(address, base, data.size());
+            auto& bytes = heap_allocations_.at(location.allocation);
+            std::copy(data.begin(), data.end(),
+                      bytes.begin() + static_cast<std::ptrdiff_t>(location.offset));
+            return;
+        } catch (const BpFault&) {
+            // Fall back to scalar writes so an invalid trailing byte still
+            // leaves the valid prefix written, as it did before this fast path.
+        }
+    }
     for (std::size_t index = 0; index < data.size(); ++index) {
         write_u8(address + static_cast<uint32_t>(index), base, data[index]);
     }
