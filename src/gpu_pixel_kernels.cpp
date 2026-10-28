@@ -13,6 +13,9 @@ namespace bgiplayer {
 struct GpuPixelKernels::Impl {};
 std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const uint8_t>) { return {}; }
 PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels&) { return {}; }
+PixelKernelResult GpuPixelKernels::effector_blur(const EffectorBlurPixels&) { return {}; }
+PixelKernelResult GpuPixelKernels::effector_displacement(const EffectorDisplacementPixels&) { return {}; }
+PixelKernelResult GpuPixelKernels::effector_vector(const EffectorVectorPixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::affine(const AffinePixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::background_mask(const BackgroundMaskPixels&) { return {}; }
@@ -38,6 +41,13 @@ PixelKernelResult GpuPixelKernels::crossfade(const CrossfadePixels& p) {
 #endif
 
 namespace bgiplayer {
+#if !defined(__APPLE__)
+std::vector<std::shared_ptr<GpuPixelStorage>> GpuPixelKernels::store_pixels_batch(std::span<const std::span<const uint8_t>> pixels) {
+    std::vector<std::shared_ptr<GpuPixelStorage>> result;result.reserve(pixels.size());
+    for(const auto bytes:pixels)result.push_back(store_pixels(bytes));
+    return result;
+}
+#endif
 namespace {
 struct HostState {
     GpuPixelKernels cpu;
@@ -147,6 +157,78 @@ PixelKernelResult compose_host_pixel_transfer(const PixelTransferPixels& p) {
 std::shared_ptr<GpuPixelStorage> store_host_pixel_storage(std::span<const uint8_t> pixels) {
     if(retain_cpu_pixel_copies() || pixels.empty())return {};
     return backend(true).store_pixels(pixels);
+}
+std::vector<std::shared_ptr<GpuPixelStorage>> store_host_pixel_storage_batch(std::span<const std::span<const uint8_t>> pixels) {
+    if(retain_cpu_pixel_copies())return {};
+    return backend(true).store_pixels_batch(pixels);
+}
+
+bool valid_effector_blur(const EffectorBlurPixels& p) {
+    const auto valid=[](const GlyphBitmapView& v) {
+        return (v.format==1 || v.format==2) && v.bytes_per_pixel==4 && v.width && v.height &&
+            v.pixels.size()<=UINT32_MAX && v.stride>=uint64_t(v.width)*4 &&
+            uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=v.pixels.size();
+    };
+    return valid(p.destination) && valid(p.source) && p.destination.format==p.source.format &&
+        p.destination.width==p.source.width && p.destination.height==p.source.height && p.radius<=256 && p.selector<=5;
+}
+PixelKernelResult compose_host_effector_blur(const EffectorBlurPixels& p) {
+    const uint64_t pixels=uint64_t(p.destination.width)*p.destination.height;
+    if(!choose_gpu(pixels,256U*256U))return {};
+    const auto result=backend(true).effector_blur(p);
+    return result.success?record("effector_blur",result,pixels):result;
+}
+bool valid_effector_displacement(const EffectorDisplacementPixels& p) {
+    const auto valid=[](const GlyphBitmapView& v) {
+        return v.bytes_per_pixel==4 && v.width && v.height && v.pixels.size()<=UINT32_MAX &&
+            v.stride>=uint64_t(v.width)*4 && uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=v.pixels.size();
+    };
+    if(!valid(p.destination) || !valid(p.source) || !valid(p.first) || p.strength>256 ||
+            p.source.format!=p.destination.format || (p.source.format!=1 && p.source.format!=2) || p.first.format!=4 ||
+            p.source.width!=p.destination.width || p.source.height!=p.destination.height ||
+            p.first.width<p.destination.width || p.first.height<p.destination.height)return false;
+    if(p.second && (!valid(*p.second) || p.second->format!=4 || p.second->width!=p.first.width || p.second->height!=p.first.height))return false;
+    const auto overlap=[](auto a,auto b) {
+        const auto x=reinterpret_cast<uintptr_t>(a.data()),y=reinterpret_cast<uintptr_t>(b.data());
+        return x<=y?y-x<a.size():x-y<b.size();
+    };
+    return !overlap(p.destination.pixels,p.source.pixels) && !overlap(p.destination.pixels,p.first.pixels) &&
+        (!p.second || !overlap(p.destination.pixels,p.second->pixels));
+}
+PixelKernelResult compose_host_effector_displacement(const EffectorDisplacementPixels& p) {
+    const uint64_t pixels=uint64_t(p.destination.width)*p.destination.height;
+    if(!choose_gpu(pixels,256U*256U))return {};
+    const auto result=backend(true).effector_displacement(p);
+    return result.success?record("effector_displacement",result,pixels):result;
+}
+bool valid_effector_vector(const EffectorVectorPixels& p) {
+    const auto valid=[](const GlyphBitmapView& v,uint32_t bpp) {
+        return v.bytes_per_pixel==bpp && v.width && v.height && v.pixels.size()<=UINT32_MAX &&
+            v.stride>=uint64_t(v.width)*bpp && uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*bpp<=v.pixels.size();
+    };
+    if(!valid(p.destination,4) || !valid(p.source,4) || !valid(p.normal,6) || p.coefficients.empty() ||
+            p.coefficients.size()>UINT32_MAX/4 || p.source.format!=p.destination.format || (p.source.format!=1 && p.source.format!=2) ||
+            p.normal.format!=6 || p.destination.width!=p.source.width || p.destination.height!=p.source.height ||
+            p.normal.width!=p.source.width || p.normal.height!=p.source.height)return false;
+    if(!p.rectangular_bounds && (p.source.stride%4 || p.source.stride/4>65535 ||
+            uint64_t(p.source.byte_offset)+uint64_t(p.source.stride)*p.source.height>p.source.pixels.size()))return false;
+    const auto overlap=[](auto a,auto b) {
+        const auto x=reinterpret_cast<uintptr_t>(a.data()),y=reinterpret_cast<uintptr_t>(b.data());
+        return x<=y?y-x<a.size():x-y<b.size();
+    };
+    if(overlap(p.destination.pixels,p.source.pixels) || overlap(p.destination.pixels,p.normal.pixels) ||
+            overlap(p.destination.pixels,std::as_bytes(p.coefficients)))return false;
+    if(p.coefficients.size()<65536)for(uint32_t y=0;y<p.normal.height;++y)for(uint32_t x=0;x<p.normal.width;++x) {
+        const auto at=p.normal.byte_offset+uint64_t(y)*p.normal.stride+uint64_t(x)*6+4;
+        if((uint32_t(p.normal.pixels[at])|(uint32_t(p.normal.pixels[at+1])<<8))>=p.coefficients.size())return false;
+    }
+    return true;
+}
+PixelKernelResult compose_host_effector_vector(const EffectorVectorPixels& p) {
+    const uint64_t pixels=uint64_t(p.destination.width)*p.destination.height;
+    if(!choose_gpu(pixels,256U*256U))return {};
+    const auto result=backend(true).effector_vector(p);
+    return result.success?record("effector_vector",result,pixels):result;
 }
 
 }

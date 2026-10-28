@@ -40,6 +40,11 @@ public:
     size_t capacity() const {return cpu_.capacity();}
     size_t gpu_bytes() const {return gpu_?gpu_->size():0;}
     const std::shared_ptr<GpuPixelStorage>& gpu_storage() const {return gpu_;}
+    std::span<const uint8_t> upload_bytes() const {return cpu_;}
+    bool adopt_gpu_storage(std::shared_ptr<GpuPixelStorage> storage) {
+        if(!storage || storage->size()!=size())return false;
+        gpu_=std::move(storage);std::vector<uint8_t>().swap(cpu_);return true;
+    }
     uint8_t* data() {materialize(true);return cpu_.data();}
     const uint8_t* data() const {materialize(false);return cpu_.data();}
     uint8_t& operator[](size_t at) {materialize(true);return cpu_[at];}
@@ -84,6 +89,7 @@ public:
     operator std::vector<uint8_t>&() & {return cpu_pixels();}
     std::vector<uint8_t> take_cpu_pixels() && {materialize(true);return std::move(cpu_);}
     bool offload() {
+        if(cpu_.empty() && !gpu_) {std::vector<uint8_t>().swap(cpu_);return true;}
         if(!gpu_ && !cpu_.empty())gpu_=store_host_pixel_storage(cpu_);
         if(!gpu_)return cpu_.empty();
         std::vector<uint8_t>().swap(cpu_);return true;

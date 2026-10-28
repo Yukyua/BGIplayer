@@ -42,13 +42,23 @@ bool VM::accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t
 void VM::offload_bitmap_cpu_pixels() {
     if(retain_cpu_pixel_copies())return;
     bool complete=true;
-    const auto buffer=[&](PixelBuffer& p){if(!p.offload())complete=false;};
+    std::vector<PixelBuffer*> pending;
+    std::vector<std::span<const uint8_t>> uploads;
+    const auto buffer=[&](PixelBuffer& p){
+        if(p.gpu_storage() || p.empty()) {if(!p.offload())complete=false;}
+        else {pending.push_back(&p);uploads.push_back(p.upload_bytes());}
+    };
     const auto surface=[&](GraphicsSurface& s) {buffer(s.pixels);buffer(s.rgba);buffer(s.encoded);};
     for(auto& [id,s]:graphics_surfaces_){(void)id;surface(s);}
     for(auto& [id,w]:window_objects_) {
         (void)id;buffer(w.background_plane);buffer(w.overlay_plane);
         buffer(w.text_saved_plane);buffer(w.composite_plane);
         for(auto& layer:w.image_layers)surface(layer.image);
+    }
+    if(!pending.empty()) {
+        const auto storage=store_host_pixel_storage_batch(uploads);
+        for(size_t n=0;n<pending.size();++n)
+            if(n>=storage.size() || !pending[n]->adopt_gpu_storage(storage[n]))complete=false;
     }
     static bool warned=false;
     if(!complete && !warned) {

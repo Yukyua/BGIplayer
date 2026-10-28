@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -59,6 +60,25 @@ struct PixelTransferPixels {
     std::shared_ptr<GpuPixelStorage> source_storage{};
 };
 bool valid_pixel_transfer(const PixelTransferPixels& pixels);
+struct EffectorBlurPixels {
+    GlyphBitmapView destination, source;
+    uint32_t radius;
+    uint32_t selector=5;
+};
+bool valid_effector_blur(const EffectorBlurPixels& pixels);
+struct EffectorDisplacementPixels {
+    GlyphBitmapView destination,source,first;
+    std::optional<GlyphBitmapView> second;
+    uint32_t strength;
+    bool bilinear;
+};
+bool valid_effector_displacement(const EffectorDisplacementPixels& pixels);
+struct EffectorVectorPixels {
+    GlyphBitmapView destination,source,normal;
+    std::span<const uint32_t> coefficients;
+    bool bilinear,rectangular_bounds=true;
+};
+bool valid_effector_vector(const EffectorVectorPixels& pixels);
 struct PixelKernelResult {
     bool success = false;
     bool used_gpu = false;
@@ -82,7 +102,11 @@ public:
     PixelKernelResult layer_composite(const LayerCompositePixels& pixels);
     PixelKernelResult background_mask(const BackgroundMaskPixels& pixels);
     PixelKernelResult pixel_transfer(const PixelTransferPixels& pixels);
+    PixelKernelResult effector_blur(const EffectorBlurPixels& pixels);
+    PixelKernelResult effector_displacement(const EffectorDisplacementPixels& pixels);
+    PixelKernelResult effector_vector(const EffectorVectorPixels& pixels);
     std::shared_ptr<GpuPixelStorage> store_pixels(std::span<const uint8_t> pixels);
+    std::vector<std::shared_ptr<GpuPixelStorage>> store_pixels_batch(std::span<const std::span<const uint8_t>> pixels);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -98,6 +122,9 @@ PixelKernelResult compose_host_fast_affine(const AffinePixels& pixels);
 PixelKernelResult compose_host_fast_background_mask(const BackgroundMaskPixels& pixels);
 PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& pixels);
 PixelKernelResult compose_host_pixel_transfer(const PixelTransferPixels& pixels);
+PixelKernelResult compose_host_effector_blur(const EffectorBlurPixels& pixels);
+PixelKernelResult compose_host_effector_displacement(const EffectorDisplacementPixels& pixels);
+PixelKernelResult compose_host_effector_vector(const EffectorVectorPixels& pixels);
 struct HostPixelKernelStatistics { uint64_t calls=0, gpu_dispatches=0, cpu_calls=0, approximate_dispatches=0; };
 HostPixelKernelStatistics host_pixel_kernel_statistics();
 }

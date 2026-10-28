@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <iostream>
 
 namespace bgiplayer {
 namespace {
@@ -47,6 +48,118 @@ bool supported(const ScaledAlphaPixels& p) {
 const char* shader_source=R"MSL(
 #include <metal_stdlib>
 using namespace metal;
+struct Blur { uint ds,ss,d0,s0,width,height,radius,reciprocal,selector; };
+uint blur_horizontal_sample(device const uchar* src,constant Blur& p,int x,uint y,uint c) {
+    if((p.selector&1u)==0u && (x<0 || x>=int(p.width)))return 0;
+    return uint(src[p.s0+y*p.ss+uint(clamp(x,0,int(p.width)-1))*4+c])>>1;
+}
+uint blur_vertical_sample(device const uchar* src,constant Blur& p,int y,uint x,uint c) {
+    if((p.selector&1u)==0u && (y<0 || y>=int(p.height)))return 0;
+    uint row=uint(clamp(y,0,int(p.height)-1));
+    uint at=p.selector<4u?p.s0+row*p.ss+x*4:(row*p.width+x)*4;
+    return uint(src[at+c])>>1;
+}
+// One lane scans a line, preserving the original sliding sums, byte halves,
+// fixed reciprocal and intermediate byte truncation in both passes.
+kernel void effector_horizontal(device uchar* tmp [[buffer(0)]],device const uchar* src [[buffer(1)]],
+    constant Blur& p [[buffer(2)]],uint y [[thread_position_in_grid]]) {
+    if(y>=p.height)return;
+    uint4 sums=uint4(0);
+    for(int x=-int(p.radius);x<=int(p.radius);++x)
+        for(uint c=0;c<4;++c)sums[c]+=blur_horizontal_sample(src,p,x,y,c);
+    for(uint x=0;x<p.width;++x) {
+        uint at=p.selector<2u?p.d0+y*p.ds+x*4:(y*p.width+x)*4;
+        for(uint c=0;c<4;++c)tmp[at+c]=uchar((sums[c]*p.reciprocal)>>16);
+        for(uint c=0;c<4;++c)sums[c]+=blur_horizontal_sample(src,p,int(x+p.radius+1),y,c)-blur_horizontal_sample(src,p,int(x)-int(p.radius),y,c);
+    }
+}
+kernel void effector_vertical(device uchar* dst [[buffer(0)]],device const uchar* tmp [[buffer(1)]],
+    constant Blur& p [[buffer(2)]],uint x [[thread_position_in_grid]]) {
+    if(x>=p.width)return;
+    uint4 sums=uint4(0);
+    for(int y=-int(p.radius);y<=int(p.radius);++y)
+        for(uint c=0;c<4;++c)sums[c]+=blur_vertical_sample(tmp,p,y,x,c);
+    for(uint y=0;y<p.height;++y) {
+        for(uint c=0;c<4;++c)dst[p.d0+y*p.ds+x*4+c]=uchar((sums[c]*p.reciprocal)>>16);
+        for(uint c=0;c<4;++c)sums[c]+=blur_vertical_sample(tmp,p,int(y+p.radius+1),x,c)-blur_vertical_sample(tmp,p,int(y)-int(p.radius),x,c);
+    }
+}
+struct Displace { uint width,height,ds,ss,as,bs,d0,s0,a0,b0,strength,filtered,second; };
+int displace_word(device const uchar* map,uint at) {return int(as_type<short>(ushort(uint(map[at])|(uint(map[at+1])<<8))));}
+int displace_wrap(int value) {return int(as_type<short>(ushort(value)));}
+int displace_sample(device const uchar* src,constant Displace& p,int x,int y,uint c) {
+    if(x<0 || y<0 || uint(x)>=p.width || uint(y)>=p.height)return 0;
+    return int(src[p.s0+uint(y)*p.ss+uint(x)*4+c]);
+}
+kernel void effector_displacement(device uchar* dst [[buffer(0)]],device const uchar* src [[buffer(1)]],
+    device const uchar* first [[buffer(2)]],device const uchar* second [[buffer(3)]],constant Displace& p [[buffer(4)]],
+    uint2 t [[thread_position_in_grid]]) {
+    if(t.x>=p.width || t.y>=p.height)return;
+    uint out=p.d0+t.y*p.ds+t.x*4;
+    if(p.second==0 && p.strength==0) {for(uint c=0;c<4;++c)dst[out+c]=src[p.s0+t.y*p.ss+t.x*4+c];return;}
+    bool dual=p.second!=0 && p.strength>0 && p.strength<256;
+    bool use_second=p.second!=0 && p.strength==256;
+    uint effective=p.second!=0 && (p.strength==0 || p.strength==256)?256:p.strength;
+    uint bits=p.filtered!=0?(dual || effective<256?3:4):0;
+    int2 d;
+    for(uint c=0;c<2;++c) {
+        int a=use_second?displace_word(second,p.b0+t.y*p.bs+t.x*4+c*2):displace_word(first,p.a0+t.y*p.as+t.x*4+c*2);
+        if(dual) {
+            int difference=displace_wrap(displace_word(second,p.b0+t.y*p.bs+t.x*4+c*2)-a);
+            d[c]=displace_wrap((a>>1)+((difference*int(p.strength<<7))>>16));
+            if(p.filtered==0)d[c]=displace_wrap(d[c]+4)>>3;
+        } else if(p.filtered!=0)d[c]=effective==256?a:(a*int(effective<<7))>>16;
+        else d[c]=(a*int(effective)+8)>>12;
+    }
+    int sx=displace_wrap(int(t.x)+(d.x>>bits)),sy=displace_wrap(int(t.y)+(d.y>>bits));
+    int fx=d.x&int((1u<<bits)-1),fy=d.y&int((1u<<bits)-1);
+    for(uint c=0;c<4;++c) {
+        int value=displace_sample(src,p,sx,sy,c);
+        if(p.filtered!=0) {
+            int top=value+(((displace_sample(src,p,sx+1,sy,c)-value)*fx)>>bits);
+            int bottom=displace_sample(src,p,sx,sy+1,c);
+            bottom+=((displace_sample(src,p,sx+1,sy+1,c)-bottom)*fx)>>bits;
+            value=top+(((bottom-top)*fy)>>bits);
+        }
+        dst[out+c]=uchar(clamp(value,0,255));
+    }
+}
+struct Vector { uint width,height,ds,ss,ms,d0,s0,m0,filtered,rectangular; };
+int vector_word(device const uchar* map,uint at) {return int(as_type<short>(ushort(uint(map[at])|(uint(map[at+1])<<8))));}
+int vector_wrap(int value) {return int(as_type<short>(ushort(value)));}
+int vector_sample(device const uchar* src,constant Vector& p,int x,int y,uint c) {
+    if(p.rectangular!=0) {
+        if(x<0 || y<0 || uint(x)>=p.width || uint(y)>=p.height)return 0;
+        return int(src[p.s0+uint(y)*p.ss+uint(x)*4+c]);
+    }
+    // Host admission bounds stride/4 so signed16 coordinates cannot overflow.
+    int index=y*int(p.ss/4)+x;
+    if(index<0 || uint(index)>=(p.ss/4)*p.height)return 0;
+    return int(src[p.s0+uint(index)*4+c]);
+}
+kernel void effector_vector(device uchar* dst [[buffer(0)]],device const uchar* src [[buffer(1)]],
+    device const uchar* map [[buffer(2)]],device const uint* coefficients [[buffer(3)]],constant Vector& p [[buffer(4)]],
+    uint2 t [[thread_position_in_grid]]) {
+    if(t.x>=p.width || t.y>=p.height)return;
+    uint at=p.m0+t.y*p.ms+t.x*6;
+    uint index=uint(map[at+4])|(uint(map[at+5])<<8),coefficient=coefficients[index];
+    int qx=vector_word(map,at)*int(as_type<short>(ushort(coefficient)));
+    int qy=vector_word(map,at+2)*int(as_type<short>(ushort(coefficient>>16)));
+    int dx=(qx>>16)+(p.filtered==0 && (uint(qx)&65535u)>=32768u?1:0);
+    int dy=(qy>>16)+(p.filtered==0 && (uint(qy)&65535u)>=32768u?1:0);
+    int sx=vector_wrap(int(t.x)+dx),sy=vector_wrap(int(t.y)+dy);
+    int fx=int((uint(qx)>>12)&15u),fy=int((uint(qy)>>12)&15u);
+    for(uint c=0;c<4;++c) {
+        int value=vector_sample(src,p,sx,sy,c);
+        if(p.filtered!=0) {
+            int top=value+(((vector_sample(src,p,sx+1,sy,c)-value)*fx)>>4);
+            int bottom=vector_sample(src,p,sx,sy+1,c);
+            bottom+=((vector_sample(src,p,sx+1,sy+1,c)-bottom)*fx)>>4;
+            value=top+(((bottom-top)*fy)>>4);
+        }
+        dst[p.d0+t.y*p.ds+t.x*4+c]=uchar(clamp(value,0,255));
+    }
+}
 struct Parameters { uint dw,dh,ds,sw,sh,ss,start_x,start_y,dx,dy,parameter,filtered; };
 int floor_shift(int v,uint bits) {
     return v>=0 ? int(uint(v)>>bits) : -int((uint(-(v+1))+1u+((1u<<bits)-1u))>>bits);
@@ -261,8 +374,10 @@ struct GpuPixelKernels::Impl {
     id<MTLDevice> device=nil;
     id<MTLCommandQueue> queue=nil;
     id<MTLComputePipelineState> pipeline=nil,crossfade_pipeline=nil,affine_pipeline=nil,mask_pipeline=nil,layer_pipeline=nil,transfer_pipeline=nil;
-    id<MTLBuffer> destination=nil,source=nil,second=nil;
+    id<MTLComputePipelineState> blur_horizontal=nil,blur_vertical=nil,displacement_pipeline=nil,vector_pipeline=nil;
+    id<MTLBuffer> destination=nil,source=nil,second=nil,auxiliary=nil;
     ~Impl() {
+        [blur_horizontal release];[blur_vertical release];[displacement_pipeline release];[vector_pipeline release];[auxiliary release];
         [source release];[second release];[destination release];[pipeline release];[crossfade_pipeline release];[affine_pipeline release];[mask_pipeline release];[layer_pipeline release];[transfer_pipeline release];[queue release];[device release];
     }
 };
@@ -273,7 +388,10 @@ GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>())
         if(!impl_->device)return;
         NSError* error=nil;
         id<MTLLibrary> library=[impl_->device newLibraryWithSource:[NSString stringWithUTF8String:shader_source] options:nil error:&error];
-        if(!library)return;
+        if(!library) {
+            std::cerr<<"warning: METAL_SHADER_COMPILE_FAILED "<<[[error localizedDescription] UTF8String]<<'\n';
+            return;
+        }
         id<MTLFunction> function=[library newFunctionWithName:@"scaled_alpha"];
         impl_->pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
         [function release];
@@ -291,6 +409,18 @@ GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>())
         [function release];
         function=[library newFunctionWithName:@"pixel_transfer"];
         impl_->transfer_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
+        [function release];
+        function=[library newFunctionWithName:@"effector_horizontal"];
+        impl_->blur_horizontal=[impl_->device newComputePipelineStateWithFunction:function error:&error];
+        [function release];
+        function=[library newFunctionWithName:@"effector_vertical"];
+        impl_->blur_vertical=[impl_->device newComputePipelineStateWithFunction:function error:&error];
+        [function release];
+        function=[library newFunctionWithName:@"effector_displacement"];
+        impl_->displacement_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
+        [function release];
+        function=[library newFunctionWithName:@"effector_vector"];
+        impl_->vector_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
         [function release];[library release];
         if(impl_->pipeline && impl_->crossfade_pipeline)impl_->queue=[impl_->device newCommandQueue];
     }
@@ -614,22 +744,168 @@ PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels& p) 
     }
 }
 
-std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const uint8_t> pixels) {
-    if(!available() || pixels.empty())return {};
-    @autoreleasepool {
-        id<MTLBuffer> buffer=[impl_->device newBufferWithLength:pixels.size() options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> staging=[impl_->device newBufferWithBytes:pixels.data() length:pixels.size() options:MTLResourceStorageModeShared];
-        if(!buffer || !staging){[buffer release];[staging release];return {};}
-        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];
-        id<MTLBlitCommandEncoder> encoder=[command blitCommandEncoder];
-        if(!command || !encoder){[buffer release];[staging release];return {};}
-        [encoder copyFromBuffer:staging sourceOffset:0 toBuffer:buffer destinationOffset:0 size:pixels.size()];
-        [encoder endEncoding];[command commit];[command waitUntilCompleted];
-        std::shared_ptr<GpuPixelStorage> result;
-        if([command status]==MTLCommandBufferStatusCompleted)
-            result=std::make_shared<MetalPixelStorage>(impl_->device,impl_->queue,buffer);
-        [buffer release];[staging release];return result;
+PixelKernelResult GpuPixelKernels::effector_blur(const EffectorBlurPixels& p) {
+    PixelKernelResult result;
+    if(!available() || !impl_->blur_horizontal || !impl_->blur_vertical || !valid_effector_blur(p))return result;
+    if(!p.radius) {
+        if(p.destination.pixels.data()==p.source.pixels.data() && p.destination.byte_offset==p.source.byte_offset &&
+                p.destination.stride==p.source.stride) {result.success=true;return result;}
+        return pixel_transfer({p.destination,p.source,PixelTransferOperation::Copy});
     }
+    if(p.selector<4) {
+        const auto d=reinterpret_cast<uintptr_t>(p.destination.pixels.data()),s=reinterpret_cast<uintptr_t>(p.source.pixels.data());
+        if(d<=s?s-d<p.destination.pixels.size():d-s<p.source.pixels.size())return result;
+    }
+    const bool timing=debug_enabled();const auto start=timing?Clock::now():Clock::time_point{};
+    @autoreleasepool {
+        const auto upload=timing?Clock::now():Clock::time_point{};
+        const auto ensure=[&](id<MTLBuffer>& b,size_t size) {
+            if(b && [b length]>=size)return true;
+            [b release];b=[impl_->device newBufferWithLength:size options:MTLResourceStorageModeShared];return b!=nil;
+        };
+        if(!ensure(impl_->destination,p.destination.pixels.size()) || !ensure(impl_->source,p.source.pixels.size()) ||
+                (p.selector>=4 && !ensure(impl_->second,uint64_t(p.source.width)*p.source.height*4)))return result;
+        std::memcpy([impl_->destination contents],p.destination.pixels.data(),p.destination.pixels.size());
+        std::memcpy([impl_->source contents],p.source.pixels.data(),p.source.pixels.size());
+        if(timing)result.upload_ns=elapsed(upload);
+        const uint32_t radius=std::min(p.radius,255U),diameter=radius*2+1;
+        const uint32_t args[]={p.destination.stride,p.source.stride,p.destination.byte_offset,p.source.byte_offset,
+            p.source.width,p.source.height,radius,((0x20000U+diameter*2)/diameter)&0xffffU,p.selector};
+        const auto wait=timing?Clock::now():Clock::time_point{};
+        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];
+        if(!command)return result;
+        const auto pass=[&](id<MTLComputePipelineState> pipeline,id<MTLBuffer> destination,id<MTLBuffer> source,uint32_t count) {
+            id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+            if(!encoder)return false;
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:destination offset:0 atIndex:0];[encoder setBuffer:source offset:0 atIndex:1];
+            [encoder setBytes:args length:sizeof(args) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256,[pipeline maxTotalThreadsPerThreadgroup]),1,1)];
+            [encoder endEncoding];return true;
+        };
+        if(p.selector<2) {if(!pass(impl_->blur_horizontal,impl_->destination,impl_->source,p.source.height))return result;}
+        else if(p.selector<4) {if(!pass(impl_->blur_vertical,impl_->destination,impl_->source,p.source.width))return result;}
+        else if(!pass(impl_->blur_horizontal,impl_->second,impl_->source,p.source.height) ||
+                !pass(impl_->blur_vertical,impl_->destination,impl_->second,p.source.width))return result;
+        [command commit];[command waitUntilCompleted];
+        if(timing)result.wait_ns=elapsed(wait);
+        if([command status]!=MTLCommandBufferStatusCompleted)return result;
+        const auto download=timing?Clock::now():Clock::time_point{};
+        std::memcpy(p.destination.pixels.data(),[impl_->destination contents],p.destination.pixels.size());
+        if(timing){result.download_ns=elapsed(download);result.total_ns=elapsed(start);}
+        result.success=true;result.used_gpu=true;return result;
+    }
+}
+
+PixelKernelResult GpuPixelKernels::effector_displacement(const EffectorDisplacementPixels& p) {
+    PixelKernelResult result;
+    if(!available() || !impl_->displacement_pipeline || !valid_effector_displacement(p))return result;
+    const bool timing=debug_enabled();const auto start=timing?Clock::now():Clock::time_point{};
+    @autoreleasepool {
+        const auto upload=timing?Clock::now():Clock::time_point{};
+        const auto put=[&](id<MTLBuffer>& b,std::span<const uint8_t> bytes) {
+            if(!b || [b length]<bytes.size()) {[b release];b=[impl_->device newBufferWithLength:bytes.size() options:MTLResourceStorageModeShared];}
+            if(!b)return false;std::memcpy([b contents],bytes.data(),bytes.size());return true;
+        };
+        if(!put(impl_->destination,p.destination.pixels) || !put(impl_->source,p.source.pixels) || !put(impl_->second,p.first.pixels) ||
+                (p.second && !put(impl_->auxiliary,p.second->pixels)))return result;
+        if(timing)result.upload_ns=elapsed(upload);
+        const auto wait=timing?Clock::now():Clock::time_point{};
+        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+        if(!command || !encoder)return result;
+        const uint32_t args[]={p.destination.width,p.destination.height,p.destination.stride,p.source.stride,p.first.stride,
+            p.second?p.second->stride:0,p.destination.byte_offset,p.source.byte_offset,p.first.byte_offset,p.second?p.second->byte_offset:0,
+            p.strength,p.bilinear?1U:0U,p.second?1U:0U};
+        [encoder setComputePipelineState:impl_->displacement_pipeline];
+        [encoder setBuffer:impl_->destination offset:0 atIndex:0];[encoder setBuffer:impl_->source offset:0 atIndex:1];
+        [encoder setBuffer:impl_->second offset:0 atIndex:2];[encoder setBuffer:p.second?impl_->auxiliary:impl_->second offset:0 atIndex:3];
+        [encoder setBytes:args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(p.destination.width,p.destination.height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        [encoder endEncoding];[command commit];[command waitUntilCompleted];
+        if(timing)result.wait_ns=elapsed(wait);
+        if([command status]!=MTLCommandBufferStatusCompleted)return result;
+        const auto download=timing?Clock::now():Clock::time_point{};
+        std::memcpy(p.destination.pixels.data(),[impl_->destination contents],p.destination.pixels.size());
+        if(timing){result.download_ns=elapsed(download);result.total_ns=elapsed(start);}
+        result.success=true;result.used_gpu=true;return result;
+    }
+}
+
+PixelKernelResult GpuPixelKernels::effector_vector(const EffectorVectorPixels& p) {
+    PixelKernelResult result;
+    if(!available() || !impl_->vector_pipeline || !valid_effector_vector(p))return result;
+    const bool timing=debug_enabled();const auto start=timing?Clock::now():Clock::time_point{};
+    @autoreleasepool {
+        const auto upload=timing?Clock::now():Clock::time_point{};
+        const auto put=[&](id<MTLBuffer>& b,std::span<const uint8_t> bytes) {
+            if(!b || [b length]<bytes.size()) {[b release];b=[impl_->device newBufferWithLength:bytes.size() options:MTLResourceStorageModeShared];}
+            if(!b)return false;std::memcpy([b contents],bytes.data(),bytes.size());return true;
+        };
+        const std::span<const uint8_t> coefficients(reinterpret_cast<const uint8_t*>(p.coefficients.data()),p.coefficients.size_bytes());
+        if(!put(impl_->destination,p.destination.pixels) || !put(impl_->source,p.source.pixels) || !put(impl_->second,p.normal.pixels) ||
+                !put(impl_->auxiliary,coefficients))return result;
+        if(timing)result.upload_ns=elapsed(upload);
+        const auto wait=timing?Clock::now():Clock::time_point{};
+        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+        if(!command || !encoder)return result;
+        const uint32_t args[]={p.destination.width,p.destination.height,p.destination.stride,p.source.stride,p.normal.stride,
+            p.destination.byte_offset,p.source.byte_offset,p.normal.byte_offset,p.bilinear?1U:0U,p.rectangular_bounds?1U:0U};
+        [encoder setComputePipelineState:impl_->vector_pipeline];
+        [encoder setBuffer:impl_->destination offset:0 atIndex:0];[encoder setBuffer:impl_->source offset:0 atIndex:1];
+        [encoder setBuffer:impl_->second offset:0 atIndex:2];[encoder setBuffer:impl_->auxiliary offset:0 atIndex:3];
+        [encoder setBytes:args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(p.destination.width,p.destination.height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        [encoder endEncoding];[command commit];[command waitUntilCompleted];
+        if(timing)result.wait_ns=elapsed(wait);
+        if([command status]!=MTLCommandBufferStatusCompleted)return result;
+        const auto download=timing?Clock::now():Clock::time_point{};
+        std::memcpy(p.destination.pixels.data(),[impl_->destination contents],p.destination.pixels.size());
+        if(timing){result.download_ns=elapsed(download);result.total_ns=elapsed(start);}
+        result.success=true;result.used_gpu=true;return result;
+    }
+}
+
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const uint8_t> pixels) {
+    const std::array<std::span<const uint8_t>,1> upload{pixels};
+    auto stored=store_pixels_batch(upload);
+    return stored.empty()?std::shared_ptr<GpuPixelStorage>{}:std::move(stored[0]);
+}
+std::vector<std::shared_ptr<GpuPixelStorage>> GpuPixelKernels::store_pixels_batch(std::span<const std::span<const uint8_t>> pixels) {
+    std::vector<std::shared_ptr<GpuPixelStorage>> result(pixels.size());
+    if(!available())return result;
+    // One wait for a bounded group, rather than one GPU round trip per bitmap.
+    // Cap transient staging to32MiB unless a single resource is larger.
+    for(size_t first=0;first<pixels.size();) {
+        size_t last=first,total=0;
+        do {total+=pixels[last++].size();} while(last<pixels.size() &&
+            pixels[last].size()<=32U*1024U*1024U && total<=32U*1024U*1024U-pixels[last].size());
+        @autoreleasepool {
+            id<MTLCommandBuffer> command=[impl_->queue commandBuffer];
+            id<MTLBlitCommandEncoder> encoder=[command blitCommandEncoder];
+            if(!command || !encoder)return result;
+            std::vector<std::shared_ptr<GpuPixelStorage>> group(last-first);
+            bool good=true;
+            for(size_t n=first;n<last;++n) {
+                const auto bytes=pixels[n];if(bytes.empty())continue;
+                id<MTLBuffer> buffer=[impl_->device newBufferWithLength:bytes.size() options:MTLResourceStorageModePrivate];
+                id<MTLBuffer> staging=[impl_->device newBufferWithBytes:bytes.data() length:bytes.size() options:MTLResourceStorageModeShared];
+                if(!buffer || !staging)good=false;
+                else {
+                    [encoder copyFromBuffer:staging sourceOffset:0 toBuffer:buffer destinationOffset:0 size:bytes.size()];
+                    group[n-first]=std::make_shared<MetalPixelStorage>(impl_->device,impl_->queue,buffer);
+                }
+                [buffer release];[staging release];
+                if(!good)break;
+            }
+            [encoder endEncoding];
+            if(!good)return result;
+            [command commit];[command waitUntilCompleted];
+            if([command status]!=MTLCommandBufferStatusCompleted)return result;
+            for(size_t n=first;n<last;++n)result[n]=std::move(group[n-first]);
+        }
+        first=last;
+    }
+    return result;
 }
 
 }
