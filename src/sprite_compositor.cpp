@@ -348,6 +348,8 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
         ~WarningContextScope() { slot = previous; }
     } warning_context{display_warning_context_, display_warning_context_};
     display_warning_context_ = callback;
+    const bool trace_frame_cost=debug_trace(DebugTrace::GpuFrames);
+    const auto callback_start=trace_frame_cost?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     const auto fail = [&](std::string_view reason) {
         return fail_display_draw(callback.bitmap, callback.display_object, "callback", reason);
     };
@@ -416,6 +418,7 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
     const uint32_t width = static_cast<uint32_t>(callback.source_right - callback.source_left) + 1U;
     const uint32_t height = static_cast<uint32_t>(callback.source_bottom - callback.source_top) + 1U;
     GraphicsSurface view;
+    view.defer_rgba_mirror=true;
     view.width = width;
     view.height = height;
     view.format = target->second.format;
@@ -454,6 +457,8 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
         const int32_t x = static_cast<int32_t>(0U - static_cast<uint32_t>(callback.destination_left));
         const int32_t y = static_cast<int32_t>(0U - static_cast<uint32_t>(callback.destination_top));
         bool composed = false;
+        const bool trace_gpu=debug_trace(DebugTrace::Gpu);
+        const auto gpu_before=trace_gpu?host_pixel_kernel_statistics():HostPixelKernelStatistics{};
         const auto failure_serial = display_failure_serial_;
         if (icon_record != nullptr) {
             if(icon_record->render_effect>=256U)composed=true;
@@ -584,6 +589,21 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
                               << " encoded=" << src->second.encoded.size();
                 std::cerr << '\n';
             }
+        }
+        if(trace_gpu) {
+            const auto after=host_pixel_kernel_statistics();
+            std::cout<<"GPU_CALLBACK object="<<callback.display_object<<" width="<<width<<" height="<<height
+                     <<" success="<<composed<<" dispatches="<<(after.gpu_dispatches-gpu_before.gpu_dispatches)
+                     <<" cpu_kernels="<<(after.cpu_calls-gpu_before.cpu_calls)<<'\n';
+        }
+        if(trace_frame_cost) {
+            const auto duration=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-callback_start).count();
+            std::cout<<"GPU_CALLBACK_COST object="<<callback.display_object<<" width="<<width<<" height="<<height
+                <<" total_ns="<<duration<<" success="<<composed;
+            if(const auto effect=effector_effects_.find(callback.display_object);effect!=effector_effects_.end())
+                std::cout<<" effector_kind="<<effect->second.mode<<" effector_selector="<<effect->second.mode_value
+                    <<" effect_level="<<object_effect_level(callback.display_object);
+            std::cout<<'\n';
         }
         cleanup();
         return composed;

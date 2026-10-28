@@ -1,104 +1,93 @@
 # BGIplayer
 
-使用 C++20 和 SDL2 实现的 BGI（Buriko General Interpreter）跨平台播放器，附带 Flutter 游戏库界面。引擎行为依据原程序的反编译、反汇编和运行结果逐步实现。
+Fresh C++20/SDL2 implementation of the Buriko General Interpreter (BGI).
 
-本仓库仅发布程序源码、必要的界面资源与构建配置，不包含游戏资源、汉化文本、原版可执行文件、存档、测试或逆向工程资料。
+This project is intentionally independent from the existing `openbgi` source
+tree. Native behavior is derived from Ghidra decompilation of the target
+executable and tracked in `docs/SEMANTICS.md`.
 
-## 功能
+The active frontier, uncommitted-work status, and restart instructions are
+recorded in `docs/CURRENT_STATE.md`.
 
-- 读取 PackFile、BURIKO ARC20 等游戏资源包。
-- 支持已适配的 32 位和 64 位 BGI VM、线程调度、画面合成和文字排版。
-- 通过 SDL2 处理窗口、鼠标、键盘和音频输出，通过 FFmpeg 解码音视频。
-- macOS 支持 Metal 图像合成，并提供 CPU 精确、GPU 精确和 GPU 快速渲染模式。
-- 支持存档、压缩调试快照、鼠标事件记录与重放。
-- 自动加载游戏目录中的 `translation_patch` 文本补丁。
-- Flutter 界面支持游戏目录导入、游戏库、运行日志和默认字体设置。
+Physical file access and Windows-to-host path mapping are documented in
+[`docs/HOST_FILE_SYSTEM.md`](docs/HOST_FILE_SYSTEM.md). Save/load compression
+and VM wait semantics remain separate from that host interface.
 
-不同游戏及引擎版本的兼容程度仍有差异。当前主要验证平台是 macOS；iOS 工程和嵌入式引擎接口也包含在源码中。
+Content checks use `BGI_CHECK_LEVEL=warn` (default) or `strict`. Structural
+errors always reject the operation. See [`docs/CHECK_LEVELS.md`](docs/CHECK_LEVELS.md)
+for the classification and affected formats.
 
-## 构建命令行引擎
+The reusable [`bgi-runtime-debug` skill](skills/bgi-runtime-debug/SKILL.md)
+provides a step-by-step runtime investigation workflow, targeted trace guidance,
+and read-only log/SUD inspection tools for agents continuing this port.
 
-依赖 C++20 编译器、Make、SDL2、FFmpeg、FreeType、zlib 和 pkg-config。macOS 构建还使用系统提供的 Metal、Cocoa、CoreText 等框架及 iconv。
+## Current milestone
 
-在 macOS 上准备依赖后编译：
+The bootstrap currently provides:
 
-```sh
-brew install sdl2 ffmpeg freetype pkg-config
-make -j4
-./build/bgiplayer --game "/path/to/game" --backend sdl2
-```
+- PackFile and BURIKO ARC20 index parsing;
+- case-insensitive game archive discovery;
+- script header extraction;
+- the BP operand/frame stack primitives and a growing opcode core;
+- an SDL2 window/event loop and a null backend for tests;
+- FFmpeg archive audio demux/decode into 48 kHz stereo S16 PCM and SDL2
+  BGM/effect mixing;
+- all `760/760` in-scope runtime native slots registered with Ghidra-derived
+  ABI/status/state semantics;
+- BG loading including uncompressed and `CompressedBG___`
+  predictor/RLE/Huffman codecs;
+- a deterministic self-test binary.
 
-`--game` 指向游戏根目录，资源可以位于根目录或其 `Archive/` 子目录。程序不包含游戏本身。
+The runtime target is the 760 in-scope native slots counted by
+`scripts/native_progress.pl`, not a compatibility fallback. Developer
+diagnostics, installer, network, optical-drive and removable-media slots are
+outside the runtime scope and do not block completion.
 
-```sh
-# 指定默认对话字体
-./build/bgiplayer --game "/path/to/game" --backend sdl2 \
-  --default-font "/path/to/font.ttf"
+Native-slot registration is complete, but engine completion still requires
+consuming all recorded renderer commands, scheduler/wait parity, host audio and
+movie backends, and remaining text/input integration. `docs/CURRENT_STATE.md`
+tracks that backend frontier.
 
-# 渲染模式
-BGI_GPU=0 ./build/bgiplayer --game "/path/to/game" --backend sdl2 --render-mode exact
-BGI_GPU=1 ./build/bgiplayer --game "/path/to/game" --backend sdl2 --render-mode exact
-BGI_GPU=1 ./build/bgiplayer --game "/path/to/game" --backend sdl2 --render-mode fast
-
-# 查看命令行选项
-./build/bgiplayer --help
-```
-
-字体需要覆盖游戏及译文所用的字符。`BGI_CHECK_LEVEL=warn` 为默认内容校验级别，`strict` 可用于定位不一致；结构错误和越界访问不会因此被放行。
-
-## 构建 macOS 界面
-
-需要 Flutter SDK、Xcode 和上述原生依赖。在仓库根目录执行：
-
-```sh
-make -j4
-cd src/UI
-bash tool/build_macos.sh
-```
-
-输出位于 `src/UI/build/macos/Build/Products/Release/BGIplayer.app`，包含引擎及运行需要的动态库。界面通过独立 SDL 进程运行游戏，游戏库和日志使用系统 Application Support 目录。
-
-## iOS 工程
-
-需要 Flutter、Xcode 和 iOS 原生依赖。构建入口：
+## Build
 
 ```sh
-cd src/UI
-bash tool/build_ios.sh simulator
-# 未签名设备包
-bash tool/build_ios.sh device
+make
+make test
+./build/bgiplayer --game "../放課後シンデレラ" --backend null --list-archives
+./build/bgiplayer --game "../放課後シンデレラ" --backend sdl2
+./build/bgiplayer --game "../放課後シンデレラ" \
+  --dump-bitmap Archive/data02800.arc:title_ani_logo \
+  --dump-bitmap-output tmp_shot/title_ani_logo.bmp
+SDL_VIDEODRIVER=dummy ./build/bgiplayer \
+  --game "../放課後シンデレラ" --backend sdl2 --seconds 0.1
 ```
 
-设备安装需要自行签名。移动端使用应用文档目录下的 `Games`，每个子目录作为一个游戏目录。
+Build dependencies: zlib, SDL2 plus FFmpeg development libraries exposed through
+`pkg-config` (`libavformat`, `libavcodec`, `libavutil`, `libswresample`,
+`libswscale`).
 
-## 补丁与调试工具
+On macOS, large verified sprite scaling and crossfade operations automatically
+use Metal compute, with exact CPU fallback. No extra GPU SDK or shader compiler
+installation is needed. Use `BGI_GPU=0` to force CPU, `BGI_GPU=1` to request GPU
+at every size, and `BGI_TRACE_GPU=1` to see actual dispatch counts. Other
+platforms currently use the portable CPU kernels. See
+[`docs/GPU_PIXEL_KERNELS.md`](docs/GPU_PIXEL_KERNELS.md) for supported paths,
+pixel comparisons, and measured costs.
 
-- `tools/translation_patch.py`：资源替换补丁的生成与检查。
-- `tools/compiled_text_patch.py`：已验证格式的剧情文本提取与重建。
-- `tools/windows_translation_build.py` 与 `tools/windows_translation_loader.c`：为匹配的原版 PE64 程序构建 Windows 补丁加载器。需要本地原始游戏、补丁及 MinGW 工具链，不包含生成后的游戏文本。
-
-```sh
-# 记录与重放鼠标输入
-./build/bgiplayer --game "/path/to/game" --backend sdl2 --record-clicks clicks.csv
-./build/bgiplayer --game "/path/to/game" --backend sdl2 --replay-clicks clicks.csv
-```
-
-## 目录
-
-- `include/`：引擎公共接口。
-- `src/`：引擎和 Flutter 界面。
-- `tools/`：补丁处理与 Windows 加载器源码。
-- `scripts/`：默认图标嵌入脚本。
-- `Makefile`：原生命令行程序构建入口。
-
-### GPU frame memory
-
-GPU presentation releases the completed frame's CPU pixel caches by default.
-Screenshots, native screen capture and debug snapshots read pixels back only
-when needed. VM bitmap resources remain available to native pixel operations.
-Use `BGI_KEEP_CPU_PIXELS=1` to retain frame copies for debugging, or `BGI_GPU=0`
-for CPU rendering. Intermediate compute operations still use synchronous
-transfers; this is not a fully resident GPU resource graph.
+For a reproducible input sequence, repeat `--click` in order. For example,
+`--click 320,610 --click 472,269 --click-delay-ms 15000 --click-interval-ms 15000`
+presses Start at15seconds and the first prologue card at30seconds. Both
+headless and SDL hosts release each press at that same point after150ms.
+The click count is at least the number of points; a larger `--click-count`
+repeats the final point. A single point retains the existing repeated-click
+behavior. These host inputs do not alter script state or selection results.
+Use `--record-clicks logs/clicks.csv` to save mouse motion and left/right
+down/up events, `--replay-clicks logs/clicks.csv` to run them automatically,
+and `--trace-clicks` for readable terminal output. See
+[`docs/CLICK_RECORDING.md`](docs/CLICK_RECORDING.md) for timing and replay limits.
+Use `--right-click X,Y` in the same sequence to inject the right button
+instead of the left button. Coordinates are engine logical pixels. Both
+buttons use the normal input records and are released after150ms.
 
 ### Android
 
@@ -114,8 +103,12 @@ release APK uses the local Android debug signing key for sideloading.
 ### GPU frame memory
 
 GPU presentation releases the completed frame's CPU pixel caches by default.
-Screenshots, native screen capture and debug snapshots read pixels back only
-when needed. VM bitmap resources remain available to native pixel operations.
-Use `BGI_KEEP_CPU_PIXELS=1` to retain frame copies for debugging, or `BGI_GPU=0`
+VM bitmap resources and window planes also move to GPU storage, with native
+pixel operations, screenshots and debug snapshots reading bytes back on demand.
+Use `BGI_KEEP_CPU_PIXELS=1` to retain CPU pixel copies for debugging, or `BGI_GPU=0`
 for CPU rendering. Intermediate compute operations still use synchronous
 transfers; this is not a fully resident GPU resource graph.
+
+Enable `BGI_TRACE_GPU_FRAMES=1` to record full frame, render-phase and callback
+costs. Use `python3 tools/analyze_frame_budget.py run.log --output frame-cost`
+to export CSV/JSON, separating present waits from work against a 16.67 ms budget.

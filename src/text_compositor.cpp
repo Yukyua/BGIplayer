@@ -669,10 +669,12 @@ bool VM::record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
         const auto width=static_cast<uint32_t>(right-left+1),height=static_cast<uint32_t>(bottom-top+1);
         const auto d0=static_cast<uint64_t>(top)*output.stride+static_cast<uint64_t>(left)*4U;
         const auto s0=static_cast<uint64_t>(top-y)*image.stride+static_cast<uint64_t>(left-x)*4U;
+        const auto resident=destination!=source?image.pixels.gpu_storage():std::shared_ptr<GpuPixelStorage>{};
+        const std::span<uint8_t> source_bytes=resident?std::span<uint8_t>{}:std::span<uint8_t>(image.pixels);
         if(d0<=UINT32_MAX && s0<=UINT32_MAX && compose_host_layer_composite({
             {output.pixels,static_cast<uint32_t>(d0),output.stride,width,height,output.format,4},
-            {image.pixels,static_cast<uint32_t>(s0),image.stride,width,height,2,4},
-            reciprocal_corrections}).success) {
+            {source_bytes,static_cast<uint32_t>(s0),image.stride,width,height,2,4},
+            reciprocal_corrections,resident}).success) {
             refresh_bgra_mirror(output);
             if(debug_enabled())bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
             display_dirty_=true;return true;

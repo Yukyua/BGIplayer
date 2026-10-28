@@ -21,6 +21,7 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
     const uint32_t source = target - 1U;
     const uint32_t isolated = target - 2U;
     GraphicsSurface plane;
+    plane.defer_rgba_mirror=true;
     plane.width = state.width;
     plane.height = state.height;
     plane.format = state.plane_format;

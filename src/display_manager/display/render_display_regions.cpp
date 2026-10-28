@@ -54,6 +54,7 @@ bool VM::render_display_regions(uint32_t width, uint32_t height,
         bitmap_blits_.resize(blits);
         display_dirty_ = dirty;
     };
+    frame.defer_rgba_mirror=true;
     graphics_surfaces_[target] = std::move(frame);
     try {
         for (const auto& region : regions) {
@@ -72,6 +73,7 @@ bool VM::render_display_regions(uint32_t width, uint32_t height,
                 }
             }
         }
+        graphics_surfaces_.at(target).defer_rgba_mirror=false;
         refresh_bgra_mirror(graphics_surfaces_.at(target));
         display_frame_ = std::move(graphics_surfaces_.at(target));
         display_frame_gpu_cached_=false;

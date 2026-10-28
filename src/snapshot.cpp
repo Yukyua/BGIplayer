@@ -56,6 +56,10 @@ struct SnapshotCodec {
             if (reading) value.resize(static_cast<std::size_t>(size));
             if (size) raw(value.data(), static_cast<std::size_t>(size));
         }
+        void operator()(PixelBuffer& value) {
+            if(reading) {std::vector<uint8_t> bytes;(*this)(bytes);value=std::move(bytes);}
+            else {PixelBuffer temporary=value;(*this)(temporary.cpu_pixels());}
+        }
         template<class T, class Alloc> void operator()(std::vector<T,Alloc>& value) {
             const auto size = count(value.size());
             if (reading) value.resize(static_cast<std::size_t>(size));

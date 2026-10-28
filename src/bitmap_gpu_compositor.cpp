@@ -1,10 +1,11 @@
 #include "bgiplayer/vm.hpp"
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include <iostream>
 namespace bgiplayer {
 bool VM::accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t x,int32_t y,
                                     uint32_t mode,uint32_t parameter,bool direct_copy,bool source_fade) {
     auto target=graphics_surfaces_.find(destination),input=graphics_surfaces_.find(source);
-    if(target==graphics_surfaces_.end() || input==graphics_surfaces_.end())return false;
+    if(target==graphics_surfaces_.end() || input==graphics_surfaces_.end() || destination==source)return false;
     // Host accelerator for the original0040BDD0/0040BED0 copy,
     // 0040C5E0 constant opacity and modeC0 source fade. Geometry and
     // admitted format/mode dispatch above remain engine-owned.
@@ -25,9 +26,11 @@ bool VM::accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t
             const uint64_t d0=uint64_t(top)*out.stride+uint64_t(left)*4;
             const uint64_t s0=uint64_t(top-y)*in.stride+uint64_t(left-x)*4;
             const auto w=static_cast<uint32_t>(right-left),h=static_cast<uint32_t>(bottom-top);
+            const auto resident=in.pixels.gpu_storage();
+            const std::span<uint8_t> source_bytes=resident?std::span<uint8_t>{}:std::span<uint8_t>(in.pixels);
             if(d0<=UINT32_MAX && s0<=UINT32_MAX && compose_host_pixel_transfer({
                     {out.pixels,static_cast<uint32_t>(d0),out.stride,w,h,out.format,4},
-                    {in.pixels,static_cast<uint32_t>(s0),in.stride,w,h,in.format,4},*gpu_operation,parameter,0}).success) {
+                    {source_bytes,static_cast<uint32_t>(s0),in.stride,w,h,in.format,4},*gpu_operation,parameter,0,resident}).success) {
                 refresh_bgra_mirror(out);
                 if(debug_enabled())bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
                 display_dirty_=true;return true;
@@ -36,4 +39,33 @@ bool VM::accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t
     }
     return false;
 }
+void VM::offload_bitmap_cpu_pixels() {
+    if(retain_cpu_pixel_copies())return;
+    bool complete=true;
+    const auto buffer=[&](PixelBuffer& p){if(!p.offload())complete=false;};
+    const auto surface=[&](GraphicsSurface& s) {buffer(s.pixels);buffer(s.rgba);buffer(s.encoded);};
+    for(auto& [id,s]:graphics_surfaces_){(void)id;surface(s);}
+    for(auto& [id,w]:window_objects_) {
+        (void)id;buffer(w.background_plane);buffer(w.overlay_plane);
+        buffer(w.text_saved_plane);buffer(w.composite_plane);
+        for(auto& layer:w.image_layers)surface(layer.image);
+    }
+    static bool warned=false;
+    if(!complete && !warned) {
+        warned=true;
+        std::cerr<<"warning: GPU_BITMAP_STORAGE_UNAVAILABLE; retaining CPU pixels for safe fallback\n";
+    }
+}
+std::array<uint64_t,2> VM::bitmap_pixel_storage_bytes() const {
+    std::array<uint64_t,2> bytes{};
+    const auto buffer=[&](const PixelBuffer& p){bytes[0]+=p.capacity();bytes[1]+=p.gpu_bytes();};
+    const auto surface=[&](const GraphicsSurface& s){buffer(s.pixels);buffer(s.rgba);buffer(s.encoded);};
+    for(const auto& [id,s]:graphics_surfaces_){(void)id;surface(s);}
+    for(const auto& [id,w]:window_objects_) {
+        (void)id;buffer(w.background_plane);buffer(w.overlay_plane);buffer(w.text_saved_plane);buffer(w.composite_plane);
+        for(const auto& layer:w.image_layers)surface(layer.image);
+    }
+    return bytes;
+}
+
 }

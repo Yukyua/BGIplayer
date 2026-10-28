@@ -1,6 +1,7 @@
 #pragma once
 #include "bgiplayer/glyph.hpp"
 #include "bgiplayer/render_policy.hpp"
+#include "bgiplayer/pixel_storage.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -44,6 +45,7 @@ struct BackgroundMaskPixels {
 struct LayerCompositePixels {
     GlyphBitmapView destination, source; // equally sized, pre-clipped views
     std::span<const uint8_t> reciprocal_corrections;
+    std::shared_ptr<GpuPixelStorage> source_storage{};
 };
 // Exact pre-clipped host transfers used by original bitmap/display callbacks.
 // Copy retains the format-1/2 conversion rules; opacity parameters are0..256.
@@ -54,6 +56,7 @@ struct PixelTransferPixels {
     GlyphBitmapView destination, source;
     PixelTransferOperation operation = PixelTransferOperation::Copy;
     uint32_t parameter = 0, color = 0;
+    std::shared_ptr<GpuPixelStorage> source_storage{};
 };
 bool valid_pixel_transfer(const PixelTransferPixels& pixels);
 struct PixelKernelResult {
@@ -79,6 +82,7 @@ public:
     PixelKernelResult layer_composite(const LayerCompositePixels& pixels);
     PixelKernelResult background_mask(const BackgroundMaskPixels& pixels);
     PixelKernelResult pixel_transfer(const PixelTransferPixels& pixels);
+    std::shared_ptr<GpuPixelStorage> store_pixels(std::span<const uint8_t> pixels);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

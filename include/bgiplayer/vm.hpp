@@ -1,6 +1,7 @@
 #pragma once
 #include "bgiplayer/resource_integrity.hpp"
 #include "bgiplayer/media_source.hpp"
+#include "bgiplayer/pixel_buffer.hpp"
 
 #include "bgiplayer/window_policy.hpp"
 
@@ -4360,11 +4361,12 @@ public:
         uint32_t bytes_per_pixel = 0;
         uint32_t stride = 0;
         uint32_t allocation_token = 0xFFFFFFFFU; // bitmap manager entry +1C
-        std::vector<uint8_t> encoded;
+        PixelBuffer encoded;
         std::string archive;
         std::string resource;
-        std::vector<uint8_t> rgba;
-        std::vector<uint8_t> pixels;
+        PixelBuffer rgba;
+        PixelBuffer pixels;
+        bool defer_rgba_mirror=false; // host-only compositor scratch
     };
     struct MovieSlotState {
         std::string directory;
@@ -6581,7 +6583,7 @@ public:
         if (capacity < required) {
             return 10;
         }
-        const std::vector<uint8_t> pixels = [&]() {
+        const std::vector<uint8_t> pixels = [&]() -> std::vector<uint8_t> {
             if (!bitmap.pixels.empty()) {
                 return bitmap.pixels;
             }
@@ -6808,6 +6810,8 @@ public:
     [[nodiscard]] std::optional<DecodedBitmap> display_frame_snapshot() const;
     // Read-only host upload view. Consume synchronously before the next render.
     [[nodiscard]] const GraphicsSurface& display_frame_view() const;
+    void offload_bitmap_cpu_pixels();
+    [[nodiscard]] std::array<uint64_t,2> bitmap_pixel_storage_bytes() const;
     using DisplayFrameReadbackProvider=std::function<bool(GraphicsSurface&)>;
     void set_display_frame_readback_provider(DisplayFrameReadbackProvider provider) {
         display_frame_readback_provider_=std::move(provider);
@@ -7701,13 +7705,13 @@ public:
         bool selection_columns_enabled = false;
         std::array<uint32_t, 16> selection_columns{};
         uint32_t background_fill_color = 0;
-        std::vector<uint8_t> background_plane;
+        PixelBuffer background_plane;
         uint32_t plane_format = 2;
         uint32_t overlay_level = 0;
         std::array<WindowImageLayer, 8> image_layers;
-        std::vector<uint8_t> overlay_plane;
-        std::vector<uint8_t> text_saved_plane; // original +1C0 snapshot used by 00430A00
-        std::vector<uint8_t> composite_plane;
+        PixelBuffer overlay_plane;
+        PixelBuffer text_saved_plane; // original +1C0 snapshot used by 00430A00
+        PixelBuffer composite_plane;
     };
     struct WindowBitmapCommand {
         uint32_t bitmap = 0;
@@ -7898,7 +7902,7 @@ public:
         const auto found = window_objects_.find(window);
         return found == window_objects_.end()
                    ? empty
-                   : found->second.background_plane;
+                   : found->second.background_plane.cpu_pixels();
     }
     [[nodiscard]] uint32_t window_background_format() const {
         return current_capture_format_;
@@ -13014,20 +13018,19 @@ public:
                 16U));
     }
     static void refresh_bgra_mirror(GraphicsSurface& surface) {
-        const std::size_t pixel_count =
-            static_cast<std::size_t>(surface.width) *
-            surface.height;
-        surface.rgba.assign(pixel_count * 4U, 0);
-        if (surface.format != 1U && surface.format != 2U) {
-            return;
+        if(surface.defer_rgba_mirror){surface.rgba.clear();return;}
+        const size_t count=static_cast<size_t>(surface.width)*surface.height;
+        auto* rgba=surface.rgba.overwrite(count*4U);
+        if(surface.format!=1U && surface.format!=2U) {
+            std::fill_n(rgba,count*4U,uint8_t{0});return;
         }
-        for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
-            const std::size_t offset = pixel * 4U;
-            surface.rgba[offset] = surface.pixels[offset + 2U];
-            surface.rgba[offset + 1U] = surface.pixels[offset + 1U];
-            surface.rgba[offset + 2U] = surface.pixels[offset];
-            surface.rgba[offset + 3U] =
-                surface.format == 1U ? 0xFFU : surface.pixels[offset + 3U];
+        // Resolve a CPU view once; per-byte lazy-access checks prevent SIMD
+        // and needlessly touch the ownership state for every color component.
+        const auto& pixels=std::as_const(surface.pixels).cpu_pixels();
+        for(size_t pixel=0;pixel<count;++pixel) {
+            const size_t at=pixel*4U;
+            rgba[at]=pixels[at+2U];rgba[at+1U]=pixels[at+1U];rgba[at+2U]=pixels[at];
+            rgba[at+3U]=surface.format==1U?0xffU:pixels[at+3U];
         }
     }
     bool accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t x,int32_t y,

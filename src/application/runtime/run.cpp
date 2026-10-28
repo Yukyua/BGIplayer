@@ -2530,7 +2530,10 @@ int run(const Options& options) {
     vm.set_input_return_gate((initial_window_flags & SDL_WINDOW_MINIMIZED) == 0);
     vm.set_sys0_state_542c58((initial_window_flags & SDL_WINDOW_INPUT_FOCUS) != 0 ? 1U : 0U);
     synchronize_keyboard();
+    const bool trace_frame_budget=debug_trace(DebugTrace::GpuFrames);
+    uint64_t budget_frame=0;
     while (running) {
+        const auto budget_start=trace_frame_budget?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         text_edit_bridge->synchronize();
         SDL_Event event{};
         bool received_input = false;
@@ -2853,6 +2856,7 @@ int run(const Options& options) {
             click_release_at.reset();
             received_input = true;
         }
+        const auto budget_vm_start=trace_frame_budget?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         vm.wake_for_timing(monotonic_ms());
         if (received_input) {
             vm.wake_for_input();
@@ -2927,6 +2931,7 @@ int run(const Options& options) {
             }
             throw Error(message.str());
         }
+        const auto budget_render_start=trace_frame_budget?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         SDL_SetWindowTitle(window.get(), vm.window_title().c_str());
         vm.advance_screen_shake(monotonic_ms());
         update_movie(static_cast<uint64_t>(SDL_GetTicks()));
@@ -2937,6 +2942,7 @@ int run(const Options& options) {
                 ? &movie_playback : nullptr,
             &last_presented_primary, &movie_texture, &logical_primary, &display_texture,
             text_edit_bridge.get());
+        const auto budget_render_end=trace_frame_budget?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         if (options.runtime_seconds > 0.0 &&
             SDL_GetTicks() - started >=
                 static_cast<uint32_t>(options.runtime_seconds * 1000.0)) {
@@ -2946,6 +2952,16 @@ int run(const Options& options) {
         if (SDL_GetRendererInfo(renderer.get(), &present_device) != 0 ||
             (present_device.flags & SDL_RENDERER_PRESENTVSYNC) == 0)
             SDL_Delay(8);
+        if(trace_frame_budget) {
+            const auto end=std::chrono::steady_clock::now();
+            const auto ns=[](auto duration){return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();};
+            const auto elapsed=ns(end-budget_start);
+            std::cout<<"FRAME_BUDGET index="<<budget_frame++<<" tick="<<SDL_GetTicks()<<" total_ns="<<elapsed
+                <<" input_ns="<<ns(budget_vm_start-budget_start)<<" vm_ns="<<ns(budget_render_start-budget_vm_start)
+                <<" render_ns="<<ns(budget_render_end-budget_render_start)<<" pacing_ns="<<ns(end-budget_render_end)
+                <<" over_60fps="<<(elapsed>16666666)<<" over_20ms="<<(elapsed>20000000)
+                <<" main_ip="<<vm.main_thread().ip<<'\n';
+        }
     }
     if (options.screenshot) {
         save_screenshot();

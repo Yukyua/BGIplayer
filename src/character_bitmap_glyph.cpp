@@ -60,7 +60,7 @@ GlyphOutlineProvider VM::with_character_bitmaps(GlyphOutlineProvider host,uint32
             }
             if(!record_bitmap_blit(scratch,blit_source,0,0,0,0))
                 throw BpFault("character-bitmap glyph original copy failed");
-            glyph.bitmap=std::move(graphics_surfaces_.at(scratch).pixels);cleanup();
+            glyph.bitmap=std::move(graphics_surfaces_.at(scratch).pixels).take_cpu_pixels();cleanup();
         }catch(...){cleanup();throw;}
         }
         if(scaled) {

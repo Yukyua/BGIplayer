@@ -120,6 +120,7 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
         vm.invalidate_display_frame_gpu_cache();
         render_vm_content(renderer, vm, movie, movie_texture);
     }
+    const auto compose_end=trace_cost?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     // Grp0:04 locks the existing primary surface. Capture the pixels this
     // normal display tick is about to present; native capture must not redraw
     // a partly modified VM or use the legacy renderer as a capture side effect.
@@ -237,10 +238,13 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
     if (text_edit) text_edit->render();
     if (logical_primary && !logical_primary->copy_to_window())
         throw Error(std::string("cannot present logical primary surface: ") + SDL_GetError());
+    const auto present_start=trace_cost?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     SDL_RenderPresent(renderer);
+    const auto present_end=trace_cost?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(!keep_cpu_pixels) {
         if(primary)primary->reset();
         if(rendered && frame_cache.has_raw_pixels())vm.release_display_frame_cpu_pixels();
+        vm.offload_bitmap_cpu_pixels();
     }
     if (keep_cpu_pixels && primary != nullptr && !reuse_primary) {
         if (pending_primary.rgba.empty()) primary->reset();
@@ -249,12 +253,20 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
     if (primary && primary->has_value() && capture_key)
         frame_cache.mark_presented(*capture_key);
     if (trace_cost) {
+        const auto cost_end=std::chrono::steady_clock::now();
         const auto cost_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - cost_start).count();
+            cost_end - cost_start).count();
         const auto cost_after = host_pixel_kernel_statistics();
+        const auto bitmap_bytes=vm.bitmap_pixel_storage_bytes();
         std::cout << "GPU_FRAME_COST tick=" << SDL_GetTicks()
                   << " retained_cpu_pixels=" << vm.retained_display_frame_cpu_bytes()
+                  << " bitmap_cpu_bytes=" << bitmap_bytes[0]
+                  << " bitmap_gpu_bytes=" << bitmap_bytes[1]
                   << " total_ns=" << cost_ns
+                  << " compose_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(compose_end-cost_start).count()
+                  << " upload_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(present_start-compose_end).count()
+                  << " present_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(present_end-present_start).count()
+                  << " eviction_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(cost_end-present_end).count()
                   << " kernel_calls=" << cost_after.calls - cost_before.calls
                   << " gpu_dispatches=" << cost_after.gpu_dispatches - cost_before.gpu_dispatches
                   << " cpu_calls=" << cost_after.cpu_calls - cost_before.cpu_calls << '\n';
