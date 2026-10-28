@@ -113,6 +113,9 @@ public:
     PixelKernelResult crossfade(const CrossfadePixels& pixels);
     PixelKernelResult affine(const AffinePixels& pixels);
     PixelKernelResult layer_composite(const LayerCompositePixels& pixels);
+    // Ordered, immutable resident layers sharing one destination allocation.
+    // Failure never publishes a partial result to CPU destination storage.
+    PixelKernelResult layer_composite_batch(std::span<const LayerCompositePixels> layers);
     PixelKernelResult background_mask(const BackgroundMaskPixels& pixels);
     PixelKernelResult pixel_transfer(const PixelTransferPixels& pixels);
     PixelKernelResult effector_blur(const EffectorBlurPixels& pixels);
@@ -136,6 +139,8 @@ PixelKernelResult compose_host_fast_affine(const AffinePixels& pixels);
 // Fast-policy dispatch, but integer mask results retain exact CPU byte values.
 PixelKernelResult compose_host_fast_background_mask(const BackgroundMaskPixels& pixels);
 PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& pixels);
+bool valid_layer_composite_batch(std::span<const LayerCompositePixels> layers);
+PixelKernelResult compose_host_layer_composite_batch(std::span<const LayerCompositePixels> layers);
 PixelKernelResult compose_host_pixel_transfer(const PixelTransferPixels& pixels);
 PixelKernelResult compose_host_effector_blur(const EffectorBlurPixels& pixels);
 PixelKernelResult compose_host_effector_displacement(const EffectorDisplacementPixels& pixels);

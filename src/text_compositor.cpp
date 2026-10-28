@@ -2,6 +2,7 @@
 #include "bgiplayer/glyph_style.hpp"
 #include "bgiplayer/text_measure.hpp"
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/layer_composite.hpp"
 #include <bit>
 #include <iostream>
 
@@ -656,15 +657,7 @@ bool VM::record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
     // C210's pair uses RCPPS then truncation; its odd tail uses integer DIV.
     // The 8-bit alpha domain is finite. Sparse corrections retain all 65,536
     // measured original pair weights without relying on host reciprocal ISA.
-    static const auto reciprocal_corrections = [] {
-        std::array<uint8_t, 65536> result{};
-        constexpr uint32_t entries[] = {
-#include "original_mode0_alpha_corrections.inc"
-        };
-        for (const uint32_t entry : entries)
-            result[entry >> 3U] = static_cast<uint8_t>(entry & 7U);
-        return result;
-    }();
+    const auto reciprocal_corrections=original_layer_reciprocal_corrections();
     if(left<=right && top<=bottom) {
         const auto width=static_cast<uint32_t>(right-left+1),height=static_cast<uint32_t>(bottom-top+1);
         const auto d0=static_cast<uint64_t>(top)*output.stride+static_cast<uint64_t>(left)*4U;

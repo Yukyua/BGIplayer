@@ -20,6 +20,7 @@ PixelKernelResult GpuPixelKernels::effector_transform(const EffectorTransformPix
 PixelKernelResult GpuPixelKernels::effector_temporal(const EffectorTemporalPixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::affine(const AffinePixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels&) { return {}; }
+PixelKernelResult GpuPixelKernels::layer_composite_batch(std::span<const LayerCompositePixels>) { return {}; }
 PixelKernelResult GpuPixelKernels::background_mask(const BackgroundMaskPixels&) { return {}; }
 GpuPixelKernels::GpuPixelKernels(bool) : impl_(std::make_unique<Impl>()) {}
 GpuPixelKernels::~GpuPixelKernels() = default;
@@ -124,6 +125,33 @@ PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& p) {
     if(!choose_gpu(pixels,p.source_storage?0U:512U*512U))return {};
     auto result=backend(true).layer_composite(p);
     return result.success?record("layer_composite",result,pixels):result;
+}
+bool valid_layer_composite_batch(std::span<const LayerCompositePixels> layers) {
+    if(layers.size()<2 || layers.size()>256)return false;
+    const auto& first=layers.front();
+    const auto valid=[](const GlyphBitmapView& v,size_t bytes) {
+        return v.width && v.height && v.bytes_per_pixel==4 && bytes<=UINT32_MAX &&
+            v.byte_offset%4==0 && v.stride%4==0 && v.stride>=uint64_t(v.width)*4 &&
+            uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=bytes;
+    };
+    for(const auto& p:layers) {
+        if(!p.source_storage || !p.source.pixels.empty() || p.source.format!=2 ||
+                (p.destination.format!=1 && p.destination.format!=2) ||
+                p.destination.format!=first.destination.format || p.destination.stride!=first.destination.stride ||
+                p.destination.pixels.data()!=first.destination.pixels.data() ||
+                p.destination.pixels.size()!=first.destination.pixels.size() ||
+                p.reciprocal_corrections.size()!=65536 ||
+                p.reciprocal_corrections.data()!=first.reciprocal_corrections.data() ||
+                p.destination.width!=p.source.width || p.destination.height!=p.source.height ||
+                !valid(p.destination,p.destination.pixels.size()) || !valid(p.source,p.source_storage->size()))return false;
+    }
+    return true;
+}
+PixelKernelResult compose_host_layer_composite_batch(std::span<const LayerCompositePixels> layers) {
+    if(!choose_gpu(0,0) || !valid_layer_composite_batch(layers))return {};
+    uint64_t pixels=0;for(const auto& p:layers)pixels+=uint64_t(p.destination.width)*p.destination.height;
+    const auto result=backend(true).layer_composite_batch(layers);
+    return result.success?record("layer_batch",result,pixels):result;
 }
 
 bool valid_pixel_transfer(const PixelTransferPixels& p) {

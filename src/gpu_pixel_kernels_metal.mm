@@ -804,6 +804,55 @@ PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels& p
     }
 }
 
+PixelKernelResult GpuPixelKernels::layer_composite_batch(std::span<const LayerCompositePixels> layers) {
+    PixelKernelResult result;
+    if(!available() || !impl_->layer_pipeline || !valid_layer_composite_batch(layers))return result;
+    std::vector<std::shared_ptr<MetalPixelStorage>> sources;sources.reserve(layers.size());
+    for(const auto& p:layers) {
+        auto source=std::dynamic_pointer_cast<MetalPixelStorage>(p.source_storage);
+        if(!source || source->device!=impl_->device)return result;
+        sources.push_back(std::move(source));
+    }
+    const bool timing=debug_enabled();const auto start=timing?Clock::now():Clock::time_point{};
+    @autoreleasepool {
+        const auto& first=layers.front();
+        const auto upload=timing?Clock::now():Clock::time_point{};
+        const auto ensure=[&](id<MTLBuffer>& b,size_t size) {
+            if(b && [b length]>=size)return true;
+            [b release];b=[impl_->device newBufferWithLength:size options:MTLResourceStorageModeShared];return b!=nil;
+        };
+        if(!ensure(impl_->destination,first.destination.pixels.size()) || !ensure(impl_->second,65536))return result;
+        std::memcpy([impl_->destination contents],first.destination.pixels.data(),first.destination.pixels.size());
+        std::memcpy([impl_->second contents],first.reciprocal_corrections.data(),65536);
+        if(timing)result.upload_ns=elapsed(upload);
+        const auto wait=timing?Clock::now():Clock::time_point{};
+        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];if(!command)return result;
+        for(size_t i=0;i<layers.size();++i) {
+            const auto& p=layers[i];
+            // Separate encoders preserve read-after-write ordering for
+            // overlapping icons without a CPU round trip between them.
+            id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];if(!encoder)return result;
+            const uint32_t args[]={p.destination.stride,p.source.stride,p.destination.byte_offset,
+                p.source.byte_offset,p.destination.width,p.destination.height,p.destination.format};
+            [encoder setComputePipelineState:impl_->layer_pipeline];
+            [encoder setBuffer:impl_->destination offset:0 atIndex:0];
+            [encoder setBuffer:sources[i]->buffer offset:0 atIndex:1];
+            [encoder setBuffer:impl_->second offset:0 atIndex:2];
+            [encoder setBytes:args length:sizeof(args) atIndex:3];
+            [encoder dispatchThreads:MTLSizeMake((p.destination.width+1U)/2U,p.destination.height,1)
+                threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+            [encoder endEncoding];
+        }
+        [command commit];[command waitUntilCompleted];
+        if(timing)result.wait_ns=elapsed(wait);
+        if([command status]!=MTLCommandBufferStatusCompleted)return result;
+        const auto download=timing?Clock::now():Clock::time_point{};
+        std::memcpy(first.destination.pixels.data(),[impl_->destination contents],first.destination.pixels.size());
+        if(timing){result.download_ns=elapsed(download);result.total_ns=elapsed(start);}
+        result.success=true;result.used_gpu=true;return result;
+    }
+}
+
 PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels& p) {
     PixelKernelResult result;
     if(!available() || !impl_->transfer_pipeline || !valid_pixel_transfer(p))return result;

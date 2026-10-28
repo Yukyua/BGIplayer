@@ -417,6 +417,58 @@ PixelKernelResult GpuPixelKernels::effector_blur(const EffectorBlurPixels& p){
  a[10]=radius;a[11]=((0x20000U+diameter*2)/diameter)&0xffffU;a[12]=p.selector;a[20]=src.width;a[21]=src.height;
  return impl_->device->dispatch(dst.pixels,src.pixels,{},a,false,false,0,true);
 }
+PixelKernelResult GpuPixelKernels::layer_composite_batch(std::span<const LayerCompositePixels> layers) {
+ PixelKernelResult result;
+ if(!available()||!valid_layer_composite_batch(layers))return result;
+ auto device=impl_->device;
+ std::vector<std::shared_ptr<GlesPixelStorage>> sources;sources.reserve(layers.size());
+ for(const auto& p:layers){auto source=std::dynamic_pointer_cast<GlesPixelStorage>(p.source_storage);if(!source||!source->compatible(device))return result;sources.push_back(std::move(source));}
+ std::lock_guard lock(device->mutex);RestoreContext restore;
+ if(!eglMakeCurrent(device->display,device->surface,device->surface,device->context))return result;
+ const bool timing=debug_enabled();auto start=timing?Clock::now():Clock::time_point{};
+ for(unsigned n=0;n<16&&glGetError()!=GL_NO_ERROR;++n){}
+ GLint maximum=0,alignment=0;glGetIntegerv(GL_MAX_SHADER_STORAGE_BLOCK_SIZE,&maximum);glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT,&alignment);
+ const auto& first=layers.front();
+ if(alignment<=0||maximum<65536||first.destination.pixels.size()>size_t(maximum))return result;
+ for(const auto& s:sources)if(s->size()>size_t(maximum))return result;
+ const size_t arg_stride=((256+size_t(alignment)-1)/size_t(alignment))*size_t(alignment);
+ std::vector<uint8_t> arguments(arg_stride*layers.size());
+ for(size_t i=0;i<layers.size();++i){
+  const auto& p=layers[i];uint32_t a[64]{};a[0]=3;a[1]=p.destination.width;a[2]=p.destination.height;
+  a[3]=p.destination.stride;a[4]=p.source.stride;a[6]=p.destination.byte_offset;a[7]=p.source.byte_offset;a[9]=p.destination.format;
+  std::memcpy(arguments.data()+i*arg_stride,a,sizeof(a));
+ }
+ const auto upload=timing?Clock::now():Clock::time_point{};
+ const auto put=[&](unsigned index,std::span<const uint8_t> bytes){
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER,device->buffers[index]);
+  if(device->capacities[index]<bytes.size()){glBufferData(GL_SHADER_STORAGE_BUFFER,static_cast<GLsizeiptr>(bytes.size()),nullptr,GL_DYNAMIC_COPY);device->capacities[index]=bytes.size();}
+  glBufferSubData(GL_SHADER_STORAGE_BUFFER,0,static_cast<GLsizeiptr>(bytes.size()),bytes.data());
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER,index,device->buffers[index]);
+ };
+ put(0,first.destination.pixels);put(2,first.reciprocal_corrections);put(3,arguments);
+ if(timing)result.upload_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-upload).count();
+ if(glGetError()!=GL_NO_ERROR)return result;
+ const auto wait=timing?Clock::now():Clock::time_point{};glUseProgram(device->program);
+ for(size_t i=0;i<layers.size();++i){
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,sources[i]->buffer());
+  glBindBufferRange(GL_SHADER_STORAGE_BUFFER,3,device->buffers[3],static_cast<GLintptr>(i*arg_stride),256);
+  glDispatchCompute(((layers[i].destination.width+1)/2+15)/16,(layers[i].destination.height+7)/8,1);
+  glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+ }
+ glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+ GLsync fence=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);if(!fence)return result;
+ GLenum status=glClientWaitSync(fence,GL_SYNC_FLUSH_COMMANDS_BIT,1000000000ULL);glDeleteSync(fence);
+ if(timing)result.wait_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-wait).count();
+ if((status!=GL_ALREADY_SIGNALED&&status!=GL_CONDITION_SATISFIED)||glGetError()!=GL_NO_ERROR)return result;
+ const auto download=timing?Clock::now():Clock::time_point{};
+ glBindBuffer(GL_SHADER_STORAGE_BUFFER,device->buffers[0]);
+ const void* mapped=glMapBufferRange(GL_SHADER_STORAGE_BUFFER,0,static_cast<GLsizeiptr>(first.destination.pixels.size()),GL_MAP_READ_BIT);if(!mapped)return result;
+ std::vector<uint8_t> readback(first.destination.pixels.size());std::memcpy(readback.data(),mapped,readback.size());
+ if(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER)!=GL_TRUE||glGetError()!=GL_NO_ERROR)return result;
+ std::memcpy(first.destination.pixels.data(),readback.data(),readback.size());
+ if(timing){result.download_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-download).count();result.total_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();}
+ result.success=true;result.used_gpu=true;return result;
+}
 PixelKernelResult GpuPixelKernels::effector_displacement(const EffectorDisplacementPixels& p){
  if(!available()||!impl_->device->displacement_program||!valid_effector_displacement(p)||
   !valid(p.destination)||!valid(p.source)||!valid(p.first)||(p.second&&!valid(*p.second)))return {};

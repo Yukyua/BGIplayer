@@ -2957,6 +2957,7 @@ int run(const Options& options) {
             const auto ns=[](auto duration){return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();};
             const auto elapsed=ns(end-budget_start);
             std::cout<<"FRAME_BUDGET index="<<budget_frame++<<" tick="<<SDL_GetTicks()<<" total_ns="<<elapsed
+                <<" elapsed_ms="<<(SDL_GetTicks()-started)
                 <<" input_ns="<<ns(budget_vm_start-budget_start)<<" vm_ns="<<ns(budget_render_start-budget_vm_start)
                 <<" render_ns="<<ns(budget_render_end-budget_render_start)<<" pacing_ns="<<ns(end-budget_render_end)
                 <<" over_60fps="<<(elapsed>16666666)<<" over_20ms="<<(elapsed>20000000)

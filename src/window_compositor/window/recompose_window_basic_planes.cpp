@@ -139,6 +139,62 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
                     const auto& b = display_object_states_.at(second);
                     return a.priority == b.priority ? a.sequence < b.sequence : a.priority < b.priority;
                 });
+                const auto batch_icons=[&] {
+                    const char* gpu=std::getenv("BGI_GPU");
+                    if(gpu && std::string_view(gpu)=="0")return false;
+                    const char* batch=std::getenv("BGI_GPU_WINDOW_BATCH");
+                    if(batch && std::string_view(batch)=="0")return false;
+                    // Original004319C0 keeps the local manager's priority/
+                    // sequence order;0040C090/C210 remain independent clipped
+                    // pair/odd-row operations. Only simple resident mode0
+                    // icons qualify. Any unsupported child keeps the ordinary
+                    // callback path for the complete list, before any write.
+                    auto& output=graphics_surfaces_.at(target);
+                    if((output.format!=1 && output.format!=2) || output.bytes_per_pixel!=4)return false;
+                    std::vector<LayerCompositePixels> layers;
+                    const auto corrections=original_layer_reciprocal_corrections();
+                    for(const auto child:children) {
+                        const auto& item=display_object_states_.at(child);
+                        if(!item.available || !item.width || !item.height)continue;
+                        const int32_t x=item.x-state.x,y=item.y-state.y;
+                        const int32_t left=std::max(x,0),top=std::max(y,0);
+                        int32_t right=std::min(x+static_cast<int32_t>(item.width)-1,static_cast<int32_t>(state.width)-1);
+                        int32_t bottom=std::min(y+static_cast<int32_t>(item.height)-1,static_cast<int32_t>(state.height)-1);
+                        if(left>right || top>bottom)continue;
+                        const IconInputIconRecord* record=nullptr;const IconInputGroupRecord* owner=nullptr;size_t index=0;
+                        for(const auto& [id,processor]:icon_input_processors_) {
+                            (void)id;
+                            for(const auto& group:processor.layout.groups) {
+                                for(size_t n=0;n<group.icons.size();++n)if(group.icons[n].display_object_id==child) {
+                                    record=&group.icons[n];owner=&group;index=n;break;
+                                }
+                                if(record)break;
+                            }
+                            if(record)break;
+                        }
+                        if(!record)return false;
+                        if(record->render_effect>=256)continue;
+                        if(record->animation_angle_q16 || record->render_effect)return false;
+                        const auto image=graphics_surfaces_.find(icon_render_bitmap(*owner,index));
+                        if(image==graphics_surfaces_.end() || image->second.format!=2 ||
+                                image->second.bytes_per_pixel!=4 || !image->second.pixels.gpu_storage())return false;
+                        const auto& source=image->second;
+                        right=std::min(right,x+static_cast<int32_t>(source.width)-1);
+                        bottom=std::min(bottom,y+static_cast<int32_t>(source.height)-1);
+                        if(left>right || top>bottom)continue;
+                        const auto width=static_cast<uint32_t>(right-left+1),height=static_cast<uint32_t>(bottom-top+1);
+                        const auto d0=uint64_t(top)*output.stride+uint64_t(left)*4;
+                        const auto s0=uint64_t(top-y)*source.stride+uint64_t(left-x)*4;
+                        if(d0>UINT32_MAX || s0>UINT32_MAX)return false;
+                        layers.push_back({{output.pixels,static_cast<uint32_t>(d0),output.stride,width,height,output.format,4},
+                            {{},static_cast<uint32_t>(s0),source.stride,width,height,2,4},corrections,source.pixels.gpu_storage()});
+                    }
+                    const auto result=compose_host_layer_composite_batch(layers);
+                    if(result.success && debug_trace(DebugTrace::GpuFrames))
+                        std::cout<<"GPU_WINDOW_ICON_BATCH window="<<window<<" layers="<<layers.size()<<" total_ns="<<result.total_ns<<'\n';
+                    return result.success;
+                };
+                if(batch_icons())continue;
                 for (const auto child : children) {
                     const auto& item = display_object_states_.at(child);
                     if (!item.available || item.width == 0 || item.height == 0) continue;

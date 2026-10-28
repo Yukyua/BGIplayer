@@ -35,6 +35,8 @@ def main():
     parser.add_argument("log", type=Path)
     parser.add_argument("--output", type=Path, required=True, help="Output prefix")
     parser.add_argument("--scene-tick", type=int, help="SDL tick at start of measured scene")
+    parser.add_argument("--scene-elapsed-ms", type=int,
+                        help="Input-loop elapsed time at scene start (independent of startup/shader compilation)")
     args = parser.parse_args()
     rows, callbacks, standalone = [], [], []
     render = None
@@ -81,10 +83,19 @@ def main():
             "Instrumentation/logging adds overhead; results describe this run and are not Android hardware measurements.",
         ],
     }
-    if args.scene_tick is not None:
-        scene = [r for r in rows if r["tick"] >= args.scene_tick]
+    if args.scene_tick is not None or args.scene_elapsed_ms is not None:
+        if args.scene_elapsed_ms is not None:
+            # Older logs lack elapsed_ms. The first complete loop is the
+            # closest available estimate of the input-loop origin.
+            origin = rows[0]["tick"] - rows[0]["total_ns"] / 1e6
+            scene = [r for r in rows if r.get("elapsed_ms", r["tick"] - origin) >= args.scene_elapsed_ms]
+            result["scene_elapsed_ms"] = args.scene_elapsed_ms
+            result["scene_elapsed_estimated"] = not all("elapsed_ms" in r for r in rows)
+        else:
+            scene = [r for r in rows if r["tick"] >= args.scene_tick]
         changed = [r for r in scene if r.get("gpu_kernel_calls", 0)]
-        result["scene_tick"] = args.scene_tick
+        if args.scene_tick is not None:
+            result["scene_tick"] = args.scene_tick
         result["scene"] = summary(scene)
         result["scene_work"] = summary(scene, "work_ns")
         result["scene_changed"] = summary(changed)
