@@ -216,11 +216,25 @@ bool VM::compose_single_bitmap_sprite_at(uint32_t destination, uint32_t handle,
         const int32_t origin_x=static_cast<int32_t>(uint32_t(static_cast<int32_t>(object_raw_field(handle,0x29CU))>>quantization)+origin_correction);
         const int32_t origin_y=static_cast<int32_t>(uint32_t(static_cast<int32_t>(object_raw_field(handle,0x2A0U))>>quantization)+origin_correction);
         const int32_t angle=static_cast<int32_t>(object_raw_field(handle,0x2A4U));
+        // Bind an immutable source already uploaded by a preceding frame.
+        // Failed/exact-policy admission falls through to the existing sampler
+        // and materializes a const CPU view only if that path needs it.
+        bool resident_affine=false;
+        if(!terminal_add_sub && angle==0 && sx>0x8000U && sy>0x8000U &&
+                source.stride<=32764U && out.stride<=2147483647U && source.pixels.gpu_storage()) {
+            const auto matrix=inverse_sprite_affine_q16(
+                position_q16(x,0x2F4U,0x2BCU),position_q16(y,0x2F8U,0x2C0U),origin_x,origin_y,0,sx,sy);
+            if(matrix)resident_affine=compose_host_fast_affine({out.pixels,out.width,out.height,out.stride,
+                {},source.width,source.height,source.stride,*matrix,parameter,
+                object_raw_field(handle,0x298U)!=0U,true,source.pixels.gpu_storage()}).success;
+        }
         // Quantization depends only on X, and small sources can exhaust
         // available levels. Either residual scale may therefore still be at
         // or below50%; the general original affine kernel admits it even
         // though the specialized host scaled-alpha helper does not.
-        if (terminal_add_sub) {
+        if(resident_affine) {
+            // The host dispatch completed all destination writes.
+        } else if (terminal_add_sub) {
             // 140066988..1400669FE samples every BGRA byte into a format2
             // temporary through52B50(parameter0), then common3E490 performs
             // the terminal blend. It does not alpha-compose into the target
@@ -242,21 +256,21 @@ bool VM::compose_single_bitmap_sprite_at(uint32_t destination, uint32_t handle,
             const auto sampler = object_raw_field(handle,0x298U) != 0U ?
                 sample_background_transform : sample_background_transform_nearest;
             if (!sampler(sampled.data(),stride,out.width,out.height,
-                    source.pixels.data(),source.stride,source.width,source.height,affine) ||
+                    std::as_const(source.pixels).data(),source.stride,source.width,source.height,affine) ||
                 !blend_original_sprite_terminal(
                     {out.pixels,0,out.stride,out.width,out.height,1,4},
                     {sampled,0,stride,out.width,out.height,2,4},mode,parameter))
                 return fail("sprite terminal add/subtract rejected its pixel views or parameter");
         } else if (angle!=0 || sx<=0x8000U || sy<=0x8000U) {
             if (!compose_rotated_alpha_bgra(out.pixels,out.width,out.height,out.stride,
-                    source.pixels,source.width,source.height,source.stride,
+                    std::as_const(source.pixels),source.width,source.height,source.stride,
                     position_q16(x,0x2F4U,0x2BCU),position_q16(y,0x2F8U,0x2C0U),
                     origin_x,origin_y,angle,
                     sx,sy,
                     parameter,object_raw_field(handle,0x298U)!=0U))
                 return fail("rotated sprite kernel rejected its pixel views or geometry");
         } else if (!compose_host_scaled_alpha({out.pixels,out.width,out.height,out.stride,
-                source.pixels,source.width,source.height,source.stride,
+                std::as_const(source.pixels),source.width,source.height,source.stride,
                 position_q16(x,0x2F4U,0x2BCU),position_q16(y,0x2F8U,0x2C0U),
                 origin_x,origin_y,
                 sx,sy,

@@ -29,7 +29,10 @@ uint byteA(uint i){return (a[i>>2u]>>((i&3u)*8u))&255u;}
 uint byteB(uint i){return (b[i>>2u]>>((i&3u)*8u))&255u;}
 ivec4 unpack(uint c){return ivec4(c&255u,(c>>8u)&255u,(c>>16u)&255u,c>>24u);}
 uint pack(ivec4 c){return uint(c.x)&255u|(uint(c.y)&255u)<<8u|(uint(c.z)&255u)<<16u|(uint(c.w)&255u)<<24u;}
-ivec4 sampleA(int x,int y){if(x<0||y<0||uint(x)>=p[20]||uint(y)>=p[21])return ivec4(0);return unpack(a[(uint(y)*p[4]+uint(x)*4u)>>2u]);}
+// Materialize SSBO scalars before passing them to value parameters. Some
+// mobile compilers incorrectly carry the block's readonly qualifier into
+// unpack(a[index]) and reject the call with S0001.
+ivec4 sampleA(int x,int y){if(x<0||y<0||uint(x)>=p[20]||uint(y)>=p[21])return ivec4(0);uint color=a[(uint(y)*p[4]+uint(x)*4u)>>2u];return unpack(color);}
 void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y,kind=p[0];
  if(kind==1u||kind==3u)x*=2u;
  if(x>=p[1]||y>=p[2])return;
@@ -49,7 +52,7 @@ void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y,kind=p[0];
  }
  if(kind==1u){
   uint count=min(2u,p[1]-x);ivec4 color[2];color[0]=ivec4(0);color[1]=ivec4(0);
-  for(uint i=0u;i<count;++i){uint bi=(p[8]+y*p[5]+(x+i)*4u)>>2u;ivec4 ca=unpack(a[si+i]),cb=unpack(b[bi]);ca.w=int((uint(ca.w)*(256u-p[10]))>>8u);cb.w=int((uint(cb.w)*(256u-p[10]))>>8u);ca.xyz=(ca.xyz*ca.w)>>8;cb.xyz=(cb.xyz*cb.w)>>8;color[i]=ca+(((cb-ca)*int(p[11]))>>8);}
+  for(uint i=0u;i<count;++i){uint bi=(p[8]+y*p[5]+(x+i)*4u)>>2u;uint first=a[si+i],second=b[bi];ivec4 ca=unpack(first),cb=unpack(second);ca.w=int((uint(ca.w)*(256u-p[10]))>>8u);cb.w=int((uint(cb.w)*(256u-p[10]))>>8u);ca.xyz=(ca.xyz*ca.w)>>8;cb.xyz=(cb.xyz*cb.w)>>8;color[i]=ca+(((cb-ca)*int(p[11]))>>8);}
   if(color[0].w==0&&(count==1u||color[1].w==0))return;
   for(uint i=0u;i<count;++i){ivec4 old=unpack(d[di+i]);old.xyz=clamp(color[i].xyz+((old.xyz*(256-color[i].w))>>8),0,255);old.w=0;d[di+i]=pack(old);}return;
  }
@@ -57,7 +60,7 @@ void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y,kind=p[0];
   uint count=min(2u,p[1]-x),aa=a[si]>>24u,ab=count==2u?a[si+1u]>>24u:0u;
   if(count==2u&&aa==0u&&ab==0u)return;
   if(count==2u&&(p[9]==1u?(aa>=254u&&ab>=254u):(aa==255u&&ab==255u))){d[di]=a[si];d[di+1u]=a[si+1u];return;}
-  for(uint i=0u;i<count;++i){ivec4 c=unpack(a[si+i]),old=unpack(d[di+i]);uint alpha=uint(c.w);
+  for(uint i=0u;i<count;++i){uint color=a[si+i];ivec4 c=unpack(color),old=unpack(d[di+i]);uint alpha=uint(c.w);
    if(p[9]==1u){uint factor=alpha>>1u;if(factor==127u){old.xyz=c.xyz;if(count==1u)old.w=0;}else if(factor!=0u)old.xyz+=((c.xyz-old.xyz)*int(factor))>>7;}
    else{if(count==1u&&alpha==0u)continue;if(count==1u&&alpha==255u){d[di+i]=a[si+i];continue;}uint da=uint(old.w),dc=da*(256u-alpha),total=alpha*256u+dc;int sw=total==0u?0:int((alpha<<16u)/total),dw=total==0u?0:int((dc<<8u)/total);if(count==2u){uint fix=byteB(alpha*256u+da);if(fix==1u)--sw;else if(fix==2u)++sw;else if(fix==3u)--dw;else if(fix==4u)++dw;}old.xyz=((c.xyz*sw+old.xyz*dw)&ivec3(65535))>>8;old.w=int(total>>8u);}d[di+i]=pack(old);
   }return;
@@ -65,16 +68,16 @@ void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y,kind=p[0];
  if(kind==4u){
   int factor=int(p[64u+byteB(p[8]+(p[30]+y)*p[5]+p[29]+x)]);if(factor==0)return;
   di=(p[6]+(p[27]+y)*p[3]+(p[26]+x)*4u)>>2u;si=(p[7]+(p[28]+y)*p[4]+(p[31]+x)*4u)>>2u;
-  if(factor<0){d[di]=a[si];return;}ivec4 c=unpack(a[si]),old=unpack(d[di]);old.xyz=clamp(old.xyz+(((c.xyz-old.xyz)*factor)>>int(p[32])),0,255);d[di]=pack(old);return;
+  if(factor<0){d[di]=a[si];return;}uint color=a[si];ivec4 c=unpack(color),old=unpack(d[di]);old.xyz=clamp(old.xyz+(((c.xyz-old.xyz)*factor)>>int(p[32])),0,255);d[di]=pack(old);return;
  }
  if(kind==5u){
-  uint op=p[10],value=p[11];ivec4 old=unpack(d[di]),c=(op==3u||op==5u)?ivec4(0):unpack(a[si]);
+  uint op=p[10],value=p[11],color=(op==3u||op==5u)?0u:a[si];ivec4 old=unpack(d[di]),c=unpack(color);
   if(op==5u){d[di]=0u;}
   else if(op==0u){if(p[13]==2u&&p[14]==1u)c.w=255;else if(p[13]==1u&&p[14]==2u){uint alpha=uint(c.w)>>1u;if(alpha==127u)alpha=128u;c.xyz=(c.xyz*int(alpha))>>7;c.w=0;}d[di]=pack(c);}
   else if(op==1u)d[di]=pack((c*int(256u-value))>>8);
   else if(op==2u)d[di]=pack(c+(((old-c)*int(value>>1u))>>7));
   else if(op==4u){uint factor=((uint(c.w)>>1u)*(256u-value))>>8u;d[di]=pack(old+(((c-old)*int(factor))>>7));}
-  else if(op==3u){c=unpack(p[12]);old.xyz=(old.xyz*int(256u-value)+c.xyz*int(value))>>8;if(p[12]==0u&&value!=0u)old.w=0;d[di]=pack(old);}
+  else if(op==3u){uint tint=p[12];c=unpack(tint);old.xyz=(old.xyz*int(256u-value)+c.xyz*int(value))>>8;if(p[12]==0u&&value!=0u)old.w=0;d[di]=pack(old);}
  }
 }
 )GLSL";
@@ -88,6 +91,7 @@ layout(std430,binding=1) readonly buffer Source {uint a[];};
 layout(std430,binding=2) readonly buffer Horizontal {uint h[];};
 layout(std430,binding=3) readonly buffer Arguments {uint p[];};
 layout(location=0) uniform uint vertical;
+layout(location=1) uniform uint pixelWise;
 uvec4 halfPixel(uint c){return uvec4(c&255u,(c>>8u)&255u,(c>>16u)&255u,c>>24u)>>1u;}
 uint quantize(uvec4 sums){uvec4 c=((sums*p[11])>>16u)&uvec4(255u);return c.x|(c.y<<8u)|(c.z<<16u)|(c.w<<24u);}
 uint sampleLine(int at,uint line,bool v){
@@ -98,6 +102,15 @@ uint sampleLine(int at,uint line,bool v){
  return a[(p[7]+(v?index*p[4]+line*4u:line*p[4]+index*4u))>>2u];
 }
 void main(){
+ if(pixelWise!=0u){
+  uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;
+  if(x>=p[20]||y>=p[21])return;
+  bool v=vertical!=0u;uvec4 sums=uvec4(0u);
+  for(int delta=-int(p[10]);delta<=int(p[10]);++delta)
+   sums+=halfPixel(sampleLine(int(v?y:x)+delta,v?x:y,v));
+  uint index=!v&&p[12]>=4u?y*p[20]+x:(p[6]+y*p[3]+x*4u)>>2u;
+  d[index]=quantize(sums);return;
+ }
  uint line=gl_GlobalInvocationID.x,width=p[20],height=p[21];
  bool v=vertical!=0u;uint count=v?height:width,lines=v?width:height;
  if(line>=lines)return;
@@ -122,7 +135,7 @@ layout(location=0) uniform uint p[64];
 int s16(uint value){return int(value<<16u)>>16;}
 ivec4 unpack(uint c){return ivec4(c&255u,(c>>8u)&255u,(c>>16u)&255u,c>>24u);}
 uint pack(ivec4 c){return uint(c.x)|(uint(c.y)<<8u)|(uint(c.z)<<16u)|(uint(c.w)<<24u);}
-ivec4 sampleSource(int x,int y){if(x<0||y<0||uint(x)>=p[20]||uint(y)>=p[21])return ivec4(0);return unpack(a[(p[7]+uint(y)*p[4]+uint(x)*4u)>>2u]);}
+ivec4 sampleSource(int x,int y){if(x<0||y<0||uint(x)>=p[20]||uint(y)>=p[21])return ivec4(0);uint color=a[(p[7]+uint(y)*p[4]+uint(x)*4u)>>2u];return unpack(color);}
 void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;if(x>=p[1]||y>=p[2])return;
  uint di=(p[6]+y*p[3]+x*4u)>>2u,strength=p[10];bool second=p[12]!=0u,bilinear=p[11]!=0u;
  if(!second&&strength==0u){d[di]=a[(p[7]+y*p[4]+x*4u)>>2u];return;}
@@ -165,7 +178,7 @@ ivec4 sampleSource(int x,int y){
   index=uint(low)+uint(x);high+=(x<0?-1:0)+(index<uint(low)?1:0);
   if(high!=0||index>=p[14])return ivec4(0);
  }
- return unpack(a[(p[7]>>2u)+index]);
+ uint color=a[(p[7]>>2u)+index];return unpack(color);
 }
 void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;if(x>=p[1]||y>=p[2])return;
  uint mi=p[8]+y*p[5]+x*6u,index=mapWord(mi+4u);if(index>=p[12])return;
@@ -187,7 +200,7 @@ layout(std430,binding=1) readonly buffer Source {uint a[];};
 layout(location=0) uniform uint p[64];
 ivec4 unpack(uint c){return ivec4(c&255u,(c>>8u)&255u,(c>>16u)&255u,c>>24u);}
 uint pack(ivec4 c){return uint(c.x)|(uint(c.y)<<8u)|(uint(c.z)<<16u)|(uint(c.w)<<24u);}
-ivec4 sampleSource(int x,int y){if(x<0||y<0||uint(x)>=p[12]||uint(y)>=p[13])return ivec4(0);return unpack(a[(p[7]+uint(y)*p[4]+uint(x)*4u)>>2u]);}
+ivec4 sampleSource(int x,int y){if(x<0||y<0||uint(x)>=p[12]||uint(y)>=p[13])return ivec4(0);uint color=a[(p[7]+uint(y)*p[4]+uint(x)*4u)>>2u];return unpack(color);}
 void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;if(x>=p[1]||y>=p[2])return;
  uint qx=p[16]+x*p[18]+y*p[20],qy=p[17]+x*p[19]+y*p[21];
  bool bilinear=p[10]!=0u;if(!bilinear){qx+=32768u;qy+=32768u;}
@@ -262,15 +275,21 @@ struct GlesDevice {
   auto wait=timing?Clock::now():Clock::time_point{};
   if(separable_blur){
    glUseProgram(blur_program);
+   const bool per_pixel=args[10]<=8;
+   glUniform1ui(1,per_pixel?1u:0u);
+   const auto blur_pass=[&](bool vertical){
+    glUniform1ui(0,vertical?1u:0u);
+    if(per_pixel)glDispatchCompute((args[20]+63)/64,args[21],1);
+    else glDispatchCompute(((vertical?args[20]:args[21])+63)/64,1,1);
+   };
    if(args[12]>=4){
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,buffers[2]);
-    glUniform1ui(0,0);glDispatchCompute((args[21]+63)/64,1,1);
+    blur_pass(false);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,buffers[0]);
-    glUniform1ui(0,1);glDispatchCompute((args[20]+63)/64,1,1);
+    blur_pass(true);
    }else{
-    const bool vertical=args[12]>=2;glUniform1ui(0,vertical?1u:0u);
-    glDispatchCompute(((vertical?args[20]:args[21])+63)/64,1,1);
+    blur_pass(args[12]>=2);
    }
   }else if(special_program){glUseProgram(special_program);glUniform1uiv(0,static_cast<GLsizei>(args.size()),args.data());uint32_t width=paired?(args[1]+1)/2:args[1];glDispatchCompute((width+15)/16,(args[2]+7)/8,1);}
   else{glUseProgram(program);uint32_t width=paired?(args[1]+1)/2:args[1];glDispatchCompute((width+15)/16,(args[2]+7)/8,1);}
@@ -370,8 +389,10 @@ PixelKernelResult GpuPixelKernels::crossfade(const CrossfadePixels& p){
  std::vector<uint32_t>a(64);a[0]=1;a[1]=w;a[2]=h;a[3]=p.destination.stride;a[4]=p.first.stride;a[5]=p.second.stride;a[6]=p.destination.byte_offset;a[7]=p.first.byte_offset;a[8]=p.second.byte_offset;a[10]=p.opacity;a[11]=uint32_t(p.mix);auto r=impl_->device->dispatch(p.destination.pixels,p.first.pixels,p.second.pixels,a,true);return r.success?r:fallback();
 }
 PixelKernelResult GpuPixelKernels::affine(const AffinePixels& p){
- if(!available()||p.parameter>256||p.destination_width>32767||p.destination_height>32767||p.source_width>32767||p.source_height>32767||p.destination_stride<uint64_t(p.destination_width)*4||p.source_stride<uint64_t(p.source_width)*4||p.destination_stride%4||p.source_stride%4||p.destination.size()<uint64_t(p.destination_stride)*p.destination_height||p.source.size()<uint64_t(p.source_stride)*p.source_height||overlap(p.destination,p.source))return {};
- std::vector<uint32_t>a(64);a[0]=2;a[1]=p.destination_width;a[2]=p.destination_height;a[3]=p.destination_stride;a[4]=p.source_stride;a[10]=p.parameter;for(unsigned i=0;i<6;++i)a[16+i]=uint32_t(p.matrix[i]);a[24]=a[20];a[25]=a[21];a[20]=p.source_width;a[21]=p.source_height;a[22]=p.filtered;a[23]=p.blend_alpha;return impl_->device->dispatch(p.destination,p.source,{},a,false,true);
+ auto storage=std::dynamic_pointer_cast<GlesPixelStorage>(p.source_storage);
+ if(p.source_storage&&(!storage||!storage->compatible(impl_->device)||!p.source.empty()))return {};
+ if(!available()||!p.destination_width||!p.destination_height||!p.source_width||!p.source_height||p.parameter>256||p.destination_width>32767||p.destination_height>32767||p.source_width>32767||p.source_height>32767||p.destination_stride<uint64_t(p.destination_width)*4||p.source_stride<uint64_t(p.source_width)*4||p.destination_stride%4||p.source_stride%4||p.destination.size()<uint64_t(p.destination_stride)*p.destination_height||(storage?storage->size():p.source.size())<uint64_t(p.source_stride)*p.source_height||(!storage&&overlap(p.destination,p.source)))return {};
+ std::vector<uint32_t>a(64);a[0]=2;a[1]=p.destination_width;a[2]=p.destination_height;a[3]=p.destination_stride;a[4]=p.source_stride;a[10]=p.parameter;for(unsigned i=0;i<6;++i)a[16+i]=uint32_t(p.matrix[i]);a[24]=a[20];a[25]=a[21];a[20]=p.source_width;a[21]=p.source_height;a[22]=p.filtered;a[23]=p.blend_alpha;return impl_->device->dispatch(p.destination,p.source,{},a,false,true,storage?storage->buffer():0);
 }
 PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels& p){
  auto storage=std::dynamic_pointer_cast<GlesPixelStorage>(p.source_storage);

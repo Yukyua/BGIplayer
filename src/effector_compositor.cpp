@@ -5,6 +5,8 @@
 #include "bgiplayer/effector_vector.hpp"
 #include "bgiplayer/effector_transform.hpp"
 #include "bgiplayer/effector_temporal.hpp"
+#include <chrono>
+#include <iostream>
 namespace bgiplayer {
 void VM::refresh_effector_display_geometry(uint32_t handle){
     if(!extended_effector_modes()||!effector_exists(handle))return;
@@ -52,6 +54,8 @@ bool VM::compose_effector_at(uint32_t destination,uint32_t handle,uint32_t left,
             std::copy_n(out.pixels.data()+uint64_t(y)*out.stride,uint64_t(out.width)*4,
                         cache.pixels.data()+uint64_t(y)*cache.stride);
     }
+    const bool trace_cost=debug_trace(DebugTrace::GpuFrames);
+    const auto kernel_start=trace_cost?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     const GlyphBitmapView view{out.pixels,0,out.stride,out.width,out.height,out.format,4};
     GlyphBitmapView input{cache.pixels,0,cache.stride,width,height,cache.format,4};
     if(state.mode==1) {
@@ -116,6 +120,8 @@ bool VM::compose_effector_at(uint32_t destination,uint32_t handle,uint32_t left,
         if(!compose_host_effector_temporal({view,input,weight}).success && !temporal_pe64_effector(view,input,weight))
             return fail("effector temporal blend rejected its pixel storage");
     } else return true; // Native callback's default dispatch is a no-op.
+    if(trace_cost)std::cout<<"GPU_EFFECTOR_KERNEL_COST object="<<handle<<" mode="<<state.mode
+        <<" total_ns="<<std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-kernel_start).count()<<'\n';
     cache.rgba.clear();refresh_bgra_mirror(out);return true;
 }
 }

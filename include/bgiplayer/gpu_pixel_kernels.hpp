@@ -34,6 +34,8 @@ struct AffinePixels {
     uint32_t parameter=0;
     bool filtered=false;
     bool blend_alpha=true;
+    // Immutable uploaded source; when present, source must be empty.
+    std::shared_ptr<GpuPixelStorage> source_storage{};
 };
 // Pre-clipped original mask blend. Factor -1 copies BGRA, zero skips;
 // positive factors blend RGB with an arithmetic shift of7 or12.

@@ -85,6 +85,26 @@ kernel void effector_vertical(device uchar* dst [[buffer(0)]],device const uchar
         for(uint c=0;c<4;++c)sums[c]+=blur_vertical_sample(tmp,p,int(y+p.radius+1),x,c)-blur_vertical_sample(tmp,p,int(y)-int(p.radius),x,c);
     }
 }
+// Small radii expose pixels rather than complete scanlines to the GPU. The
+// integer sums and the quantized intermediate remain identical to the sliding
+// window above; large radii keep its radius-independent work per line.
+kernel void effector_horizontal_pixels(device uchar* dst [[buffer(0)]],device const uchar* src [[buffer(1)]],
+    constant Blur& p [[buffer(2)]],uint2 t [[thread_position_in_grid]]) {
+    if(t.x>=p.width || t.y>=p.height)return;
+    uint4 sums=uint4(0);
+    for(int dx=-int(p.radius);dx<=int(p.radius);++dx)
+        for(uint c=0;c<4;++c)sums[c]+=blur_horizontal_sample(src,p,int(t.x)+dx,t.y,c);
+    uint at=p.selector<2u?p.d0+t.y*p.ds+t.x*4:(t.y*p.width+t.x)*4;
+    for(uint c=0;c<4;++c)dst[at+c]=uchar((sums[c]*p.reciprocal)>>16);
+}
+kernel void effector_vertical_pixels(device uchar* dst [[buffer(0)]],device const uchar* src [[buffer(1)]],
+    constant Blur& p [[buffer(2)]],uint2 t [[thread_position_in_grid]]) {
+    if(t.x>=p.width || t.y>=p.height)return;
+    uint4 sums=uint4(0);
+    for(int dy=-int(p.radius);dy<=int(p.radius);++dy)
+        for(uint c=0;c<4;++c)sums[c]+=blur_vertical_sample(src,p,int(t.y)+dy,t.x,c);
+    for(uint c=0;c<4;++c)dst[p.d0+t.y*p.ds+t.x*4+c]=uchar((sums[c]*p.reciprocal)>>16);
+}
 struct Displace { uint width,height,ds,ss,as,bs,d0,s0,a0,b0,strength,filtered,second,sw,sh; };
 int displace_word(device const uchar* map,uint at) {return int(as_type<short>(ushort(uint(map[at])|(uint(map[at+1])<<8))));}
 int displace_wrap(int value) {return int(as_type<short>(ushort(value)));}
@@ -437,10 +457,11 @@ struct GpuPixelKernels::Impl {
     id<MTLDevice> device=nil;
     id<MTLCommandQueue> queue=nil;
     id<MTLComputePipelineState> pipeline=nil,crossfade_pipeline=nil,affine_pipeline=nil,mask_pipeline=nil,layer_pipeline=nil,transfer_pipeline=nil;
-    id<MTLComputePipelineState> blur_horizontal=nil,blur_vertical=nil,displacement_pipeline=nil,vector_pipeline=nil,transform_pipeline=nil,temporal_pipeline=nil,temporal_retain_pipeline=nil;
+    id<MTLComputePipelineState> blur_horizontal=nil,blur_vertical=nil,blur_horizontal_pixels=nil,blur_vertical_pixels=nil,displacement_pipeline=nil,vector_pipeline=nil,transform_pipeline=nil,temporal_pipeline=nil,temporal_retain_pipeline=nil;
     id<MTLBuffer> destination=nil,source=nil,second=nil,auxiliary=nil;
     ~Impl() {
         [blur_horizontal release];[blur_vertical release];[displacement_pipeline release];[vector_pipeline release];[transform_pipeline release];[temporal_pipeline release];[temporal_retain_pipeline release];[auxiliary release];
+        [blur_horizontal_pixels release];[blur_vertical_pixels release];
         [source release];[second release];[destination release];[pipeline release];[crossfade_pipeline release];[affine_pipeline release];[mask_pipeline release];[layer_pipeline release];[transfer_pipeline release];[queue release];[device release];
     }
 };
@@ -480,6 +501,12 @@ GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>())
         [function release];
         function=[library newFunctionWithName:@"effector_vertical"];
         impl_->blur_vertical=[impl_->device newComputePipelineStateWithFunction:function error:&error];
+        [function release];
+        function=[library newFunctionWithName:@"effector_horizontal_pixels"];
+        impl_->blur_horizontal_pixels=[impl_->device newComputePipelineStateWithFunction:function error:&error];
+        [function release];
+        function=[library newFunctionWithName:@"effector_vertical_pixels"];
+        impl_->blur_vertical_pixels=[impl_->device newComputePipelineStateWithFunction:function error:&error];
         [function release];
         function=[library newFunctionWithName:@"effector_displacement"];
         impl_->displacement_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
@@ -609,6 +636,8 @@ PixelKernelResult GpuPixelKernels::crossfade(const CrossfadePixels& p) {
 
 PixelKernelResult GpuPixelKernels::affine(const AffinePixels& p) {
     PixelKernelResult result;
+    const auto resident=std::dynamic_pointer_cast<MetalPixelStorage>(p.source_storage);
+    if(p.source_storage && (!resident || resident->device!=impl_->device || !p.source.empty()))return result;
     const bool timing=debug_enabled();
     const auto start=timing?Clock::now():Clock::time_point{};
     const auto valid=[](size_t size,uint32_t width,uint32_t height,uint32_t stride) {
@@ -618,9 +647,9 @@ PixelKernelResult GpuPixelKernels::affine(const AffinePixels& p) {
     const uintptr_t d=reinterpret_cast<uintptr_t>(p.destination.data()),
                     a=reinterpret_cast<uintptr_t>(p.source.data());
     const bool overlap=d<=a?a-d<p.destination.size():d-a<p.source.size();
-    if(!available() || !impl_->affine_pipeline || p.parameter>256 || overlap ||
+    if(!available() || !impl_->affine_pipeline || p.parameter>256 || (!resident && overlap) ||
        !valid(p.destination.size(),p.destination_width,p.destination_height,p.destination_stride) ||
-       !valid(p.source.size(),p.source_width,p.source_height,p.source_stride))return result;
+       !valid(resident?resident->size():p.source.size(),p.source_width,p.source_height,p.source_stride))return result;
     @autoreleasepool {
         const auto upload=timing?Clock::now():Clock::time_point{};
         const auto ensure=[&](id<MTLBuffer>& buffer,size_t size) {
@@ -628,8 +657,8 @@ PixelKernelResult GpuPixelKernels::affine(const AffinePixels& p) {
             [buffer release];buffer=[impl_->device newBufferWithLength:size options:MTLResourceStorageModeShared];
             return buffer!=nil;
         };
-        if(!ensure(impl_->source,p.source.size()) || !ensure(impl_->destination,p.destination.size()))return result;
-        std::memcpy([impl_->source contents],p.source.data(),p.source.size());
+        if((!resident && !ensure(impl_->source,p.source.size())) || !ensure(impl_->destination,p.destination.size()))return result;
+        if(!resident)std::memcpy([impl_->source contents],p.source.data(),p.source.size());
         std::memcpy([impl_->destination contents],p.destination.data(),p.destination.size());
         if(timing)result.upload_ns=elapsed(upload);
         const auto wait=timing?Clock::now():Clock::time_point{};
@@ -642,7 +671,7 @@ PixelKernelResult GpuPixelKernels::affine(const AffinePixels& p) {
             p.parameter,uint32_t(p.filtered),uint32_t(p.blend_alpha)};
         [encoder setComputePipelineState:impl_->affine_pipeline];
         [encoder setBuffer:impl_->destination offset:0 atIndex:0];
-        [encoder setBuffer:impl_->source offset:0 atIndex:1];
+        [encoder setBuffer:resident?resident->buffer:impl_->source offset:0 atIndex:1];
         [encoder setBytes:args length:sizeof(args) atIndex:2];
         [encoder dispatchThreads:MTLSizeMake(p.destination_width,p.destination_height,1)
             threadsPerThreadgroup:MTLSizeMake(16,16,1)];
@@ -841,6 +870,9 @@ PixelKernelResult GpuPixelKernels::effector_blur(const EffectorBlurPixels& p) {
         std::memcpy([impl_->source contents],p.source.pixels.data(),p.source.pixels.size());
         if(timing)result.upload_ns=elapsed(upload);
         const uint32_t radius=std::min(p.radius,255U),diameter=radius*2+1;
+        const bool per_pixel=radius<=8 && impl_->blur_horizontal_pixels && impl_->blur_vertical_pixels;
+        const auto horizontal=per_pixel?impl_->blur_horizontal_pixels:impl_->blur_horizontal;
+        const auto vertical=per_pixel?impl_->blur_vertical_pixels:impl_->blur_vertical;
         const uint32_t args[]={p.destination.stride,p.source.stride,p.destination.byte_offset,p.source.byte_offset,
             p.source.width,p.source.height,radius,((0x20000U+diameter*2)/diameter)&0xffffU,p.selector};
         const auto wait=timing?Clock::now():Clock::time_point{};
@@ -852,13 +884,16 @@ PixelKernelResult GpuPixelKernels::effector_blur(const EffectorBlurPixels& p) {
             [encoder setComputePipelineState:pipeline];
             [encoder setBuffer:destination offset:0 atIndex:0];[encoder setBuffer:source offset:0 atIndex:1];
             [encoder setBytes:args length:sizeof(args) atIndex:2];
-            [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256,[pipeline maxTotalThreadsPerThreadgroup]),1,1)];
+            if(per_pixel)
+                [encoder dispatchThreads:MTLSizeMake(p.source.width,p.source.height,1) threadsPerThreadgroup:MTLSizeMake(16,8,1)];
+            else
+                [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256,[pipeline maxTotalThreadsPerThreadgroup]),1,1)];
             [encoder endEncoding];return true;
         };
-        if(p.selector<2) {if(!pass(impl_->blur_horizontal,impl_->destination,impl_->source,p.source.height))return result;}
-        else if(p.selector<4) {if(!pass(impl_->blur_vertical,impl_->destination,impl_->source,p.source.width))return result;}
-        else if(!pass(impl_->blur_horizontal,impl_->second,impl_->source,p.source.height) ||
-                !pass(impl_->blur_vertical,impl_->destination,impl_->second,p.source.width))return result;
+        if(p.selector<2) {if(!pass(horizontal,impl_->destination,impl_->source,p.source.height))return result;}
+        else if(p.selector<4) {if(!pass(vertical,impl_->destination,impl_->source,p.source.width))return result;}
+        else if(!pass(horizontal,impl_->second,impl_->source,p.source.height) ||
+                !pass(vertical,impl_->destination,impl_->second,p.source.width))return result;
         [command commit];[command waitUntilCompleted];
         if(timing)result.wait_ns=elapsed(wait);
         if([command status]!=MTLCommandBufferStatusCompleted)return result;
