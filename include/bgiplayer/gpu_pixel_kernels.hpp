@@ -79,6 +79,17 @@ struct EffectorVectorPixels {
     bool bilinear,rectangular_bounds=true;
 };
 bool valid_effector_vector(const EffectorVectorPixels& pixels);
+struct EffectorTransformPixels {
+    GlyphBitmapView destination,source;
+    std::array<int32_t,6> matrix;
+    bool bilinear;
+};
+bool valid_effector_transform(const EffectorTransformPixels& pixels);
+struct EffectorTemporalPixels {
+    GlyphBitmapView scene,history;
+    uint32_t strength;
+};
+bool valid_effector_temporal(const EffectorTemporalPixels& pixels);
 struct PixelKernelResult {
     bool success = false;
     bool used_gpu = false;
@@ -105,6 +116,8 @@ public:
     PixelKernelResult effector_blur(const EffectorBlurPixels& pixels);
     PixelKernelResult effector_displacement(const EffectorDisplacementPixels& pixels);
     PixelKernelResult effector_vector(const EffectorVectorPixels& pixels);
+    PixelKernelResult effector_transform(const EffectorTransformPixels& pixels);
+    PixelKernelResult effector_temporal(const EffectorTemporalPixels& pixels);
     std::shared_ptr<GpuPixelStorage> store_pixels(std::span<const uint8_t> pixels);
     std::vector<std::shared_ptr<GpuPixelStorage>> store_pixels_batch(std::span<const std::span<const uint8_t>> pixels);
 private:
@@ -125,6 +138,8 @@ PixelKernelResult compose_host_pixel_transfer(const PixelTransferPixels& pixels)
 PixelKernelResult compose_host_effector_blur(const EffectorBlurPixels& pixels);
 PixelKernelResult compose_host_effector_displacement(const EffectorDisplacementPixels& pixels);
 PixelKernelResult compose_host_effector_vector(const EffectorVectorPixels& pixels);
+PixelKernelResult compose_host_effector_transform(const EffectorTransformPixels& pixels);
+PixelKernelResult compose_host_effector_temporal(const EffectorTemporalPixels& pixels);
 struct HostPixelKernelStatistics { uint64_t calls=0, gpu_dispatches=0, cpu_calls=0, approximate_dispatches=0; };
 HostPixelKernelStatistics host_pixel_kernel_statistics();
 }

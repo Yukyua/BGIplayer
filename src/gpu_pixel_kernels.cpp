@@ -16,6 +16,8 @@ PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels&) { 
 PixelKernelResult GpuPixelKernels::effector_blur(const EffectorBlurPixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::effector_displacement(const EffectorDisplacementPixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::effector_vector(const EffectorVectorPixels&) { return {}; }
+PixelKernelResult GpuPixelKernels::effector_transform(const EffectorTransformPixels&) { return {}; }
+PixelKernelResult GpuPixelKernels::effector_temporal(const EffectorTemporalPixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::affine(const AffinePixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::background_mask(const BackgroundMaskPixels&) { return {}; }
@@ -229,6 +231,41 @@ PixelKernelResult compose_host_effector_vector(const EffectorVectorPixels& p) {
     if(!choose_gpu(pixels,256U*256U))return {};
     const auto result=backend(true).effector_vector(p);
     return result.success?record("effector_vector",result,pixels):result;
+}
+bool valid_effector_transform(const EffectorTransformPixels& p) {
+    if(!p.bilinear && (p.source.width>32767 || p.source.height>32767 || p.source.stride>131068 ||
+            p.source.stride%4 || p.destination.stride%4))return false;
+    const auto valid=[](const GlyphBitmapView& v) {
+        return v.bytes_per_pixel==4 && v.width && v.height && v.pixels.size()<=UINT32_MAX &&
+            v.stride>=uint64_t(v.width)*4 && uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=v.pixels.size();
+    };
+    const auto d=reinterpret_cast<uintptr_t>(p.destination.pixels.data()),s=reinterpret_cast<uintptr_t>(p.source.pixels.data());
+    return valid(p.destination) && valid(p.source) && p.destination.format==p.source.format &&
+        (p.source.format==1 || p.source.format==2) && !(d<=s?s-d<p.destination.pixels.size():d-s<p.source.pixels.size());
+}
+PixelKernelResult compose_host_effector_transform(const EffectorTransformPixels& p) {
+    const uint64_t pixels=uint64_t(p.destination.width)*p.destination.height;
+    if(!choose_gpu(pixels,256U*256U))return {};
+    const auto result=backend(true).effector_transform(p);
+    return result.success?record("effector_transform",result,pixels):result;
+}
+bool valid_effector_temporal(const EffectorTemporalPixels& p) {
+    const auto valid=[](const GlyphBitmapView& v) {
+        return v.bytes_per_pixel==4 && v.width && v.height && v.pixels.size()<=UINT32_MAX &&
+            v.stride>=uint64_t(v.width)*4 && uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=v.pixels.size();
+    };
+    const auto s=reinterpret_cast<uintptr_t>(p.scene.pixels.data()),h=reinterpret_cast<uintptr_t>(p.history.pixels.data());
+    return valid(p.scene) && valid(p.history) && p.scene.format==p.history.format && (p.scene.format==1 || p.scene.format==2) &&
+        p.history.width<=p.scene.width && p.history.height<=p.scene.height &&
+        p.history.stride>=uint64_t(p.scene.width)*4 &&
+        uint64_t(p.history.byte_offset)+uint64_t(p.scene.height-1)*p.history.stride+uint64_t(p.scene.width)*4<=p.history.pixels.size() &&
+        !(s<=h?h-s<p.scene.pixels.size():s-h<p.history.pixels.size());
+}
+PixelKernelResult compose_host_effector_temporal(const EffectorTemporalPixels& p) {
+    const uint64_t pixels=uint64_t(p.scene.width)*p.scene.height;
+    if(!choose_gpu(pixels,256U*256U))return {};
+    const auto result=backend(true).effector_temporal(p);
+    return result.success?record("effector_temporal",result,pixels):result;
 }
 
 }

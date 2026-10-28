@@ -2,6 +2,7 @@
 #include "bgiplayer/debug.hpp"
 #include "bgiplayer/sprite_scaled_alpha.hpp"
 #include "bgiplayer/sprite_crossfade.hpp"
+#include "bgiplayer/rcpss_estimate_table.hpp"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <algorithm>
@@ -159,6 +160,68 @@ kernel void effector_vector(device uchar* dst [[buffer(0)]],device const uchar* 
         }
         dst[p.d0+t.y*p.ds+t.x*4+c]=uchar(clamp(value,0,255));
     }
+}
+struct TransformExact { uint dw,dh,ds,sw,sh,ss,d0,s0,sx,sy,cx,cy,rx,ry,filtered; };
+int transform_exact_sample(device const uchar* src,constant TransformExact& p,int x,int y,uint c) {
+    if(x<0 || y<0 || uint(x)>=p.sw || uint(y)>=p.sh)return 0;
+    return int(src[p.s0+uint(y)*p.ss+uint(x)*4+c]);
+}
+kernel void effector_transform(device uchar* dst [[buffer(0)]],device const uchar* src [[buffer(1)]],
+    constant TransformExact& p [[buffer(2)]],uint2 t [[thread_position_in_grid]]) {
+    if(t.x>=p.dw || t.y>=p.dh)return;
+    uint qx=p.sx+t.x*p.cx+t.y*p.rx,qy=p.sy+t.x*p.cy+t.y*p.ry;
+    if(p.filtered==0){qx+=32768u;qy+=32768u;}
+    int x=as_type<int>(qx)>>16,y=as_type<int>(qy)>>16;
+    int fx=int((qx>>12)&15u),fy=int((qy>>12)&15u);
+    for(uint c=0;c<4;++c) {
+        int value=transform_exact_sample(src,p,x,y,c);
+        if(p.filtered!=0) {
+            int top=value+(((transform_exact_sample(src,p,x+1,y,c)-value)*fx)>>4);
+            int bottom=transform_exact_sample(src,p,x,y+1,c);
+            bottom+=((transform_exact_sample(src,p,x+1,y+1,c)-bottom)*fx)>>4;
+            value=top+(((bottom-top)*fy)>>4);
+        }
+        dst[p.d0+t.y*p.ds+t.x*4+c]=uchar(clamp(value,0,255));
+    }
+}
+struct Temporal { uint ss,hs,s0,h0,sw,sh,hw,hh,format,strength; };
+#pragma clang fp contract(off)
+kernel void effector_temporal(device uchar* scene [[buffer(0)]],device const uchar* history [[buffer(1)]],
+    device const uint* rcp_table [[buffer(2)]],constant Temporal& p [[buffer(3)]],uint2 t [[thread_position_in_grid]]) {
+    uint x=t.x*2u,y=t.y;
+    if(x>=p.hw || y>=p.hh || p.strength==0 || p.strength>256)return;
+    uint count=min(2u,p.hw-x),h=p.h0+y*p.hs+x*4,s=p.s0+y*p.ss+x*4;
+    if(p.format==2 && history[h+3]==0 && (count==1 || history[h+7]==0))return;
+    for(uint i=0;i<count;++i) {
+        uint hi=h+i*4,si=s+i*4;
+        if(p.strength==256 && (p.format==1 || (count==1 && history[hi+3]==255) ||
+                (count==2 && history[h+3]==255 && history[h+7]==255))) {
+            for(uint c=0;c<4;++c)scene[si+c]=history[hi+c];
+        } else if(p.format==1) {
+            for(uint c=0;c<4;++c)scene[si+c]=uchar(int(history[hi+c])+(((int(scene[si+c])-int(history[hi+c]))*int((256-p.strength)>>1))>>7));
+        } else {
+            uint ha=history[hi+3],sa=scene[si+3],hw,sw,alpha;
+            if(count==2) {
+                float first=float(ha)*(float(p.strength)/256.0f);
+                float second=(float(sa)/256.0f)*(256.0f-first);
+                float total=first+second;
+                uint bits=as_type<uint>(total==0.0f?1.0f:total);
+                float reciprocal=as_type<float>(rcp_table[(bits>>11)&4095u]-((((bits>>23)&255u)-127u)<<23));
+                float a=reciprocal*first,b=reciprocal*second;
+                hw=uint(a*256.0f);sw=uint(b*256.0f);alpha=uint(total);
+            } else {
+                uint first=ha*p.strength,second=(sa*(65536u-first))>>8,total=first+second;
+                if(total==0){hw=0;sw=0;alpha=0;}else{hw=(first<<8)/total;sw=(second<<8)/total;alpha=total>>8;}
+            }
+            for(uint c=0;c<3;++c)scene[si+c]=uchar(((uint(history[hi+c])*hw+uint(scene[si+c])*sw)&65535u)>>8);
+            scene[si+3]=uchar(alpha);
+        }
+    }
+}
+kernel void effector_temporal_retain(device const uchar* scene [[buffer(0)]],device uchar* history [[buffer(1)]],
+    constant Temporal& p [[buffer(2)]],uint2 t [[thread_position_in_grid]]) {
+    if(t.x>=p.sw || t.y>=p.sh)return;
+    for(uint c=0;c<4;++c)history[p.h0+t.y*p.hs+t.x*4+c]=scene[p.s0+t.y*p.ss+t.x*4+c];
 }
 struct Parameters { uint dw,dh,ds,sw,sh,ss,start_x,start_y,dx,dy,parameter,filtered; };
 int floor_shift(int v,uint bits) {
@@ -374,10 +437,10 @@ struct GpuPixelKernels::Impl {
     id<MTLDevice> device=nil;
     id<MTLCommandQueue> queue=nil;
     id<MTLComputePipelineState> pipeline=nil,crossfade_pipeline=nil,affine_pipeline=nil,mask_pipeline=nil,layer_pipeline=nil,transfer_pipeline=nil;
-    id<MTLComputePipelineState> blur_horizontal=nil,blur_vertical=nil,displacement_pipeline=nil,vector_pipeline=nil;
+    id<MTLComputePipelineState> blur_horizontal=nil,blur_vertical=nil,displacement_pipeline=nil,vector_pipeline=nil,transform_pipeline=nil,temporal_pipeline=nil,temporal_retain_pipeline=nil;
     id<MTLBuffer> destination=nil,source=nil,second=nil,auxiliary=nil;
     ~Impl() {
-        [blur_horizontal release];[blur_vertical release];[displacement_pipeline release];[vector_pipeline release];[auxiliary release];
+        [blur_horizontal release];[blur_vertical release];[displacement_pipeline release];[vector_pipeline release];[transform_pipeline release];[temporal_pipeline release];[temporal_retain_pipeline release];[auxiliary release];
         [source release];[second release];[destination release];[pipeline release];[crossfade_pipeline release];[affine_pipeline release];[mask_pipeline release];[layer_pipeline release];[transfer_pipeline release];[queue release];[device release];
     }
 };
@@ -387,7 +450,9 @@ GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>())
         impl_->device=MTLCreateSystemDefaultDevice();
         if(!impl_->device)return;
         NSError* error=nil;
-        id<MTLLibrary> library=[impl_->device newLibraryWithSource:[NSString stringWithUTF8String:shader_source] options:nil error:&error];
+        MTLCompileOptions* compile_options=[MTLCompileOptions new];compile_options.fastMathEnabled=NO;
+        id<MTLLibrary> library=[impl_->device newLibraryWithSource:[NSString stringWithUTF8String:shader_source] options:compile_options error:&error];
+        [compile_options release];
         if(!library) {
             std::cerr<<"warning: METAL_SHADER_COMPILE_FAILED "<<[[error localizedDescription] UTF8String]<<'\n';
             return;
@@ -421,6 +486,13 @@ GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>())
         [function release];
         function=[library newFunctionWithName:@"effector_vector"];
         impl_->vector_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
+        [function release];
+        function=[library newFunctionWithName:@"effector_transform"];
+        impl_->transform_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];[function release];
+        function=[library newFunctionWithName:@"effector_temporal"];
+        impl_->temporal_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];[function release];
+        function=[library newFunctionWithName:@"effector_temporal_retain"];
+        impl_->temporal_retain_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
         [function release];[library release];
         if(impl_->pipeline && impl_->crossfade_pipeline)impl_->queue=[impl_->device newCommandQueue];
     }
@@ -860,6 +932,79 @@ PixelKernelResult GpuPixelKernels::effector_vector(const EffectorVectorPixels& p
         if([command status]!=MTLCommandBufferStatusCompleted)return result;
         const auto download=timing?Clock::now():Clock::time_point{};
         std::memcpy(p.destination.pixels.data(),[impl_->destination contents],p.destination.pixels.size());
+        if(timing){result.download_ns=elapsed(download);result.total_ns=elapsed(start);}
+        result.success=true;result.used_gpu=true;return result;
+    }
+}
+
+PixelKernelResult GpuPixelKernels::effector_transform(const EffectorTransformPixels& p) {
+    PixelKernelResult result;
+    if(!available() || !impl_->transform_pipeline || !valid_effector_transform(p))return result;
+    const bool timing=debug_enabled();const auto start=timing?Clock::now():Clock::time_point{};
+    @autoreleasepool {
+        const auto upload=timing?Clock::now():Clock::time_point{};
+        const auto put=[&](id<MTLBuffer>& b,std::span<const uint8_t> bytes) {
+            if(!b || [b length]<bytes.size()) {[b release];b=[impl_->device newBufferWithLength:bytes.size() options:MTLResourceStorageModeShared];}
+            if(!b)return false;std::memcpy([b contents],bytes.data(),bytes.size());return true;
+        };
+        if(!put(impl_->destination,p.destination.pixels) || !put(impl_->source,p.source.pixels))return result;
+        if(timing)result.upload_ns=elapsed(upload);
+        const auto wait=timing?Clock::now():Clock::time_point{};
+        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+        if(!command || !encoder)return result;
+        const uint32_t args[]={p.destination.width,p.destination.height,p.destination.stride,p.source.width,p.source.height,p.source.stride,
+            p.destination.byte_offset,p.source.byte_offset,uint32_t(p.matrix[0]),uint32_t(p.matrix[1]),uint32_t(p.matrix[2]),
+            uint32_t(p.matrix[3]),uint32_t(p.matrix[4]),uint32_t(p.matrix[5]),p.bilinear?1U:0U};
+        [encoder setComputePipelineState:impl_->transform_pipeline];
+        [encoder setBuffer:impl_->destination offset:0 atIndex:0];[encoder setBuffer:impl_->source offset:0 atIndex:1];
+        [encoder setBytes:args length:sizeof(args) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(p.destination.width,p.destination.height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        [encoder endEncoding];[command commit];[command waitUntilCompleted];
+        if(timing)result.wait_ns=elapsed(wait);
+        if([command status]!=MTLCommandBufferStatusCompleted)return result;
+        const auto download=timing?Clock::now():Clock::time_point{};
+        std::memcpy(p.destination.pixels.data(),[impl_->destination contents],p.destination.pixels.size());
+        if(timing){result.download_ns=elapsed(download);result.total_ns=elapsed(start);}
+        result.success=true;result.used_gpu=true;return result;
+    }
+}
+PixelKernelResult GpuPixelKernels::effector_temporal(const EffectorTemporalPixels& p) {
+    PixelKernelResult result;
+    if(!available() || !impl_->temporal_pipeline || !impl_->temporal_retain_pipeline || !valid_effector_temporal(p))return result;
+    const bool timing=debug_enabled();const auto start=timing?Clock::now():Clock::time_point{};
+    @autoreleasepool {
+        const auto upload=timing?Clock::now():Clock::time_point{};
+        const auto put=[&](id<MTLBuffer>& b,std::span<const uint8_t> bytes) {
+            if(!b || [b length]<bytes.size()) {[b release];b=[impl_->device newBufferWithLength:bytes.size() options:MTLResourceStorageModeShared];}
+            if(!b)return false;std::memcpy([b contents],bytes.data(),bytes.size());return true;
+        };
+        const auto& table=detail::kRcpSsEstimateTable;
+        const std::span<const uint8_t> rcp(reinterpret_cast<const uint8_t*>(table.data()),sizeof(table));
+        if(!put(impl_->destination,p.scene.pixels) || !put(impl_->source,p.history.pixels) || !put(impl_->auxiliary,rcp))return result;
+        if(timing)result.upload_ns=elapsed(upload);
+        const auto wait=timing?Clock::now():Clock::time_point{};
+        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];if(!command)return result;
+        const uint32_t args[]={p.scene.stride,p.history.stride,p.scene.byte_offset,p.history.byte_offset,p.scene.width,p.scene.height,
+            p.history.width,p.history.height,p.scene.format,p.strength};
+        if(p.strength && p.strength<=256) {
+            id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];if(!encoder)return result;
+            [encoder setComputePipelineState:impl_->temporal_pipeline];
+            [encoder setBuffer:impl_->destination offset:0 atIndex:0];[encoder setBuffer:impl_->source offset:0 atIndex:1];
+            [encoder setBuffer:impl_->auxiliary offset:0 atIndex:2];[encoder setBytes:args length:sizeof(args) atIndex:3];
+            [encoder dispatchThreads:MTLSizeMake((p.history.width+1)/2,p.history.height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+            [encoder endEncoding];
+        }
+        id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];if(!encoder)return result;
+        [encoder setComputePipelineState:impl_->temporal_retain_pipeline];
+        [encoder setBuffer:impl_->destination offset:0 atIndex:0];[encoder setBuffer:impl_->source offset:0 atIndex:1];
+        [encoder setBytes:args length:sizeof(args) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(p.scene.width,p.scene.height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        [encoder endEncoding];[command commit];[command waitUntilCompleted];
+        if(timing)result.wait_ns=elapsed(wait);
+        if([command status]!=MTLCommandBufferStatusCompleted)return result;
+        const auto download=timing?Clock::now():Clock::time_point{};
+        std::memcpy(p.scene.pixels.data(),[impl_->destination contents],p.scene.pixels.size());
+        std::memcpy(p.history.pixels.data(),[impl_->source contents],p.history.pixels.size());
         if(timing){result.download_ns=elapsed(download);result.total_ns=elapsed(start);}
         result.success=true;result.used_gpu=true;return result;
     }
