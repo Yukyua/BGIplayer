@@ -8027,6 +8027,14 @@ public:
         uint32_t vector_source = 0;
         uint32_t vector_parameter_5 = 0;
         std::vector<std::array<uint32_t, 4>> vector_records;
+        uint32_t primary_token = 0xFFFFFFFFU;
+        uint32_t secondary_token = 0xFFFFFFFFU;
+        uint32_t vector_token = 0xFFFFFFFFU;
+        GraphicsSurface temporal_cache;
+        uint32_t vector_phase = 0;
+        uint32_t vector_bilinear = 0;
+        std::array<int32_t, 6> custom_modulation{};
+        std::array<int32_t, 5> custom_transform{};
     };
     struct ObjectAttachment {
         uint32_t parent = 0;
@@ -8038,69 +8046,15 @@ public:
     }
     bool configure_effector_bitmaps(
         uint32_t handle, uint32_t primary, uint32_t secondary,
-        uint32_t field_158, uint32_t effect, uint32_t query) {
-        if (!effector_exists(handle)) {
-            return false;
-        }
-        const auto [width, height] = effective_client_dimensions();
-        const auto valid_surface = [&](uint32_t type) {
-            const auto surface = graphics_surfaces_.find(type);
-            return surface != graphics_surfaces_.end() &&
-                   surface->second.format == 4U &&
-                   surface->second.width >= width &&
-                   surface->second.height >= height;
-        };
-        if (!valid_surface(primary)) {
-            return false;
-        }
-        if (secondary != 0xFFFFFFFFU && !valid_surface(secondary)) {
-            return false;
-        }
-        EffectorEffectState state;
-        state.mode = 0;
-        state.primary_bitmap = primary;
-        state.secondary_bitmap = secondary;
-        state.field_158 = field_158;
-        state.effect = effect;
-        state.query = query;
-        effector_effects_[handle] = state;
-        display_dirty_ = true;
-        return true;
-    }
+        uint32_t field_158, uint32_t effect, uint32_t query) ;
     bool configure_effector_mode(uint32_t handle, uint32_t mode,
-                                 uint32_t effect, uint32_t query) {
-        if (!effector_exists(handle) || mode > (extended_effector_modes() ? 5U : 1U)) {
-            return false;
-        }
-        if (extended_effector_modes()) {
-            // Mini32 425FF0 / PE64 5BB70 clear the owned vector, then
-            // set mode/effect/bias through the original virtual setters.
-            auto& state = effector_effects_[handle];
-            state.vector_records.clear();
-            state.mode = 1;
-            state.mode_value = mode;
-            state.effect = effect;
-            set_raw_field_recursive(handle, 0xB4U, effect);
-            if (query < 0x10000U) object_raw_fields_[{handle, 0x1CU}] = query;
-            state.query = object_raw_field(handle, 0x1CU);
-            // Mini32 447600 / PE64 85020 invalidate only a visible object,
-            // then 436770 / 6FF80 reinsert the postprocess display node.
-            refresh_effector_display_geometry(handle);
-            reinsert_display_object(handle);
-            display_dirty_ = display_dirty_ || object_draw_visible(handle);
-            return true;
-        }
-        EffectorEffectState state;
-        state.mode = 1;
-        state.mode_value = mode;
-        state.effect = effect;
-        state.query = query;
-        effector_effects_[handle] = state;
-        display_dirty_ = true;
-        return true;
-    }
+                                 uint32_t effect, uint32_t query) ;
     void refresh_effector_display_geometry(uint32_t handle);
-    bool compose_effector_at(uint32_t destination,uint32_t handle);
+    bool compose_effector_at(uint32_t destination,uint32_t handle,
+                             uint32_t left=0,uint32_t top=0);
+    void refresh_effector_parameters(uint32_t handle);
+    void finish_effector_configuration(uint32_t handle,uint32_t effect,uint32_t query);
+    uint32_t update_effector_vector_phase(uint32_t handle,uint32_t phase,uint32_t effect);
     bool set_effector_enabled(uint32_t handle, uint32_t enabled) {
         if (!effector_exists(handle)) return false;
         const bool before = object_draw_visible(handle);
@@ -8112,84 +8066,13 @@ public:
         return true;
     }
     bool configure_effector_custom(
-        uint32_t handle, const std::array<uint32_t, 9>& values) {
-        if (!effector_exists(handle) || values[3] == 0 ||
-            values[4] == 0) {
-            return false;
-        }
-        EffectorEffectState state;
-        state.mode = 3;
-        state.custom = values;
-        state.effect = values[6];
-        state.query = values[7];
-        effector_effects_[handle] = state;
-        display_dirty_ = true;
-        return true;
-    }
+        uint32_t handle, const std::array<uint32_t, 9>& values) ;
     uint32_t configure_effector_vector_records(
         uint32_t handle, uint32_t bitmap, uint32_t count,
         uint32_t source, uint32_t parameter_5, uint32_t query,
-        uint32_t base) {
-        if (!effector_exists(handle)) {
-            return 0xFF;
-        }
-        const auto surface = graphics_surfaces_.find(bitmap);
-        if (surface == graphics_surfaces_.end() ||
-            surface->second.format != 4U) {
-            return 1;
-        }
-        const auto [width, height] = effective_client_dimensions();
-        if (surface->second.width != width ||
-            surface->second.height != height) {
-            return 3;
-        }
-        if (count == 0) {
-            return 6;
-        }
-        if (count > 7) {
-            return 7;
-        }
-        std::vector<std::array<uint32_t, 4>> records;
-        records.reserve(count);
-        try {
-            for (uint32_t index = 0; index < count; ++index) {
-                std::array<uint32_t, 4> record{};
-                for (std::size_t word = 0; word < record.size(); ++word) {
-                    record[word] = memory_.read_u32(
-                        source + index * 16U +
-                            static_cast<uint32_t>(word * 4U),
-                        base);
-                }
-                records.push_back(record);
-            }
-        } catch (const BpFault&) {
-            return 7;
-        }
-        EffectorEffectState state;
-        state.mode = 2;
-        state.vector_bitmap = bitmap;
-        state.vector_count = count;
-        state.vector_source = source;
-        state.vector_parameter_5 = parameter_5;
-        state.query = query;
-        state.vector_records = std::move(records);
-        effector_effects_[handle] = std::move(state);
-        display_dirty_ = true;
-        return 0;
-    }
+        uint32_t base) ;
     bool clear_effector_effect(uint32_t handle, uint32_t effect,
-                               uint32_t query) {
-        if (!effector_exists(handle)) {
-            return false;
-        }
-        EffectorEffectState state;
-        state.mode = 4;
-        state.effect = effect;
-        state.query = query;
-        effector_effects_[handle] = state;
-        display_dirty_ = true;
-        return true;
-    }
+                               uint32_t query) ;
     [[nodiscard]] const std::map<uint32_t, EffectorEffectState>&
     effector_effects() const {
         return effector_effects_;
@@ -10975,6 +10858,7 @@ public:
             if (selector != 1U) {
                 object_effect_level_[current] = value;
                 object_raw_fields_[{current, 0xB4U}] = value;
+                refresh_effector_parameters(current);
                 if (const auto sprite = sprites_.find(current); sprite != sprites_.end()) {
                     sprite->second.alpha = value;
                 }
@@ -11268,6 +11152,7 @@ public:
                 return;
             }
             object_scaled_level_[current] = scaled;
+            refresh_effector_parameters(current);
             if (group_objects_.count(current) == 0) {
                 return;
             }
@@ -11433,6 +11318,22 @@ public:
                                  uint32_t value, uint32_t extra) {
         if (!object_exists(object)) {
             return 0xFFU;
+        }
+        if (effector_exists(object)) {
+            auto& state=effector_effects_[object];
+            if (property>=0x80U && property<=0x82U) {
+                if (state.mode==3) {
+                    const size_t index=property==0x80U?0:property==0x81U?2:3;
+                    state.custom_modulation[index]=static_cast<int32_t>(value);
+                    if (property!=0x81U)state.custom_modulation[index+1]=static_cast<int32_t>(extra);
+                }
+                return 0;
+            }
+            if (property==0x8FU) {state.custom_modulation[5]=static_cast<int32_t>(value);return 0;}
+            if (property==0xFFU) {
+                state.vector_bilinear=value;state.field_158=value;state.custom[6]=value;return 0;
+            }
+            if (property==0x100U)return update_effector_vector_phase(object,value,extra)==0?0:0xFFFF0002U;
         }
         const auto display_class = object_display_classes_.find(object);
         if (display_class != object_display_classes_.end() &&
@@ -11735,6 +11636,7 @@ public:
             object_raw_fields_[{current, offset}] = value;
             if (offset == 0xB4U) {
                 object_effect_level_[current] = value;
+                refresh_effector_parameters(current);
                 if (const auto sprite = sprites_.find(current);
                     sprite != sprites_.end()) {
                     sprite->second.alpha = value;

@@ -7,8 +7,8 @@ namespace bgiplayer {
 namespace {
 NativeSignal grp1_configure_effector_bitmaps(VM& vm, Thread& thread) {
     const uint32_t query = thread.stack.pop();
-    const uint32_t effect = thread.stack.pop();
     const uint32_t field_158 = thread.stack.pop();
+    const uint32_t effect = thread.stack.pop();
     const uint32_t secondary = thread.stack.pop();
     const uint32_t primary = thread.stack.pop();
     const uint32_t handle = thread.stack.pop();

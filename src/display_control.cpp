@@ -235,6 +235,7 @@ WaitProcedureResult VM::advance_control_display_procedure(std::size_t index, uin
             // selector3 derive their source crossfade from its integer part.
             object_raw_fields_[{current,0xC0U}] = time;
             object_scaled_level_[current] = time;
+            refresh_effector_parameters(current);
             const uint32_t mode = sprite ? object_raw_field(current, 0x144U) : 0U;
             if (sprite && selector == 3U && (mode == 1U || mode == 5U || mode == 6U))
                 object_raw_fields_[{current,0x250U}] = time >> 16U;

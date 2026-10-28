@@ -55,6 +55,7 @@ void VM::offload_bitmap_cpu_pixels() {
         buffer(w.text_saved_plane);buffer(w.composite_plane);
         for(auto& layer:w.image_layers)surface(layer.image);
     }
+    for(auto& [id,e]:effector_effects_) {(void)id;surface(e.temporal_cache);}
     if(!pending.empty()) {
         const auto storage=store_host_pixel_storage_batch(uploads);
         for(size_t n=0;n<pending.size();++n)
@@ -75,6 +76,7 @@ std::array<uint64_t,2> VM::bitmap_pixel_storage_bytes() const {
         (void)id;buffer(w.background_plane);buffer(w.overlay_plane);buffer(w.text_saved_plane);buffer(w.composite_plane);
         for(const auto& layer:w.image_layers)surface(layer.image);
     }
+    for(const auto& [id,e]:effector_effects_) {(void)id;surface(e.temporal_cache);}
     return bytes;
 }
 

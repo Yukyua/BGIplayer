@@ -388,6 +388,29 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
             return fail("callback clip is outside the destination bitmap");
         return fail("callback destination pixels could not be materialized");
     }
+    // 56900 crops the scene descriptor before entering the callback. The
+    // full-primary fast path is equivalent only when no crop is needed.
+    if(extended_effector_modes()) {
+        const auto effect=effector_effects_.find(callback.display_object);
+        const auto [primary_width,primary_height]=current_mode_dimensions();
+        // A capture may target a larger backing bitmap while its scene is
+        // only the source viewport (e.g.1920x1080 inside3590x2133). Preserve
+        // that logical descriptor through the ordinary scratch adapter.
+        if(effect!=effector_effects_.end() && effect->second.mode!=4 &&
+                target->second.width==primary_width && target->second.height==primary_height &&
+                callback.source_left==0 && callback.source_top==0 &&
+                callback.source_right==static_cast<int32_t>(primary_width)-1 &&
+                callback.source_bottom==static_cast<int32_t>(primary_height)-1) {
+            const bool result=compose_effector_at(callback.bitmap,callback.display_object);
+            if(trace_frame_cost) {
+                const auto duration=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-callback_start).count();
+                std::cout<<"GPU_CALLBACK_COST object="<<callback.display_object<<" width="<<target->second.width<<" height="<<target->second.height
+                    <<" total_ns="<<duration<<" success="<<result<<" effector_kind="<<effect->second.mode
+                    <<" effector_selector="<<effect->second.mode_value<<" effect_level="<<object_effect_level(callback.display_object)<<'\n';
+            }
+            return result;
+        }
+    }
     const IconInputIconRecord* icon_record = nullptr;
     const IconInputGroupRecord* icon_group = nullptr;
     std::size_t icon_index = 0;
@@ -543,7 +566,8 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
                 ? compose_filter_at(scratch, callback.display_object,
                                     uint32_t(callback.source_left),uint32_t(callback.source_top))
                 : extended_effector_modes() && effector_effects_.contains(callback.display_object)
-                ? compose_effector_at(scratch, callback.display_object)
+                ? compose_effector_at(scratch, callback.display_object,
+                    uint32_t(callback.destination_left),uint32_t(callback.destination_top))
                 : sprites_.count(callback.display_object) != 0
                 ? compose_single_bitmap_sprite_at(
                       scratch, callback.display_object, x, y)

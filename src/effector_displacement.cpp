@@ -19,9 +19,10 @@ bool displace_pe64_effector(GlyphBitmapView dst,GlyphBitmapView src,
                            uint32_t strength,uint32_t bilinear){
     if(!valid(dst)||!valid(src)||!valid(primary)||strength>256||
        dst.format!=src.format||(src.format!=1&&src.format!=2)||primary.format!=4||
-       dst.width>primary.width||dst.height>primary.height||dst.width!=src.width||dst.height!=src.height||
+       dst.width>primary.width||dst.height>primary.height||
        (secondary&&(!valid(*secondary)||secondary->format!=4||secondary->width!=primary.width||secondary->height!=primary.height)))return false;
     if(!secondary&&strength==0){
+        if(uint64_t(dst.byte_offset)+uint64_t(src.height-1)*dst.stride+uint64_t(src.width)*4>dst.pixels.size())return false;
         for(uint32_t y=0;y<src.height;++y)std::memcpy(dst.pixels.data()+dst.byte_offset+uint64_t(y)*dst.stride,
             src.pixels.data()+src.byte_offset+uint64_t(y)*src.stride,uint64_t(src.width)*4);
         return true;
