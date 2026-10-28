@@ -45,6 +45,17 @@ struct LayerCompositePixels {
     GlyphBitmapView destination, source; // equally sized, pre-clipped views
     std::span<const uint8_t> reciprocal_corrections;
 };
+// Exact pre-clipped host transfers used by original bitmap/display callbacks.
+// Copy retains the format-1/2 conversion rules; opacity parameters are0..256.
+enum class PixelTransferOperation : uint32_t {
+    Copy, FadeSource, BlendOpaque, ColorFilter, BlendAlpha, Clear
+};
+struct PixelTransferPixels {
+    GlyphBitmapView destination, source;
+    PixelTransferOperation operation = PixelTransferOperation::Copy;
+    uint32_t parameter = 0, color = 0;
+};
+bool valid_pixel_transfer(const PixelTransferPixels& pixels);
 struct PixelKernelResult {
     bool success = false;
     bool used_gpu = false;
@@ -67,6 +78,7 @@ public:
     PixelKernelResult affine(const AffinePixels& pixels);
     PixelKernelResult layer_composite(const LayerCompositePixels& pixels);
     PixelKernelResult background_mask(const BackgroundMaskPixels& pixels);
+    PixelKernelResult pixel_transfer(const PixelTransferPixels& pixels);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -81,6 +93,7 @@ PixelKernelResult compose_host_fast_affine(const AffinePixels& pixels);
 // Fast-policy dispatch, but integer mask results retain exact CPU byte values.
 PixelKernelResult compose_host_fast_background_mask(const BackgroundMaskPixels& pixels);
 PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& pixels);
+PixelKernelResult compose_host_pixel_transfer(const PixelTransferPixels& pixels);
 struct HostPixelKernelStatistics { uint64_t calls=0, gpu_dispatches=0, cpu_calls=0, approximate_dispatches=0; };
 HostPixelKernelStatistics host_pixel_kernel_statistics();
 }

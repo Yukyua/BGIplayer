@@ -90,3 +90,12 @@ bash tool/build_ios.sh device
 - `tools/`：补丁处理与 Windows 加载器源码。
 - `scripts/`：默认图标嵌入脚本。
 - `Makefile`：原生命令行程序构建入口。
+
+### GPU frame memory
+
+GPU presentation releases the completed frame's CPU pixel caches by default.
+Screenshots, native screen capture and debug snapshots read pixels back only
+when needed. VM bitmap resources remain available to native pixel operations.
+Use `BGI_KEEP_CPU_PIXELS=1` to retain frame copies for debugging, or `BGI_GPU=0`
+for CPU rendering. Intermediate compute operations still use synchronous
+transfers; this is not a fully resident GPU resource graph.

@@ -2,6 +2,7 @@
 
 #include <SDL.h>
 #include <cstdint>
+#include <vector>
 
 namespace bgiplayer {
 // Host presentation owns a logical primary surface independently of desktop
@@ -41,6 +42,20 @@ public:
         if (SDL_RenderClear(renderer_) != 0) return false;
         const SDL_Rect destination{0, 0, width_, height_};
         return SDL_RenderCopy(renderer_, texture_, nullptr, &destination) == 0;
+    }
+
+    // Read the retained GPU primary only when a native capture asks for it.
+    // Selecting the texture also avoids undefined window back-buffer contents
+    // after SDL_RenderPresent. Restore the caller's rendering state on failure.
+    bool read_pixels(std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) const {
+        if(!texture_ || !renderer_)return false;
+        auto* previous=SDL_GetRenderTarget(renderer_);
+        if(SDL_SetRenderTarget(renderer_,texture_)!=0)return false;
+        std::vector<uint8_t> pixels(static_cast<size_t>(width_)*static_cast<size_t>(height_)*4U);
+        const int result=SDL_RenderReadPixels(renderer_,nullptr,SDL_PIXELFORMAT_RGBA32,pixels.data(),width_*4);
+        const int restored=SDL_SetRenderTarget(renderer_,previous);
+        if(result!=0 || restored!=0)return false;
+        rgba=std::move(pixels);width=static_cast<uint32_t>(width_);height=static_cast<uint32_t>(height_);return true;
     }
 
     // Some accelerated sdl2-compat backends report window output dimensions

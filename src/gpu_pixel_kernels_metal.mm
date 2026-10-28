@@ -156,6 +156,38 @@ kernel void background_mask(device uchar* dst [[buffer(0)]],
     }
 }
 
+struct Transfer { uint ds,ss,d0,s0,width,height,df,sf,op,parameter,color; };
+kernel void pixel_transfer(device uchar* dst [[buffer(0)]],device const uchar* src [[buffer(1)]],
+    constant Transfer& p [[buffer(2)]],uint2 t [[thread_position_in_grid]]) {
+    if(t.x>=p.width || t.y>=p.height)return;
+    uint d=p.d0+t.y*p.ds+t.x*4u,s=p.s0+t.y*p.ss+t.x*4u;
+    if(p.op==5u){for(uint c=0;c<4u;++c)dst[d+c]=0;return;}
+    if(p.op==3u) {
+        for(uint c=0;c<3u;++c)
+            dst[d+c]=uchar((uint(dst[d+c])*(256u-p.parameter)+((p.color>>(c*8u))&255u)*p.parameter)>>8u);
+        if(p.color==0u && p.parameter!=0u)dst[d+3u]=0;
+        return;
+    }
+    if(p.op==0u) {
+        for(uint c=0;c<4u;++c)dst[d+c]=src[s+c];
+        if(p.df==2u && p.sf==1u)dst[d+3u]=255;
+        if(p.df==1u && p.sf==2u) {
+            uint a=uint(src[s+3u])>>1u;if(a==127u)a=128u;
+            for(uint c=0;c<3u;++c)dst[d+c]=uchar((uint(src[s+c])*a)>>7u);
+            dst[d+3u]=0;
+        }
+        return;
+    }
+    for(uint c=0;c<4u;++c) {
+        int a=int(src[s+c]),b=int(dst[d+c]);
+        if(p.op==1u)dst[d+c]=uchar((uint(a)*(256u-p.parameter))>>8u);
+        else if(p.op==2u)dst[d+c]=uchar(a+floor_shift((b-a)*int(p.parameter>>1u),7u));
+        else {
+            uint factor=((uint(src[s+3u])>>1u)*(256u-p.parameter))>>8u;
+            dst[d+c]=uchar(b+floor_shift((a-b)*int(factor),7u));
+        }
+    }
+}
 struct Layer { uint ds,ss,d0,s0,width,height,format; };
 kernel void layer_composite(device uchar* dst [[buffer(0)]], device const uchar* src [[buffer(1)]],
     device const uchar* corrections [[buffer(2)]], constant Layer& p [[buffer(3)]],
@@ -203,10 +235,10 @@ kernel void layer_composite(device uchar* dst [[buffer(0)]], device const uchar*
 struct GpuPixelKernels::Impl {
     id<MTLDevice> device=nil;
     id<MTLCommandQueue> queue=nil;
-    id<MTLComputePipelineState> pipeline=nil,crossfade_pipeline=nil,affine_pipeline=nil,mask_pipeline=nil,layer_pipeline=nil;
+    id<MTLComputePipelineState> pipeline=nil,crossfade_pipeline=nil,affine_pipeline=nil,mask_pipeline=nil,layer_pipeline=nil,transfer_pipeline=nil;
     id<MTLBuffer> destination=nil,source=nil,second=nil;
     ~Impl() {
-        [source release];[second release];[destination release];[pipeline release];[crossfade_pipeline release];[affine_pipeline release];[mask_pipeline release];[layer_pipeline release];[queue release];[device release];
+        [source release];[second release];[destination release];[pipeline release];[crossfade_pipeline release];[affine_pipeline release];[mask_pipeline release];[layer_pipeline release];[transfer_pipeline release];[queue release];[device release];
     }
 };
 GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>()) {
@@ -231,6 +263,9 @@ GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>())
         [function release];
         function=[library newFunctionWithName:@"layer_composite"];
         impl_->layer_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
+        [function release];
+        function=[library newFunctionWithName:@"pixel_transfer"];
+        impl_->transfer_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
         [function release];[library release];
         if(impl_->pipeline && impl_->crossfade_pipeline)impl_->queue=[impl_->device newCommandQueue];
     }
@@ -495,6 +530,45 @@ PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels& p
         [encoder setBuffer:impl_->second offset:0 atIndex:2];
         [encoder setBytes:args length:sizeof(args) atIndex:3];
         [encoder dispatchThreads:MTLSizeMake((p.destination.width+1U)/2U,p.destination.height,1)
+            threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        [encoder endEncoding];[command commit];[command waitUntilCompleted];
+        if(timing)result.wait_ns=elapsed(wait);
+        if([command status]!=MTLCommandBufferStatusCompleted)return result;
+        const auto download=timing?Clock::now():Clock::time_point{};
+        std::memcpy(p.destination.pixels.data(),[impl_->destination contents],p.destination.pixels.size());
+        if(timing){result.download_ns=elapsed(download);result.total_ns=elapsed(start);}
+        result.success=true;result.used_gpu=true;return result;
+    }
+}
+
+PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels& p) {
+    PixelKernelResult result;
+    if(!available() || !impl_->transfer_pipeline || !valid_pixel_transfer(p))return result;
+    const bool timing=debug_enabled();const auto start=timing?Clock::now():Clock::time_point{};
+    const bool needs_source=p.operation!=PixelTransferOperation::ColorFilter && p.operation!=PixelTransferOperation::Clear;
+    @autoreleasepool {
+        const auto upload=timing?Clock::now():Clock::time_point{};
+        const auto ensure=[&](id<MTLBuffer>& b,size_t size) {
+            if(b && [b length]>=size)return true;
+            [b release];b=[impl_->device newBufferWithLength:size options:MTLResourceStorageModeShared];return b!=nil;
+        };
+        if(!ensure(impl_->destination,p.destination.pixels.size()) ||
+            !ensure(impl_->source,needs_source?p.source.pixels.size():4U))return result;
+        std::memcpy([impl_->destination contents],p.destination.pixels.data(),p.destination.pixels.size());
+        if(needs_source)std::memcpy([impl_->source contents],p.source.pixels.data(),p.source.pixels.size());
+        if(timing)result.upload_ns=elapsed(upload);
+        const auto wait=timing?Clock::now():Clock::time_point{};
+        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+        if(!command || !encoder)return result;
+        const uint32_t args[]={p.destination.stride,p.source.stride,p.destination.byte_offset,
+            p.source.byte_offset,p.destination.width,p.destination.height,p.destination.format,p.source.format,
+            static_cast<uint32_t>(p.operation),p.parameter,p.color};
+        [encoder setComputePipelineState:impl_->transfer_pipeline];
+        [encoder setBuffer:impl_->destination offset:0 atIndex:0];
+        [encoder setBuffer:impl_->source offset:0 atIndex:1];
+        [encoder setBytes:args length:sizeof(args) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(p.destination.width,p.destination.height,1)
             threadsPerThreadgroup:MTLSizeMake(16,16,1)];
         [encoder endEncoding];[command commit];[command waitUntilCompleted];
         if(timing)result.wait_ns=elapsed(wait);

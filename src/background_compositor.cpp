@@ -1,4 +1,5 @@
 #include "bgiplayer/vm.hpp"
+#include "bgiplayer/gpu_pixel_kernels.hpp"
 #include "bgiplayer/background_motion.hpp"
 #include "bgiplayer/background_transform.hpp"
 
@@ -231,6 +232,10 @@ bool VM::compose_main_background_at(uint32_t destination,
             output.pixels.size() <
                 static_cast<std::size_t>(output.stride) * output.height) {
             return fail("background clear destination stride or capacity is invalid");
+        }
+        if(compose_host_pixel_transfer({{output.pixels,0,output.stride,output.width,output.height,output.format,output.bytes_per_pixel},
+                {},PixelTransferOperation::Clear}).success) {
+            refresh_bgra_mirror(output);return true;
         }
         for (std::size_t row = 0; row < output.height; ++row) {
             std::fill_n(output.pixels.begin() +

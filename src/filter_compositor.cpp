@@ -1,4 +1,5 @@
 #include "bgiplayer/vm.hpp"
+#include "bgiplayer/gpu_pixel_kernels.hpp"
 #include "bgiplayer/filter_color.hpp"
 #include "bgiplayer/filter_mask.hpp"
 #include "bgiplayer/filter_rgb555.hpp"
@@ -115,6 +116,10 @@ bool VM::compose_filter_at(uint32_t destination, uint32_t object,
             return fail("black source-alpha filter rejected its pixel views");
         refresh_bgra_mirror(out);
         return true;
+    }
+    if(compose_host_pixel_transfer({{out.pixels,0,out.stride,out.width,out.height,out.format,4},
+            {},PixelTransferOperation::ColorFilter,weight,f.field_14c}).success) {
+        refresh_bgra_mirror(out);return true;
     }
     // 00411C80 preserves alpha; the color0 specialization0040EAF0
     // writes RGB only and zeroes alpha whenever weight is nonzero.

@@ -11,19 +11,41 @@ bool VM::render_display_regions(uint32_t width, uint32_t height,
         return false;
     }
     refresh_main_background_geometry();
-    GraphicsSurface frame = display_frame_;
-    if (frame.width != width || frame.height != height || frame.pixels.empty()) {
-        frame = GraphicsSurface{};
-        frame.width = width;
-        frame.height = height;
-        frame.format = 1;
-        frame.bytes_per_pixel = 4;
-        frame.stride = width * 4U;
-        frame.pixels.resize(static_cast<std::size_t>(frame.stride) * height, 0);
-    }
     uint32_t target = 0xFFFFFFFFU;
-    while (graphics_surfaces_.count(target) != 0) {
-        --target;
+    while (graphics_surfaces_.count(target) != 0) --target;
+    bool replaces_previous=false;
+    if(display_frame_gpu_cached_ && display_frame_.pixels.empty() && regions.size()==1 &&
+            regions[0].rectangle==std::array<int32_t,4>{0,0,static_cast<int32_t>(width)-1,static_cast<int32_t>(height)-1}) {
+        // Inspect the real ordered dispatcher. Only a proven covering clear
+        // or BackF format1 source copy/fade can omit the previous frame.
+        GraphicsSurface descriptor;descriptor.width=width;descriptor.height=height;
+        graphics_surfaces_.emplace(target,std::move(descriptor));
+        std::vector<DisplayBitmapDraw> commands;
+        try {commands=build_display_dispatch(target,regions[0].rectangle,regions[0].parameter,display_priority_cutoff_);}
+        catch(...){graphics_surfaces_.erase(target);throw;}
+        graphics_surfaces_.erase(target);
+        if(!commands.empty() && commands.front().display_object==main_background_handle &&
+                commands.front().source_left==0 && commands.front().source_top==0 &&
+                commands.front().source_right==static_cast<int32_t>(width)-1 &&
+                commands.front().source_bottom==static_cast<int32_t>(height)-1) {
+            replaces_previous=background_render_enabled_==0;
+            const auto config=sprite_mask_configs_.find(0);
+            if(background_type_==4 && config!=sprite_mask_configs_.end()) {
+                const auto& c=config->second;const auto bitmap=graphics_surfaces_.find(c.primary_bitmap);
+                replaces_previous=replaces_previous || (c.mask_bitmap==0xffffffffU &&
+                    (c.secondary_bitmap==0x7fffU || c.secondary_bitmap==0xffffffffU) &&
+                    bitmap!=graphics_surfaces_.end() && bitmap->second.format==1 &&
+                    graphics_bitmap_token(c.primary_bitmap)==background_bitmap_tokens_[0] &&
+                    uint64_t(c.field1)+width<=bitmap->second.width && uint64_t(c.field2)+height<=bitmap->second.height);
+            }
+        }
+    }
+    GraphicsSurface frame=replaces_previous?GraphicsSurface{}:display_frame_view();
+    if(!replaces_previous && display_frame_gpu_cached_ && frame.pixels.empty())return false;
+    if(frame.width!=width || frame.height!=height || frame.pixels.empty()) {
+        frame=GraphicsSurface{};frame.width=width;frame.height=height;frame.format=1;
+        frame.bytes_per_pixel=4;frame.stride=width*4U;
+        frame.pixels.resize(static_cast<size_t>(frame.stride)*height,0);
     }
     const auto blits = bitmap_blits_.size();
     const bool dirty = display_dirty_;
@@ -52,6 +74,7 @@ bool VM::render_display_regions(uint32_t width, uint32_t height,
         }
         refresh_bgra_mirror(graphics_surfaces_.at(target));
         display_frame_ = std::move(graphics_surfaces_.at(target));
+        display_frame_gpu_cached_=false;
         cleanup();
         return true;
     } catch (...) {

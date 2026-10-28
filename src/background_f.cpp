@@ -1,4 +1,5 @@
 #include "bgiplayer/vm.hpp"
+#include "bgiplayer/gpu_pixel_kernels.hpp"
 #include "bgiplayer/background_mask.hpp"
 
 #include <cstdlib>
@@ -68,6 +69,10 @@ bool VM::compose_background_f_at(uint32_t destination, const DisplayBitmapDraw& 
         const std::size_t bytes = static_cast<std::size_t>(out.width) * out.bytes_per_pixel;
         if (out.stride < bytes || out.pixels.size() < static_cast<std::size_t>(out.stride) * out.height)
             return fail("BackF clear destination stride or capacity is invalid");
+        if(compose_host_pixel_transfer({{out.pixels,0,out.stride,out.width,out.height,out.format,out.bytes_per_pixel},
+                {},PixelTransferOperation::Clear}).success) {
+            refresh_bgra_mirror(out);return true;
+        }
         for (std::size_t y = 0; y < out.height; ++y)
             std::fill_n(out.pixels.begin() + static_cast<std::ptrdiff_t>(y * out.stride), bytes, uint8_t{0});
         refresh_bgra_mirror(out);

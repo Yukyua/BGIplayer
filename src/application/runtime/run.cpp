@@ -265,23 +265,25 @@ int run(const Options& options) {
     // VM state. After loading a checkpoint the first normal tick seeds this
     // cache again before any restored script executes.
     std::optional<VM::PrimarySurfaceSnapshot> last_presented_primary;
-    vm.set_primary_surface_capture_provider([&last_presented_primary, &vm]() {
+    std::function<std::optional<VM::PrimarySurfaceSnapshot>()> read_presented_primary;
+    vm.set_primary_surface_capture_provider([&last_presented_primary, &read_presented_primary, &vm]() {
+        const auto captured=read_presented_primary?read_presented_primary():last_presented_primary;
         if (debug_trace(DebugTrace::Display)) {
             uint64_t hash = 1469598103934665603ULL, sum = 0;
-            if (last_presented_primary) {
-                const auto& rgba = last_presented_primary->rgba;
+            if (captured) {
+                const auto& rgba = captured->rgba;
                 for (std::size_t i = 0; i < rgba.size(); i += 4U)
                     for (std::size_t channel = 0; channel < 3U; ++channel) {
                         sum += rgba[i + channel];
                         hash = (hash ^ rgba[i + channel]) * 1099511628211ULL;
                     }
             }
-            std::cout << "PRIMARY_CAPTURE_PRESENTED available=" << last_presented_primary.has_value()
+            std::cout << "PRIMARY_CAPTURE_PRESENTED available=" << captured.has_value()
                       << " thread=" << vm.current_thread_id()
                       << " ip=" << vm.current_opcode_ip()
                       << " rgb_sum=" << sum << " hash=" << hash << '\n';
         }
-        return last_presented_primary;
+        return captured;
     });
     if (options.backend == "null") {
         vm.set_message_box_handler([&vm](std::string_view text, uint32_t flags) -> int {
@@ -2146,6 +2148,18 @@ int run(const Options& options) {
     SdlPrimarySurface logical_primary;
     MovieTextureCache movie_texture;
     DisplayFrameTextureCache display_texture;
+    vm.set_display_frame_readback_provider([&](VM::GraphicsSurface& frame) {
+        int width=0,height=0;
+        if(!display_texture.read_raw_pixels(frame.pixels,width,height))return false;
+        frame.width=static_cast<uint32_t>(width);frame.height=static_cast<uint32_t>(height);
+        frame.stride=frame.width*4;frame.format=1;frame.bytes_per_pixel=4;return true;
+    });
+    read_presented_primary=[&]() -> std::optional<VM::PrimarySurfaceSnapshot> {
+        if(retain_cpu_pixel_copies())return last_presented_primary;
+        VM::PrimarySurfaceSnapshot capture;
+        if(!logical_primary.read_pixels(capture.rgba,capture.width,capture.height))return std::nullopt;
+        capture.format=vm.window_mode_flag();return capture;
+    };
     MoviePlayback movie_playback;
     uint32_t movie_handle = 0;
     uint64_t movie_started_ms = 0;

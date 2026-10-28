@@ -8,9 +8,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(__ANDROID__)
 namespace bgiplayer {
 struct GpuPixelKernels::Impl {};
+PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::affine(const AffinePixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::background_mask(const BackgroundMaskPixels&) { return {}; }
@@ -107,9 +108,38 @@ PixelKernelResult compose_host_fast_background_mask(const BackgroundMaskPixels& 
 
 PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& p) {
     const uint64_t pixels=uint64_t(p.destination.width)*p.destination.height;
-    if(!fast_rendering_enabled() || !choose_gpu(pixels,512U*512U))return {};
+    if(!choose_gpu(pixels,512U*512U))return {};
     auto result=backend(true).layer_composite(p);
     return result.success?record("layer_composite",result,pixels):result;
+}
+
+bool valid_pixel_transfer(const PixelTransferPixels& p) {
+    const auto valid=[](const GlyphBitmapView& v) {
+        return v.width && v.height && v.bytes_per_pixel==4 && (v.format==1 || v.format==2) &&
+            v.pixels.size()<=UINT32_MAX && v.stride>=uint64_t(v.width)*4 &&
+            uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=v.pixels.size();
+    };
+    if(!valid(p.destination) || p.parameter>256)return false;
+    if(p.operation==PixelTransferOperation::Clear)return true;
+    if(p.operation==PixelTransferOperation::ColorFilter)return p.destination.format==1;
+    if(!valid(p.source) || p.source.width!=p.destination.width || p.source.height!=p.destination.height)return false;
+    const uintptr_t a=reinterpret_cast<uintptr_t>(p.destination.pixels.data()),
+                    b=reinterpret_cast<uintptr_t>(p.source.pixels.data());
+    if(a<=b?b-a<p.destination.pixels.size():a-b<p.source.pixels.size())return false;
+    switch(p.operation) {
+        case PixelTransferOperation::Copy:return true;
+        case PixelTransferOperation::FadeSource:
+        case PixelTransferOperation::BlendOpaque:return p.destination.format==1 && p.source.format==1;
+        case PixelTransferOperation::BlendAlpha:return p.destination.format==1 && p.source.format==2 && p.parameter>0 && p.parameter<256;
+        default:return false;
+    }
+}
+PixelKernelResult compose_host_pixel_transfer(const PixelTransferPixels& p) {
+    const uint64_t pixels=uint64_t(p.destination.width)*p.destination.height;
+    if(!choose_gpu(pixels,512U*512U))return {};
+    const auto result=backend(true).pixel_transfer(p);
+    constexpr const char* names[]={"copy","source_fade","opaque_opacity","color_filter","alpha_opacity","clear"};
+    return result.success?record(names[static_cast<uint32_t>(p.operation)],result,pixels):result;
 }
 
 }

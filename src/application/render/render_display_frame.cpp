@@ -19,7 +19,8 @@ bool render_display_frame(SDL_Renderer* renderer, const VM& vm,
         cache.invalidate();
         return false;
     }
-    return cache.upload(renderer,static_cast<int>(frame.width),static_cast<int>(frame.height),frame.rgba) &&
+    return cache.upload(renderer,static_cast<int>(frame.width),static_cast<int>(frame.height),frame.rgba,
+        retain_cpu_pixel_copies()?std::span<const uint8_t>{}:std::span<const uint8_t>(frame.pixels)) &&
         cache.draw(vm.screen_shake_offset_x(), vm.screen_shake_offset_y());
 }
 }  // namespace

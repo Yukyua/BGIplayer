@@ -167,6 +167,12 @@ struct SnapshotCodec {
     static void save(VM& vm,const std::filesystem::path& path,std::string_view game, SdlAudioBackend* audio) {
         if(!vm.plugins_.empty())throw Error("snapshot cannot checkpoint external plugin state");
         waits(vm,false);
+        const bool gpu_only=vm.display_frame_gpu_cached_ && vm.display_frame_.pixels.empty();
+        if(gpu_only && vm.display_frame_view().pixels.empty())throw Error("cannot read GPU display frame for snapshot");
+        struct FrameReadbackScope {
+            VM& vm;bool release;
+            ~FrameReadbackScope(){if(release)vm.release_display_frame_cpu_pixels();}
+        } frame_readback{vm,gpu_only};
         std::vector<std::unique_lock<std::mutex>> locks;
         for(auto& [id,w]:vm.d0_.workers_) {
             (void)id; locks.emplace_back(w->critical_section);
@@ -226,6 +232,7 @@ struct SnapshotCodec {
         stop_workers(vm.d0_);
         for(auto& [id,mutex]:vm.named_mutexes_){(void)id;if(vm.named_mutex_hooks_.close)vm.named_mutex_hooks_.close(mutex.handle);}
         transfer(vm,candidate);
+        vm.display_frame_gpu_cached_=false;
         if(has_audio) {std::scoped_lock audio_lock(audio->mutex_);transfer(*audio,candidate_audio);}
         // IPL registers aliases in both the VM and its host ArchiveSet. A
         // new process retains the registrar closure, but starts with an empty

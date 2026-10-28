@@ -6807,14 +6807,28 @@ public:
                                  std::span<const DisplayDirtyRegion> regions);
     [[nodiscard]] std::optional<DecodedBitmap> display_frame_snapshot() const;
     // Read-only host upload view. Consume synchronously before the next render.
-    [[nodiscard]] const GraphicsSurface& display_frame_view() const { return display_frame_; }
+    [[nodiscard]] const GraphicsSurface& display_frame_view() const;
+    using DisplayFrameReadbackProvider=std::function<bool(GraphicsSurface&)>;
+    void set_display_frame_readback_provider(DisplayFrameReadbackProvider provider) {
+        display_frame_readback_provider_=std::move(provider);
+    }
+    void release_display_frame_cpu_pixels() {
+        if(!display_frame_readback_provider_ || display_frame_.pixels.empty())return;
+        std::vector<uint8_t>().swap(display_frame_.pixels);
+        std::vector<uint8_t>().swap(display_frame_.rgba);
+        display_frame_gpu_cached_=true;
+    }
+    void invalidate_display_frame_gpu_cache() { display_frame_gpu_cached_=false; }
+    [[nodiscard]] size_t retained_display_frame_cpu_bytes() const {
+        return display_frame_.pixels.capacity()+display_frame_.rgba.capacity();
+    }
     [[nodiscard]] bool has_display_frame(uint32_t width,
                                          uint32_t height) const {
         return display_frame_.width == width &&
                display_frame_.height == height &&
                display_frame_.format == 1U &&
-               display_frame_.pixels.size() ==
-                   static_cast<std::size_t>(width) * height * 4U;
+               (display_frame_gpu_cached_ || display_frame_.pixels.size() ==
+                   static_cast<std::size_t>(width) * height * 4U);
     }
 
     [[nodiscard]] std::vector<DisplayBitmapDraw> build_display_dispatch(
@@ -13016,6 +13030,8 @@ public:
                 surface.format == 1U ? 0xFFU : surface.pixels[offset + 3U];
         }
     }
+    bool accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t x,int32_t y,
+                                    uint32_t mode,uint32_t parameter,bool direct_copy,bool source_fade);
     bool record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
                                     int32_t x, int32_t y, uint32_t mode,
                                     uint32_t parameter);
@@ -13094,6 +13110,8 @@ public:
             refresh_bgra_mirror(out);if (debug_enabled()) bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
             display_dirty_=true;return true;
         }
+        if(accelerate_bitmap_transfer(destination,source,x,y,mode,parameter,
+                matching_direct_copy || format1_to_format2 || format2_to_format1,mode5))return true;
         const bool clear_intersection = mode == 0x41U;
         const bool clear_source_key = mode == 0x40U;
         if (mode_ff_packed) {
@@ -20254,7 +20272,9 @@ private:
     bool draw_window_plane(uint32_t window, int32_t x, int32_t y,
                             uint32_t bitmap, uint32_t mode, uint32_t opacity, bool overlay);
     bool compose_window_at(uint32_t destination, uint32_t window, int32_t x, int32_t y);
-    GraphicsSurface display_frame_;
+    mutable GraphicsSurface display_frame_;
+    bool display_frame_gpu_cached_=false;
+    DisplayFrameReadbackProvider display_frame_readback_provider_;
     DisplayCallbackTrace display_callback_trace_;
     bool compose_single_bitmap_sprite_at(uint32_t destination, uint32_t handle,
                                          int32_t x, int32_t y);

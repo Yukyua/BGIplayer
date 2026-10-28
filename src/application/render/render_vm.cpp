@@ -83,6 +83,7 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
     const char* cache_option = std::getenv("BGI_PRESENT_CACHE");
     const bool cache_enabled = cache_option == nullptr || std::string_view(cache_option) != "0";
     const bool verify_cache = runtime_debug.verify_present_cache;
+    const bool keep_cpu_pixels=retain_cpu_pixel_copies() || verify_cache;
     const bool trace_cost = debug_trace(DebugTrace::GpuFrames);
     const auto cost_start = trace_cost ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
@@ -116,6 +117,7 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
     }
     if (!rendered) {
         frame_cache.invalidate();
+        vm.invalidate_display_frame_gpu_cache();
         render_vm_content(renderer, vm, movie, movie_texture);
     }
     // Grp0:04 locks the existing primary surface. Capture the pixels this
@@ -131,7 +133,7 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
         (*primary)->width == static_cast<uint32_t>(capture_key->width) &&
         (*primary)->height == static_cast<uint32_t>(capture_key->height) &&
         (*primary)->rgba.size() == uint64_t(capture_key->width)*capture_key->height*4U;
-    if (primary != nullptr && (!reuse_primary || verify_cache)) {
+    if (keep_cpu_pixels && primary != nullptr && (!reuse_primary || verify_cache)) {
         int width = 0, height = 0;
         if (SdlPrimarySurface::readback_dimensions(renderer, &width, &height) == 0 &&
             width > 0 && height > 0) {
@@ -236,7 +238,11 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
     if (logical_primary && !logical_primary->copy_to_window())
         throw Error(std::string("cannot present logical primary surface: ") + SDL_GetError());
     SDL_RenderPresent(renderer);
-    if (primary != nullptr && !reuse_primary) {
+    if(!keep_cpu_pixels) {
+        if(primary)primary->reset();
+        if(rendered && frame_cache.has_raw_pixels())vm.release_display_frame_cpu_pixels();
+    }
+    if (keep_cpu_pixels && primary != nullptr && !reuse_primary) {
         if (pending_primary.rgba.empty()) primary->reset();
         else *primary = std::move(pending_primary);
     }
@@ -247,6 +253,7 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
             std::chrono::steady_clock::now() - cost_start).count();
         const auto cost_after = host_pixel_kernel_statistics();
         std::cout << "GPU_FRAME_COST tick=" << SDL_GetTicks()
+                  << " retained_cpu_pixels=" << vm.retained_display_frame_cpu_bytes()
                   << " total_ns=" << cost_ns
                   << " kernel_calls=" << cost_after.calls - cost_before.calls
                   << " gpu_dispatches=" << cost_after.gpu_dispatches - cost_before.gpu_dispatches
