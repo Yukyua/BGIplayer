@@ -112,8 +112,9 @@ class _HomeScreenState extends State<HomeScreen> {
         backgroundColor: AppColors.surfaceRaised,
         title: const Text('从库中移除？'),
         content: Text(
-          '只会移除「${game.title}」的库记录。'
-          '不会删除游戏文件。',
+          privateGameCopies
+              ? '将删除「${game.title}」的应用私有副本及其中的存档（UserData）。外部原目录不会改动。'
+              : '只会移除「${game.title}」的库记录，不会删除游戏文件。',
         ),
         actions: <Widget>[
           TextButton(
@@ -128,8 +129,12 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
     if (confirmed != true || !mounted) return;
-    AppScope.of(context).removeGame(game.id);
-    _snack('已从库中移除「${game.title}」。');
+    try {
+      await AppScope.of(context).removeGame(game.id);
+      if (mounted) _snack('已从库中移除「${game.title}」。');
+    } on Object catch (error) {
+      if (mounted) _snack('移除失败，游戏仍保留在库中：$error');
+    }
   }
 
   void _settings() {

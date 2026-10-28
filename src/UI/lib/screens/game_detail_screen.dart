@@ -52,7 +52,9 @@ class GameDetailScreen extends StatelessWidget {
       builder: (BuildContext context) => AlertDialog(
         backgroundColor: AppColors.surfaceRaised,
         title: const Text('从库中移除？'),
-        content: Text('只会移除「${current.title}」的库记录，不会删除游戏文件。'),
+        content: Text(privateGameCopies
+            ? '将删除「${current.title}」的应用私有副本及其中的存档（UserData）。外部原目录不会改动。'
+            : '只会移除「${current.title}」的库记录，不会删除游戏文件。'),
         actions: <Widget>[
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
@@ -66,8 +68,16 @@ class GameDetailScreen extends StatelessWidget {
       ),
     );
     if (confirmed != true || !context.mounted) return;
-    AppScope.of(context).removeGame(current.id);
-    Navigator.of(context).pop();
+    try {
+      await AppScope.of(context).removeGame(current.id);
+      if (context.mounted) Navigator.of(context).pop();
+    } on Object catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('移除失败，游戏仍保留在库中：$error')),
+        );
+      }
+    }
   }
 
   @override

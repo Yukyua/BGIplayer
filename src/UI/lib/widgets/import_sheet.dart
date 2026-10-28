@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../services/game_folder_picker.dart';
+import '../services/host_service.dart';
 import '../theme/app_theme.dart';
 
 Future<String?> showImportGameSheet(BuildContext context) {
@@ -32,6 +33,7 @@ class _ImportGameSheetState extends State<ImportGameSheet> {
   }
 
   void _submit() {
+    if (privateGameCopies) return;
     final String value = _path.text.trim();
     if (value.isEmpty) return;
     Navigator.of(context).pop(value);
@@ -124,35 +126,38 @@ class _ImportGameSheetState extends State<ImportGameSheet> {
                     ],
                   ),
                   const SizedBox(height: 20),
-                  TextField(
-                    controller: _path,
-                    textInputAction: TextInputAction.done,
-                    keyboardType: TextInputType.url,
-                    onSubmitted: (_) => _submit(),
-                    decoration: const InputDecoration(
-                      labelText: '游戏目录路径',
-                      hintText: '游戏根目录的绝对路径',
-                      prefixIcon: Icon(Icons.folder_open_rounded),
+                  if (!privateGameCopies) ...[
+                    TextField(
+                      controller: _path,
+                      textInputAction: TextInputAction.done,
+                      keyboardType: TextInputType.url,
+                      onSubmitted: (_) => _submit(),
+                      decoration: const InputDecoration(
+                        labelText: '游戏目录路径',
+                        hintText: '游戏根目录的绝对路径',
+                        prefixIcon: Icon(Icons.folder_open_rounded),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 12),
-                  ValueListenableBuilder<TextEditingValue>(
-                    valueListenable: _path,
-                    builder: (
-                      BuildContext context,
-                      TextEditingValue value,
-                      Widget? child,
-                    ) {
-                      return SizedBox(
-                        width: double.infinity,
-                        child: FilledButton.icon(
-                          onPressed: value.text.trim().isEmpty ? null : _submit,
-                          icon: const Icon(Icons.download_done_rounded),
-                          label: const Text('导入此目录'),
-                        ),
-                      );
-                    },
-                  ),
+                    const SizedBox(height: 12),
+                    ValueListenableBuilder<TextEditingValue>(
+                      valueListenable: _path,
+                      builder: (
+                        BuildContext context,
+                        TextEditingValue value,
+                        Widget? child,
+                      ) {
+                        return SizedBox(
+                          width: double.infinity,
+                          child: FilledButton.icon(
+                            onPressed:
+                                value.text.trim().isEmpty ? null : _submit,
+                            icon: const Icon(Icons.download_done_rounded),
+                            label: const Text('导入此目录'),
+                          ),
+                        );
+                      },
+                    ),
+                  ],
                   const SizedBox(height: 10),
                   SizedBox(
                     width: double.infinity,
@@ -188,8 +193,11 @@ class _ImportGameSheetState extends State<ImportGameSheet> {
                         const SizedBox(width: 10),
                         Expanded(
                           child: Text(
-                            '游戏文件保留在原目录，不会复制。'
-                            '启动时由 SDL2 打开独立游戏窗口，存档仍由游戏管理。',
+                            privateGameCopies
+                                ? '通过系统目录选择器授权后，完整复制到应用私有 Games 目录运行。'
+                                    '游戏存档也保存在副本中；从库中移除会删除副本及其存档，外部原目录不变。'
+                                : '游戏文件保留在原目录，不会复制。'
+                                    '启动时由 SDL2 打开独立游戏窗口，存档仍由游戏管理。',
                             style: text.bodySmall?.copyWith(
                               color: AppColors.muted,
                               height: 1.5,

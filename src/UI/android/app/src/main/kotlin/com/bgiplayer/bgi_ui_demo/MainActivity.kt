@@ -1,6 +1,7 @@
 package com.bgiplayer.bgi_ui_demo
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
@@ -14,6 +15,8 @@ import java.util.concurrent.Executors
 class MainActivity : FlutterActivity() {
     private var events: EventChannel.EventSink? = null
     private var logPath: String? = null
+    private var removing = false
+    private val runningGame get() = getSharedPreferences("engine",MODE_PRIVATE).getString("activePath",null)
     private var importing: MethodChannel.Result? = null
     private val worker = Executors.newSingleThreadExecutor()
     override fun configureFlutterEngine(engine: FlutterEngine) {
@@ -26,12 +29,14 @@ class MainActivity : FlutterActivity() {
             when(call.method) {
                 "launch" -> {
                     val path=call.argument<String>("path")
-                    if(path==null || !(File(path,"sysprg.arc").isFile || File(path,"Archive/sysprg.arc").isFile)) {
+                    if(removing) result.error("busy","正在删除游戏副本",null)
+                    else if(path==null || !(File(path,"sysprg.arc").isFile || File(path,"Archive/sysprg.arc").isFile)) {
                         result.error("directory","游戏目录缺少 sysprg.arc",null)
                     } else {
                         val intent=Intent(this,GameActivity::class.java)
                         for(key in listOf("path","title","renderer","defaultFont","logPath","iconPath")) intent.putExtra(key,call.argument<String>(key))
                         logPath=call.argument<String>("logPath")
+                        getSharedPreferences("engine",MODE_PRIVATE).edit().putString("activePath",File(path).canonicalPath).apply()
                         startActivityForResult(intent,41);events?.success(mapOf("type" to "ready", "message" to logPath));result.success(null)
                     }
                 }
@@ -45,15 +50,31 @@ class MainActivity : FlutterActivity() {
             else result.success(File("/system/fonts").listFiles()?.filter{it.isFile && it.extension.lowercase() in setOf("ttf","otf","ttc") }?.sortedBy{it.name}?.map{mapOf("name" to it.nameWithoutExtension,"path" to it.absolutePath)}?:emptyList<Map<String,String>>())
         }
         MethodChannel(engine.dartExecutor.binaryMessenger,"bgiplayer/storage").setMethodCallHandler { call,result ->
-            if(call.method!="importGame") result.notImplemented()
-            else if(importing!=null) result.error("busy","已有目录正在导入",null)
-            else { importing=result;startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION),42) }
+            when(call.method) {
+                "importGame" -> if(importing!=null || removing) result.error("busy","已有目录操作正在执行",null)
+                    else { importing=result;startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION),42) }
+                "removeGame" -> if(importing!=null || removing) result.error("busy","已有目录操作正在执行",null)
+                    else {
+                        val path=call.argument<String>("path")
+                        val engineRunning=(getSystemService(ACTIVITY_SERVICE) as ActivityManager).runningAppProcesses?.any{it.processName=="$packageName:engine"}==true
+                        val active=if(engineRunning)runningGame else null
+                        removing=true
+                        worker.execute {
+                            try {
+                                if(engineRunning && active==null)throw IllegalStateException("请先退出正在运行的游戏")
+                                PrivateGameStorage.remove(filesDir,path,active);runOnUiThread{removing=false;result.success(null)} }
+                            catch(e:Exception){runOnUiThread{removing=false;result.error("remove",e.message,null)}}
+                        }
+                    }
+                else -> result.notImplemented()
+            }
         }
     }
     @Deprecated("Activity result retained for the SDL host contract")
     override fun onActivityResult(request:Int,result:Int,data:Intent?) {
         super.onActivityResult(request,result,data)
         if(request==41){
+            getSharedPreferences("engine",MODE_PRIVATE).edit().remove("activePath").apply()
             if(result==Activity.RESULT_FIRST_USER){
                 val tail=try{logPath?.let{File(it).readLines().takeLast(24).joinToString("\n")}}catch(_:Exception){null}
                 events?.success(mapOf("type" to "error","message" to "引擎退出（${data?.getIntExtra("exitCode",1)}）\n${tail?:""}"))

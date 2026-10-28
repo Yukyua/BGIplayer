@@ -3,11 +3,20 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/game.dart';
 import '../models/app_settings.dart';
 import '../utils/palette.dart';
+
+final bool privateGameCopies = Platform.isAndroid;
+Future<void> removeHostGame(String path) async {
+  if (privateGameCopies) {
+    await const MethodChannel('bgiplayer/storage')
+        .invokeMethod<void>('removeGame', {'path': path});
+  }
+}
 
 final bool fixedGamesDirectory = Platform.isIOS;
 

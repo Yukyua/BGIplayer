@@ -9,9 +9,11 @@ class AppController extends ChangeNotifier {
   AppController(
       {required List<Game> games,
       AppSettings settings = const AppSettings(),
-      this.persistent = false})
+      this.persistent = false,
+      Future<void> Function(String)? removeImportedGame})
       : _games = List<Game>.of(games),
-        _settings = settings;
+        _settings = settings,
+        _removeImportedGame = removeImportedGame ?? removeHostGame;
 
   factory AppController.seeded() => AppController(games: <Game>[]);
 
@@ -29,6 +31,7 @@ class AppController extends ChangeNotifier {
   }
 
   final bool persistent;
+  final Future<void> Function(String) _removeImportedGame;
   final List<Game> _games;
   AppSettings _settings;
   bool _importing = false;
@@ -72,7 +75,11 @@ class AppController extends ChangeNotifier {
     _notify();
   }
 
-  void removeGame(String id) {
+  Future<void> removeGame(String id) async {
+    final matches = _games.where((game) => game.id == id);
+    if (matches.isEmpty) return;
+    await _removeImportedGame(matches.first.path);
+    if (_disposed) return;
     _games.removeWhere((Game game) => game.id == id);
     _save();
     _notify();

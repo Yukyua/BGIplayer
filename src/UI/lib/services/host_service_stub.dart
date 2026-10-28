@@ -2,6 +2,9 @@ import 'dart:typed_data';
 import '../models/app_settings.dart';
 import '../models/game.dart';
 
+const bool privateGameCopies = false;
+Future<void> removeHostGame(String path) async {}
+
 const bool desktopHost = false;
 const bool fixedGamesDirectory = false;
 Future<Game> inspectGame(String path) async =>
