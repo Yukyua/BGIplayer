@@ -2555,7 +2555,10 @@ int run(const Options& options) {
                     const int y = std::clamp(int(event.tfinger.y * logical_h), 0, std::max(0, logical_h - 1));
                     const auto phase = event.type == SDL_FINGERDOWN ? MobileTouchInput::Phase::Down :
                         event.type == SDL_FINGERUP ? MobileTouchInput::Phase::Up : MobileTouchInput::Phase::Move;
-                    touch_input.finger(phase, event.tfinger.fingerId, x, y, SDL_GetTicks64());
+                    const uint64_t current_tick = SDL_GetTicks64();
+                    const uint32_t event_age = static_cast<uint32_t>(current_tick) - event.tfinger.timestamp;
+                    touch_input.finger(phase, event.tfinger.fingerId, x, y,
+                        current_tick >= event_age ? current_tick - event_age : 0);
                     continue;
                 }
                 if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN ||

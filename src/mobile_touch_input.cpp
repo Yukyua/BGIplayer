@@ -28,7 +28,7 @@ void MobileTouchInput::cancel() {
     if (held_) actions_.push_back({held_, false, last_x_, last_y_, held_generation_});
 }
 void MobileTouchInput::expire(uint64_t now) {
-    if (chord_ && !cancelled_ && now - started_ > timeout_) cancel_gesture();
+    if (chord_ && !fingers_.empty() && !cancelled_ && now - started_ > timeout_) cancel_gesture();
 }
 void MobileTouchInput::finger(Phase phase, int64_t id, int32_t x, int32_t y, uint64_t now) {
     expire(now);
