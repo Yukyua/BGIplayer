@@ -77,6 +77,115 @@ void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y,kind=p[0];
  }
 }
 )GLSL";
+// Two separable passes retain the original byte quantization between axes.
+// Each invocation slides across an entire row/column, independent of radius.
+const char* effector_blur_source=R"GLSL(#version 310 es
+precision highp int;
+layout(local_size_x=64) in;
+layout(std430,binding=0) writeonly buffer Destination {uint d[];};
+layout(std430,binding=1) readonly buffer Source {uint a[];};
+layout(std430,binding=2) readonly buffer Horizontal {uint h[];};
+layout(std430,binding=3) readonly buffer Arguments {uint p[];};
+layout(location=0) uniform uint vertical;
+uvec4 halfPixel(uint c){return uvec4(c&255u,(c>>8u)&255u,(c>>16u)&255u,c>>24u)>>1u;}
+uint quantize(uvec4 sums){uvec4 c=((sums*p[11])>>16u)&uvec4(255u);return c.x|(c.y<<8u)|(c.z<<16u)|(c.w<<24u);}
+uint sampleLine(int at,uint line,bool v){
+ int count=int(v?p[21]:p[20]);
+ if(at<0||at>=count){if((p[12]&1u)==0u)return 0u;at=clamp(at,0,count-1);}
+ uint index=uint(at);
+ if(v&&p[12]>=4u)return h[index*p[20]+line];
+ return a[(p[7]+(v?index*p[4]+line*4u:line*p[4]+index*4u))>>2u];
+}
+void main(){
+ uint line=gl_GlobalInvocationID.x,width=p[20],height=p[21];
+ bool v=vertical!=0u;uint count=v?height:width,lines=v?width:height;
+ if(line>=lines)return;
+ int radius=int(p[10]);uvec4 sums=uvec4(0u);
+ for(int i=-radius;i<=radius;++i)sums+=halfPixel(sampleLine(i,line,v));
+ for(uint at=0u;at<count;++at){
+  uint index=!v&&p[12]>=4u?line*width+at:(p[6]+(v?at*p[3]+line*4u:line*p[3]+at*4u))>>2u;
+  d[index]=quantize(sums);
+  sums-=halfPixel(sampleLine(int(at)-radius,line,v));
+  sums+=halfPixel(sampleLine(int(at)+radius+1,line,v));
+ }
+}
+)GLSL";
+const char* effector_displacement_source=R"GLSL(#version 310 es
+precision highp int;
+layout(local_size_x=16,local_size_y=16) in;
+layout(std430,binding=0) writeonly buffer Destination {uint d[];};
+layout(std430,binding=1) readonly buffer Source {uint a[];};
+layout(std430,binding=2) readonly buffer FirstMap {uint m[];};
+layout(std430,binding=3) readonly buffer SecondMap {uint n[];};
+layout(location=0) uniform uint p[64];
+int s16(uint value){return int(value<<16u)>>16;}
+ivec4 unpack(uint c){return ivec4(c&255u,(c>>8u)&255u,(c>>16u)&255u,c>>24u);}
+uint pack(ivec4 c){return uint(c.x)|(uint(c.y)<<8u)|(uint(c.z)<<16u)|(uint(c.w)<<24u);}
+ivec4 sampleSource(int x,int y){if(x<0||y<0||uint(x)>=p[1]||uint(y)>=p[2])return ivec4(0);return unpack(a[(p[7]+uint(y)*p[4]+uint(x)*4u)>>2u]);}
+void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;if(x>=p[1]||y>=p[2])return;
+ uint di=(p[6]+y*p[3]+x*4u)>>2u,strength=p[10];bool second=p[12]!=0u,bilinear=p[11]!=0u;
+ if(!second&&strength==0u){d[di]=a[(p[7]+y*p[4]+x*4u)>>2u];return;}
+ uint ma=m[(p[8]+y*p[5]+x*4u)>>2u],mb=second?n[(p[14]+y*p[13]+x*4u)>>2u]:0u;
+ bool dual=second&&strength>0u&&strength<256u;uint selected=second&&strength==256u?mb:ma;
+ uint effective=second&&(strength==0u||strength==256u)?256u:strength;
+ int bits=bilinear?(dual||effective<256u?3:4):0;ivec2 offset=ivec2(0);
+ for(uint component=0u;component<2u;++component){int value=s16(selected>>(component*16u)),q;
+  if(dual){int difference=s16(uint(s16(mb>>(component*16u))-value));q=s16(uint((value>>1)+((difference*int(strength<<7u))>>16)));if(!bilinear)q=s16(uint(q+4))>>3;}
+  else if(bilinear)q=effective==256u?value:(value*int(effective<<7u))>>16;
+  else q=(value*int(effective)+8)>>12;
+  offset[int(component)]=q;
+ }
+ ivec2 fraction=bilinear?offset&ivec2((1<<bits)-1):ivec2(0);
+ int sx=s16(uint(int(x)+(offset.x>>bits))),sy=s16(uint(int(y)+(offset.y>>bits)));
+ ivec4 color=sampleSource(sx,sy);
+ if(bilinear){ivec4 top=color+((sampleSource(sx+1,sy)-color)*fraction.x>>bits),bottom0=sampleSource(sx,sy+1);
+  ivec4 bottom=bottom0+((sampleSource(sx+1,sy+1)-bottom0)*fraction.x>>bits);color=top+((bottom-top)*fraction.y>>bits);}
+ d[di]=pack(clamp(color,0,255));
+}
+)GLSL";
+const char* effector_vector_source=R"GLSL(#version 310 es
+precision highp int;
+layout(local_size_x=16,local_size_y=16) in;
+layout(std430,binding=0) writeonly buffer Destination {uint d[];};
+layout(std430,binding=1) readonly buffer Source {uint a[];};
+layout(std430,binding=2) readonly buffer NormalMap {uint m[];};
+layout(std430,binding=3) readonly buffer Coefficients {uint c[];};
+layout(location=0) uniform uint p[64];
+int s16(uint value){return int(value<<16u)>>16;}
+uint mapByte(uint i){return (m[i>>2u]>>((i&3u)*8u))&255u;}
+uint mapWord(uint i){return mapByte(i)|(mapByte(i+1u)<<8u);}
+ivec4 unpack(uint color){return ivec4(color&255u,(color>>8u)&255u,(color>>16u)&255u,color>>24u);}
+uint pack(ivec4 color){return uint(color.x)|(uint(color.y)<<8u)|(uint(color.z)<<16u)|(uint(color.w)<<24u);}
+ivec4 sampleSource(int x,int y){
+ uint index;
+ if(p[11]!=0u){if(x<0||y<0||uint(x)>=p[1]||uint(y)>=p[2])return ivec4(0);index=uint(y)*(p[4]>>2u)+uint(x);}
+ else{
+  int high,low;imulExtended(y,int(p[4]>>2u),high,low);
+  index=uint(low)+uint(x);high+=(x<0?-1:0)+(index<uint(low)?1:0);
+  if(high!=0||index>=p[14])return ivec4(0);
+ }
+ return unpack(a[(p[7]>>2u)+index]);
+}
+void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;if(x>=p[1]||y>=p[2])return;
+ uint mi=p[8]+y*p[5]+x*6u,index=mapWord(mi+4u);if(index>=p[12])return;
+ uint coefficient=c[index];int qx=s16(mapWord(mi))*s16(coefficient),qy=s16(mapWord(mi+2u))*s16(coefficient>>16u);
+ bool bilinear=p[10]!=0u;int bias=bilinear?0:32768;
+ int sx=s16(uint(int(x)+((qx+bias)>>16))),sy=s16(uint(int(y)+((qy+bias)>>16)));
+ ivec4 color=sampleSource(sx,sy);
+ if(bilinear){int fx=int((uint(qx)>>12u)&15u),fy=int((uint(qy)>>12u)&15u);
+  ivec4 top=color+((sampleSource(sx+1,sy)-color)*fx>>4),bl=sampleSource(sx,sy+1);
+  ivec4 bottom=bl+((sampleSource(sx+1,sy+1)-bl)*fx>>4);color=top+((bottom-top)*fy>>4);}
+ d[(p[6]+y*p[3]+x*4u)>>2u]=pack(clamp(color,0,255));
+}
+)GLSL";
+GLuint make_compute_program(const char* source,const char* label){
+ GLuint shader=glCreateShader(GL_COMPUTE_SHADER);glShaderSource(shader,1,&source,nullptr);glCompileShader(shader);
+ GLint okay=0;glGetShaderiv(shader,GL_COMPILE_STATUS,&okay);
+ if(!okay){char log[2048]{};glGetShaderInfoLog(shader,sizeof(log),nullptr,log);std::cerr<<"warning: ANDROID_GPU_SHADER kernel="<<label<<" "<<log<<'\n';glDeleteShader(shader);return 0;}
+ GLuint program=glCreateProgram();glAttachShader(program,shader);glLinkProgram(program);glDeleteShader(shader);glGetProgramiv(program,GL_LINK_STATUS,&okay);
+ if(!okay){char log[2048]{};glGetProgramInfoLog(program,sizeof(log),nullptr,log);std::cerr<<"warning: ANDROID_GPU_LINK kernel="<<label<<" "<<log<<'\n';glDeleteProgram(program);return 0;}
+ return program;
+}
 bool valid(const GlyphBitmapView& v,uint32_t bpp=4,size_t storage_bytes=0){const size_t bytes=storage_bytes?storage_bytes:v.pixels.size();return v.width&&v.height&&v.bytes_per_pixel==bpp&&v.stride>=uint64_t(v.width)*bpp&&uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*bpp<=bytes&&bytes<=UINT32_MAX&&(bpp!=4||(v.byte_offset%4==0&&v.stride%4==0));}
 bool overlap(std::span<uint8_t> d,std::span<const uint8_t> s){auto a=reinterpret_cast<uintptr_t>(d.data()),b=reinterpret_cast<uintptr_t>(s.data());return a<=b?b-a<d.size():a-b<s.size();}
 struct RestoreContext {
@@ -86,21 +195,35 @@ struct RestoreContext {
 int32_t truncate_sse(double value){return value>=-2147483648.0&&value<2147483648.0?static_cast<int32_t>(value):INT32_MIN;}
 }
 struct GlesDevice {
- EGLDisplay display=EGL_NO_DISPLAY;EGLContext context=EGL_NO_CONTEXT;EGLSurface surface=EGL_NO_SURFACE;GLuint program=0,buffers[4]{};size_t capacities[4]{};std::recursive_mutex mutex;std::string name="CPU";
- ~GlesDevice(){if(context!=EGL_NO_CONTEXT){RestoreContext restore;if(eglMakeCurrent(display,surface,surface,context)){glDeleteBuffers(4,buffers);if(program)glDeleteProgram(program);}eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);eglDestroyContext(display,context);}if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);/* SDL owns the shared EGLDisplay lifetime. */}
- PixelKernelResult dispatch(std::span<uint8_t> dst,std::span<const uint8_t> src,std::span<const uint8_t> second,std::vector<uint32_t>& args,bool paired=false,bool approximate=false,GLuint resident_source=0){
+ EGLDisplay display=EGL_NO_DISPLAY;EGLContext context=EGL_NO_CONTEXT;EGLSurface surface=EGL_NO_SURFACE;GLuint program=0,blur_program=0,displacement_program=0,vector_program=0,buffers[5]{};size_t capacities[5]{};std::recursive_mutex mutex;std::string name="CPU";
+ ~GlesDevice(){if(context!=EGL_NO_CONTEXT){RestoreContext restore;if(eglMakeCurrent(display,surface,surface,context)){glDeleteBuffers(5,buffers);if(program)glDeleteProgram(program);if(blur_program)glDeleteProgram(blur_program);if(displacement_program)glDeleteProgram(displacement_program);if(vector_program)glDeleteProgram(vector_program);}eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);eglDestroyContext(display,context);}if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);/* SDL owns the shared EGLDisplay lifetime. */}
+ PixelKernelResult dispatch(std::span<uint8_t> dst,std::span<const uint8_t> src,std::span<const uint8_t> second,std::vector<uint32_t>& args,bool paired=false,bool approximate=false,GLuint resident_source=0,bool separable_blur=false,GLuint special_program=0,std::span<const uint8_t> auxiliary={}){
   std::lock_guard lock(mutex);PixelKernelResult result;const bool timing=debug_enabled();auto start=timing?Clock::now():Clock::time_point{};
-  if(!program||dst.empty()||args[1]==0||args[2]==0)return result;
+  if(!program||(separable_blur&&!blur_program)||dst.empty()||args[1]==0||args[2]==0)return result;
   RestoreContext restore;if(!eglMakeCurrent(display,surface,surface,context))return result;
   GLint maximum=0;glGetIntegerv(GL_MAX_SHADER_STORAGE_BLOCK_SIZE,&maximum);
-  std::span<const uint8_t> spans[]={dst,src,second,{reinterpret_cast<const uint8_t*>(args.data()),args.size()*4}};
+  std::span<const uint8_t> spans[]={dst,src,second,{reinterpret_cast<const uint8_t*>(args.data()),args.size()*4},auxiliary};
   for(unsigned n=0;n<16 && glGetError()!=GL_NO_ERROR;++n){}
   auto upload=timing?Clock::now():Clock::time_point{};
-  for(unsigned n=0;n<4;++n){if(n==1&&resident_source){glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,resident_source);continue;}size_t bytes=std::max<size_t>(4,(spans[n].size()+3)&~size_t(3));if(bytes>size_t(maximum))return result;glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[n]);if(capacities[n]<bytes){glBufferData(GL_SHADER_STORAGE_BUFFER,static_cast<GLsizeiptr>(bytes),nullptr,GL_DYNAMIC_COPY);capacities[n]=bytes;}if(!spans[n].empty())glBufferSubData(GL_SHADER_STORAGE_BUFFER,0,static_cast<GLsizeiptr>(spans[n].size()),spans[n].data());glBindBufferBase(GL_SHADER_STORAGE_BUFFER,n,buffers[n]);}
+  for(unsigned n=0;n<(special_program?5u:4u);++n){if(special_program&&n==3)continue;if(n==1&&resident_source){glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,resident_source);continue;}size_t bytes=separable_blur&&n==2&&args[12]>=4?uint64_t(args[20])*args[21]*4:std::max<size_t>(4,(spans[n].size()+3)&~size_t(3));if(bytes>size_t(maximum))return result;glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[n]);if(capacities[n]<bytes){glBufferData(GL_SHADER_STORAGE_BUFFER,static_cast<GLsizeiptr>(bytes),nullptr,GL_DYNAMIC_COPY);capacities[n]=bytes;}if(!spans[n].empty())glBufferSubData(GL_SHADER_STORAGE_BUFFER,0,static_cast<GLsizeiptr>(spans[n].size()),spans[n].data());glBindBufferBase(GL_SHADER_STORAGE_BUFFER,n==4?3:n,buffers[n]);}
   if(timing)result.upload_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-upload).count();
   if(glGetError()!=GL_NO_ERROR)return result;
   auto wait=timing?Clock::now():Clock::time_point{};
-  glUseProgram(program);uint32_t width=paired?(args[1]+1)/2:args[1];glDispatchCompute((width+15)/16,(args[2]+15)/16,1);glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT|GL_SHADER_STORAGE_BARRIER_BIT);
+  if(separable_blur){
+   glUseProgram(blur_program);
+   if(args[12]>=4){
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,buffers[2]);
+    glUniform1ui(0,0);glDispatchCompute((args[21]+63)/64,1,1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,buffers[0]);
+    glUniform1ui(0,1);glDispatchCompute((args[20]+63)/64,1,1);
+   }else{
+    const bool vertical=args[12]>=2;glUniform1ui(0,vertical?1u:0u);
+    glDispatchCompute(((vertical?args[20]:args[21])+63)/64,1,1);
+   }
+  }else if(special_program){glUseProgram(special_program);glUniform1uiv(0,static_cast<GLsizei>(args.size()),args.data());glDispatchCompute((args[1]+15)/16,(args[2]+15)/16,1);}
+  else{glUseProgram(program);uint32_t width=paired?(args[1]+1)/2:args[1];glDispatchCompute((width+15)/16,(args[2]+15)/16,1);}
+  glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT|GL_SHADER_STORAGE_BARRIER_BIT);
   GLsync fence=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);if(!fence)return result;GLenum status=glClientWaitSync(fence,GL_SYNC_FLUSH_COMMANDS_BIT,1000000000ULL);glDeleteSync(fence);
   if(timing)result.wait_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-wait).count();
   if((status!=GL_ALREADY_SIGNALED&&status!=GL_CONDITION_SATISFIED)||glGetError()!=GL_NO_ERROR)return result;
@@ -148,8 +271,12 @@ GpuPixelKernels::GpuPixelKernels(bool enabled):impl_(std::make_unique<Impl>()){
  EGLint contextAttrs[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE},surfaceAttrs[]={EGL_WIDTH,1,EGL_HEIGHT,1,EGL_NONE};impl_->device->surface=eglCreatePbufferSurface(impl_->device->display,config,surfaceAttrs);impl_->device->context=eglCreateContext(impl_->device->display,config,EGL_NO_CONTEXT,contextAttrs);
  if(impl_->device->surface==EGL_NO_SURFACE||impl_->device->context==EGL_NO_CONTEXT||!eglMakeCurrent(impl_->device->display,impl_->device->surface,impl_->device->surface,impl_->device->context))return;
  GLint glMajor=0,glMinor=0;glGetIntegerv(GL_MAJOR_VERSION,&glMajor);glGetIntegerv(GL_MINOR_VERSION,&glMinor);if(glMajor<3||(glMajor==3&&glMinor<1)){std::cerr<<"warning: ANDROID_GPU_UNAVAILABLE OpenGL ES 3.1 compute required; CPU composition selected\n";return;}
- GLuint shader=glCreateShader(GL_COMPUTE_SHADER);glShaderSource(shader,1,&compute_source,nullptr);glCompileShader(shader);GLint okay=0;glGetShaderiv(shader,GL_COMPILE_STATUS,&okay);if(!okay){char log[2048]{};glGetShaderInfoLog(shader,sizeof(log),nullptr,log);std::cerr<<"warning: ANDROID_GPU_SHADER "<<log<<'\n';glDeleteShader(shader);return;}
- GLuint program=glCreateProgram();glAttachShader(program,shader);glLinkProgram(program);glDeleteShader(shader);glGetProgramiv(program,GL_LINK_STATUS,&okay);if(!okay){glDeleteProgram(program);return;}impl_->device->program=program;glGenBuffers(4,impl_->device->buffers);if(auto name=glGetString(GL_RENDERER))impl_->device->name=reinterpret_cast<const char*>(name);
+ impl_->device->program=make_compute_program(compute_source,"pixels");
+ if(!impl_->device->program)return;
+ impl_->device->blur_program=make_compute_program(effector_blur_source,"effector_blur");
+ impl_->device->displacement_program=make_compute_program(effector_displacement_source,"effector_displacement");
+ impl_->device->vector_program=make_compute_program(effector_vector_source,"effector_vector");
+ glGenBuffers(5,impl_->device->buffers);if(auto name=glGetString(GL_RENDERER))impl_->device->name=reinterpret_cast<const char*>(name);
 }
 std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const uint8_t> pixels){
  if(!available()||pixels.empty()||pixels.size()>size_t(std::numeric_limits<GLsizeiptr>::max())-3)return {};
@@ -191,6 +318,42 @@ PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels& p
  if(p.source_storage&&(!storage||!storage->compatible(impl_->device)||!p.source.pixels.empty()))return {};
  if(!available()||!valid(p.destination)||!valid(p.source,4,storage?storage->size():0)||p.source.format!=2||(p.destination.format!=1&&p.destination.format!=2)||p.destination.width!=p.source.width||p.destination.height!=p.source.height||p.reciprocal_corrections.size()!=65536||(!storage&&overlap(p.destination.pixels,p.source.pixels)))return {};
  std::vector<uint32_t>a(64);a[0]=3;a[1]=p.destination.width;a[2]=p.destination.height;a[3]=p.destination.stride;a[4]=p.source.stride;a[6]=p.destination.byte_offset;a[7]=p.source.byte_offset;a[9]=p.destination.format;return impl_->device->dispatch(p.destination.pixels,p.source.pixels,p.reciprocal_corrections,a,true,false,storage?storage->buffer():0);
+}
+PixelKernelResult GpuPixelKernels::effector_blur(const EffectorBlurPixels& p){
+ if(!available()||!valid_effector_blur(p)||!valid(p.destination)||!valid(p.source))return {};
+ const auto& dst=p.destination;const auto& src=p.source;
+ if(p.radius==0){
+  if(dst.pixels.data()==src.pixels.data()&&dst.byte_offset==src.byte_offset&&dst.stride==src.stride)return {true,false};
+  // CPU radius0 is row-by-row memmove; uploading all overlapping source rows
+  // first would change its cross-row alias semantics. Preserve the CPU fallback.
+  if(overlap(dst.pixels,src.pixels))return {};
+  std::vector<uint32_t>a(64);a[0]=5;a[1]=dst.width;a[2]=dst.height;a[3]=dst.stride;a[4]=src.stride;a[6]=dst.byte_offset;a[7]=src.byte_offset;a[10]=0;a[13]=dst.format;a[14]=src.format;
+  return impl_->device->dispatch(dst.pixels,src.pixels,{},a);
+ }
+ if(p.selector<4&&overlap(dst.pixels,src.pixels))return {};
+ const uint32_t radius=std::min(p.radius,255U),diameter=radius*2+1;
+ std::vector<uint32_t>a(64);a[1]=dst.width;a[2]=dst.height;a[3]=dst.stride;a[4]=src.stride;a[6]=dst.byte_offset;a[7]=src.byte_offset;
+ a[10]=radius;a[11]=((0x20000U+diameter*2)/diameter)&0xffffU;a[12]=p.selector;a[20]=src.width;a[21]=src.height;
+ return impl_->device->dispatch(dst.pixels,src.pixels,{},a,false,false,0,true);
+}
+PixelKernelResult GpuPixelKernels::effector_displacement(const EffectorDisplacementPixels& p){
+ if(!available()||!impl_->device->displacement_program||!valid_effector_displacement(p)||
+  !valid(p.destination)||!valid(p.source)||!valid(p.first)||(p.second&&!valid(*p.second)))return {};
+ std::vector<uint32_t>a(64);a[1]=p.destination.width;a[2]=p.destination.height;a[3]=p.destination.stride;
+ a[4]=p.source.stride;a[5]=p.first.stride;a[6]=p.destination.byte_offset;a[7]=p.source.byte_offset;a[8]=p.first.byte_offset;
+ a[10]=p.strength;a[11]=p.bilinear;a[12]=p.second.has_value();if(p.second){a[13]=p.second->stride;a[14]=p.second->byte_offset;}
+ return impl_->device->dispatch(p.destination.pixels,p.source.pixels,p.first.pixels,a,false,false,0,false,
+  impl_->device->displacement_program,p.second?p.second->pixels:std::span<const uint8_t>{});
+}
+PixelKernelResult GpuPixelKernels::effector_vector(const EffectorVectorPixels& p){
+ if(!available()||!impl_->device->vector_program||!valid_effector_vector(p)||
+  !valid(p.destination)||!valid(p.source)||!valid(p.normal,6))return {};
+ std::vector<uint32_t>a(64);a[1]=p.destination.width;a[2]=p.destination.height;a[3]=p.destination.stride;
+ a[4]=p.source.stride;a[5]=p.normal.stride;a[6]=p.destination.byte_offset;a[7]=p.source.byte_offset;a[8]=p.normal.byte_offset;
+ a[10]=p.bilinear;a[11]=p.rectangular_bounds;a[12]=static_cast<uint32_t>(p.coefficients.size());a[14]=(p.source.stride/4)*p.source.height;
+ const auto coefficients=std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(p.coefficients.data()),p.coefficients.size_bytes());
+ return impl_->device->dispatch(p.destination.pixels,p.source.pixels,p.normal.pixels,a,false,false,0,false,
+  impl_->device->vector_program,coefficients);
 }
 PixelKernelResult GpuPixelKernels::background_mask(const BackgroundMaskPixels& p){
  if(!available()||!valid(p.destination)||!valid(p.source)||!valid(p.mask,1)||p.destination.format!=1||p.source.format!=1||p.mask.format!=3||p.left>=p.right||p.top>=p.bottom||p.right>p.destination.width||p.bottom>p.destination.height||uint64_t(p.source_left)+p.right-p.left>p.source.width||uint64_t(p.source_top)+p.bottom-p.top>p.source.height||uint64_t(p.mask_left)+p.right-p.left>p.mask.width||uint64_t(p.mask_top)+p.bottom-p.top>p.mask.height||(p.shift!=7&&p.shift!=12)||overlap(p.destination.pixels,p.source.pixels)||overlap(p.destination.pixels,p.mask.pixels))return {};
