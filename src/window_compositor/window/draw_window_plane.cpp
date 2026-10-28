@@ -12,6 +12,10 @@ bool VM::draw_window_plane(uint32_t window, int32_t x, int32_t y,
     }
     auto& state = object->second;
     GraphicsSurface plane;
+    // This temporary commits only native bitmap bytes back to the window.
+    // Its RGBA presentation mirror is never consumed; building it after each
+    // static icon needlessly swizzles the complete window for every blit.
+    plane.defer_rgba_mirror=true;
     plane.width = state.width;
     plane.height = state.height;
     plane.format = state.plane_format;

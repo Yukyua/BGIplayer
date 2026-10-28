@@ -8890,7 +8890,7 @@ public:
             // The host display/SDL backbuffer is not the source of this native.
             if (!recompose_window_basic_planes(handle)) return false;
             captured = WindowCaptureSnapshot{window->second.width,window->second.height,
-                2U,window->second.composite_plane};
+                2U,std::as_const(window->second.composite_plane).cpu_pixels()};
         }
         if (!captured || captured->width == 0 ||
             captured->height == 0 || captured->format != 2U) {
@@ -8915,12 +8915,15 @@ public:
         surface.format = format;
         surface.bytes_per_pixel = 4;
         surface.stride = surface.width * 4U;
-        surface.pixels.assign(destination_size, 0);
+        const bool exact_storage=captured->width==surface.width && captured->height==surface.height &&
+            captured->pixels.size()==destination_size;
+        if(exact_storage)surface.pixels=std::move(captured->pixels);
+        else surface.pixels.assign(destination_size, 0);
         const uint32_t copy_width =
             std::min(surface.width, captured->width);
         const uint32_t copy_height =
             std::min(surface.height, captured->height);
-        if (copy_width != 0 && copy_height != 0) {
+        if (!exact_storage && copy_width != 0 && copy_height != 0) {
             for (uint32_t row = 0; row < copy_height; ++row) {
                 std::copy_n(
                     captured->pixels.begin() +
@@ -8934,15 +8937,16 @@ public:
                             surface.stride));
             }
         }
-        surface.rgba.resize(destination_size);
+        // Resolve lazy buffers once. Capture's presentation mirror is opaque
+        // even when its native format2 bytes carry nonopaque alpha.
+        auto* const rgba=surface.rgba.overwrite(destination_size);
+        const auto* const pixels=std::as_const(surface.pixels).data();
         for (std::size_t index = 0;
-             index < surface.pixels.size() / 4U; ++index) {
-            surface.rgba[index * 4U] = surface.pixels[index * 4U + 2U];
-            surface.rgba[index * 4U + 1U] =
-                surface.pixels[index * 4U + 1U];
-            surface.rgba[index * 4U + 2U] =
-                surface.pixels[index * 4U];
-            surface.rgba[index * 4U + 3U] = 0xFF;
+             index < destination_size / 4U; ++index) {
+            rgba[index * 4U] = pixels[index * 4U + 2U];
+            rgba[index * 4U + 1U] = pixels[index * 4U + 1U];
+            rgba[index * 4U + 2U] = pixels[index * 4U];
+            rgba[index * 4U + 3U] = 0xFF;
         }
         install_allocated_graphics_surface(type, std::move(surface));
         return true;
