@@ -85,11 +85,11 @@ kernel void effector_vertical(device uchar* dst [[buffer(0)]],device const uchar
         for(uint c=0;c<4;++c)sums[c]+=blur_vertical_sample(tmp,p,int(y+p.radius+1),x,c)-blur_vertical_sample(tmp,p,int(y)-int(p.radius),x,c);
     }
 }
-struct Displace { uint width,height,ds,ss,as,bs,d0,s0,a0,b0,strength,filtered,second; };
+struct Displace { uint width,height,ds,ss,as,bs,d0,s0,a0,b0,strength,filtered,second,sw,sh; };
 int displace_word(device const uchar* map,uint at) {return int(as_type<short>(ushort(uint(map[at])|(uint(map[at+1])<<8))));}
 int displace_wrap(int value) {return int(as_type<short>(ushort(value)));}
 int displace_sample(device const uchar* src,constant Displace& p,int x,int y,uint c) {
-    if(x<0 || y<0 || uint(x)>=p.width || uint(y)>=p.height)return 0;
+    if(x<0 || y<0 || uint(x)>=p.sw || uint(y)>=p.sh)return 0;
     return int(src[p.s0+uint(y)*p.ss+uint(x)*4+c]);
 }
 kernel void effector_displacement(device uchar* dst [[buffer(0)]],device const uchar* src [[buffer(1)]],
@@ -887,7 +887,7 @@ PixelKernelResult GpuPixelKernels::effector_displacement(const EffectorDisplacem
         if(!command || !encoder)return result;
         const uint32_t args[]={p.destination.width,p.destination.height,p.destination.stride,p.source.stride,p.first.stride,
             p.second?p.second->stride:0,p.destination.byte_offset,p.source.byte_offset,p.first.byte_offset,p.second?p.second->byte_offset:0,
-            p.strength,p.bilinear?1U:0U,p.second?1U:0U};
+            p.strength,p.bilinear?1U:0U,p.second?1U:0U,p.source.width,p.source.height};
         [encoder setComputePipelineState:impl_->displacement_pipeline];
         [encoder setBuffer:impl_->destination offset:0 atIndex:0];[encoder setBuffer:impl_->source offset:0 atIndex:1];
         [encoder setBuffer:impl_->second offset:0 atIndex:2];[encoder setBuffer:p.second?impl_->auxiliary:impl_->second offset:0 atIndex:3];

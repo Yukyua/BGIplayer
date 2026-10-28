@@ -1,7 +1,9 @@
 #include "bgiplayer/gpu_pixel_kernels.hpp"
 #include "bgiplayer/effector_selectors.hpp"
+#include "bgiplayer/effector_transform.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -58,6 +60,63 @@ int main() {
             check(vector.good() && !status && result.success && result.used_gpu && dst==expected,"GPU vector differs from original");++count;
         }
         check(count==288,"vector case count");std::cout<<"GPU_EFFECTOR_VECTOR_PASS cases="<<count<<'\n';
+        {
+            unsigned cases=0;
+            for(uint32_t format:{1U,2U}) {
+            std::ifstream temporal(format==1?"tests/fixtures/original_pe64_effector_temporal.bin":"tests/fixtures/original_pe64_effector_temporal_alpha.bin",std::ios::binary);
+            check(temporal.good(),"original temporal fixture");
+            while(temporal.peek()!=EOF) {
+                uint32_t h[4];temporal.read(reinterpret_cast<char*>(h),sizeof(h));
+                check(h[0] && h[0]<=9 && h[1] && h[1]<=5 && h[2]<=257,"temporal fixture bounds");
+                std::vector<uint8_t> scene(h[0]*h[1]*4),history(scene.size()),want_scene(scene.size()),want_history(scene.size());
+                for(auto* bytes:{&scene,&history,&want_scene,&want_history})temporal.read(reinterpret_cast<char*>(bytes->data()),bytes->size());
+                const auto result=gpu.effector_temporal({{scene,0,h[0]*4,h[0],h[1],format,4},{history,0,h[0]*4,h[0],h[1],format,4},h[2]});
+                check(temporal.good() && result.success && result.used_gpu && scene==want_scene && history==want_history,"GPU original consecutive temporal frames");++cases;
+            }
+            }
+            check(cases==504,"temporal consecutive case count");std::cout<<"GPU_EFFECTOR_TEMPORAL_PASS cases="<<cases<<'\n';
+        }
+        {
+            std::ifstream partial("tests/fixtures/original_pe64_effector_partial_kinds.bin",std::ios::binary);
+            check(partial.good(),"original partial fixture");unsigned transforms=0,temporals=0,displacements=0;
+            const int rects[][4]={{0,0,8,4},{1,1,6,3},{2,0,2,4},{0,2,8,2}};
+            while(partial.peek()!=EOF) {
+                uint32_t h[7];partial.read(reinterpret_cast<char*>(h),sizeof(h));
+                std::vector<uint8_t> scene(1024),history(1024),want_scene(1024),want_history(1024);
+                for(auto* bytes:{&scene,&history,&want_scene,&want_history})partial.read(reinterpret_cast<char*>(bytes->data()),bytes->size());
+                check(partial.good() && h[0]>=1 && h[0]<=2 && h[1]<=4 && h[2]<4,"partial fixture bounds");
+                if(h[1]!=0 && h[1]!=3 && h[1]!=4)continue;
+                const auto& rect=rects[h[2]];
+                const uint32_t offset=uint32_t(rect[1]*36+rect[0]*4),rw=uint32_t(rect[2]-rect[0]+1),rh=uint32_t(rect[3]-rect[1]+1);
+                const uint32_t w=h[3]?rw:9,height=h[3]?rh:5,scene_offset=h[3]?offset:0;
+                const GlyphBitmapView view{scene,scene_offset,36,w,height,h[0],4};
+                if(h[1]!=4)for(uint32_t y=0;y<height;++y)std::copy_n(scene.data()+scene_offset+y*36,w*4,history.data()+y*36);
+                if(h[1]==0) {
+                    if(h[4]<=256) {
+                        std::vector<uint8_t> map(9*5*4);
+                        for(uint32_t y=0;y<5;++y)for(uint32_t x=0;x<9;++x) {
+                            const std::array<int16_t,2> displacement{int16_t((int(x%3)-1)*32),int16_t((int(y%3)-1)*32)};
+                            std::memcpy(map.data()+y*36+x*4,displacement.data(),4);
+                        }
+                        const GlyphBitmapView mv{map,0,36,9,5,4,4};
+                        const auto result=gpu.effector_displacement({view,{history,0,36,9,5,h[0],4},mv,mv,h[4],h[5]!=0});
+                        check(result.success && result.used_gpu,"GPU partial displacement dispatch");
+                    }
+                    check(scene==want_scene && history==want_history,"GPU original partial displacement source bounds");++displacements;
+                } else
+                if(h[1]==3) {
+                    const auto matrix=effector_transform_matrix(9,5,{4*65536+16384,2*65536-8192,65536,72089,81920});
+                    check(matrix.has_value(),"original transform matrix");
+                    const auto result=gpu.effector_transform({view,{history,0,36,9,5,h[0],4},*matrix,h[5]!=0});
+                    check(result.success && result.used_gpu && scene==want_scene && history==want_history,"GPU original partial affine callback");++transforms;
+                } else {
+                    const auto result=gpu.effector_temporal({view,{history,offset,36,rw,rh,h[0],4},h[4]});
+                    check(result.success && result.used_gpu && scene==want_scene && history==want_history,"GPU original partial temporal callback and alpha pairing");++temporals;
+                }
+            }
+            check(displacements==128 && transforms==128 && temporals==128,"partial displacement/transform/temporal case counts");
+            std::cout<<"GPU_EFFECTOR_PARTIAL_PASS displacement="<<displacements<<" transform="<<transforms<<" temporal="<<temporals<<'\n';
+        }
         {
             const std::vector<uint8_t> a(4099,0x39),b(65539,0x97);
             const std::array<std::span<const uint8_t>,2> input{a,b};

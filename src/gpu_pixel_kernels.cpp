@@ -187,8 +187,8 @@ bool valid_effector_displacement(const EffectorDisplacementPixels& p) {
     };
     if(!valid(p.destination) || !valid(p.source) || !valid(p.first) || p.strength>256 ||
             p.source.format!=p.destination.format || (p.source.format!=1 && p.source.format!=2) || p.first.format!=4 ||
-            p.source.width!=p.destination.width || p.source.height!=p.destination.height ||
             p.first.width<p.destination.width || p.first.height<p.destination.height)return false;
+    if(!p.second && p.strength==0 && (p.source.width!=p.destination.width || p.source.height!=p.destination.height))return false;
     if(p.second && (!valid(*p.second) || p.second->format!=4 || p.second->width!=p.first.width || p.second->height!=p.first.height))return false;
     const auto overlap=[](auto a,auto b) {
         const auto x=reinterpret_cast<uintptr_t>(a.data()),y=reinterpret_cast<uintptr_t>(b.data());

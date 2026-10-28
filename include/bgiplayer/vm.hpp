@@ -6436,17 +6436,17 @@ public:
                               std::string resource) {
         std::vector<uint8_t> data = read_resource(archive, resource);
         return load_bitmap_resource_data(
-            type, std::move(archive), std::move(resource), data);
+            type, std::move(archive), std::move(resource), std::move(data));
     }
     bool load_bitmap_resource_data(
         uint32_t type, std::string archive, std::string resource,
-        const std::vector<uint8_t>& data) {
+        std::vector<uint8_t> data) {
         if (data.size() >= 15U &&
             std::string_view(
                 reinterpret_cast<const char*>(data.data()), 15U).starts_with(
                 "CompressedBG_")) {
             std::string decode_error;
-            const auto decoded = decode_compressed_bg(data, &decode_error, archive + ":" + resource);
+            auto decoded = decode_compressed_bg(data, &decode_error, archive + ":" + resource);
             if (!decoded || decoded->width == 0 ||
                 decoded->height == 0 ||
                 (decoded->bits_per_pixel != 8U &&
@@ -6472,13 +6472,18 @@ public:
             // The decoder result itself must retain selector7.
             if (compact_64_opcodes_ && decoded->format == 7U) {
                 surface.format = 1U;
-                surface.pixels = decoded->pixels;
+                surface.pixels = std::move(decoded->pixels);
+            } else if (surface.format != 1U && decoded->pixels.size() ==
+                       static_cast<std::size_t>(surface.stride) * surface.height) {
+                // The decoder already produced this exact internal layout;
+                // transfer its allocation rather than copying every pixel.
+                surface.pixels = std::move(decoded->pixels);
             } else {
                 surface.pixels = bitmap_internal_pixels(
                     surface.format, surface.width, surface.height,
                     decoded->pixels);
             }
-            surface.encoded = data;
+            surface.encoded = std::move(data);
             surface.archive = std::move(archive);
             surface.resource = std::move(resource);
             refresh_bgra_mirror(surface);
@@ -6554,8 +6559,9 @@ public:
             bitmap_load_errors_[type] = "bitmap resource is missing";
             return false;
         }
-        const bool loaded = load_bitmap_resource_data(
-            type, archive, resource, data);
+        const bool loaded = cache_loaded
+            ? load_bitmap_resource_data(type, archive, resource, data)
+            : load_bitmap_resource_data(type, archive, resource, std::move(data));
         if (loaded && cache_loaded) {
             bitmap_resource_cache_[key] = std::move(data);
         }
