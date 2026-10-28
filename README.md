@@ -99,3 +99,23 @@ when needed. VM bitmap resources remain available to native pixel operations.
 Use `BGI_KEEP_CPU_PIXELS=1` to retain frame copies for debugging, or `BGI_GPU=0`
 for CPU rendering. Intermediate compute operations still use synchronous
 transfers; this is not a fully resident GPU resource graph.
+
+### Android
+
+Android 9+ ARM64 is supported by the Flutter launcher and the native SDL2
+engine. Install Android SDK/NDK 28.2.13676358 and CMake 3.22.1, set
+`ANDROID_SDK_ROOT`, and run `src/UI/tool/build_android.sh`. The APK is generated
+at `src/UI/build/app/outputs/flutter-apk/app-release.apk`. Import a game folder
+through the Android directory picker; the application copies it into private
+storage and keeps UserData there. GLES 3.1 compute accelerates supported
+composition operations, with a CPU fallback on other devices. The current
+release APK uses the local Android debug signing key for sideloading.
+
+### GPU frame memory
+
+GPU presentation releases the completed frame's CPU pixel caches by default.
+Screenshots, native screen capture and debug snapshots read pixels back only
+when needed. VM bitmap resources remain available to native pixel operations.
+Use `BGI_KEEP_CPU_PIXELS=1` to retain frame copies for debugging, or `BGI_GPU=0`
+for CPU rendering. Intermediate compute operations still use synchronous
+transfers; this is not a fully resident GPU resource graph.

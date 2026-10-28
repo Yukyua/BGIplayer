@@ -1,5 +1,6 @@
 #include "bgiplayer/host_locale.hpp"
 #include "bgiplayer/common.hpp"
+#include <cstdlib>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -33,6 +34,12 @@ uint32_t host_default_ui_language() {
     if(languages)CFRelease(languages);
     if(result==0)throw Error("host UI language has no Windows LANGID mapping");
     return result;
+#elif defined(__ANDROID__)
+    if (const char* value=std::getenv("BGI_ANDROID_LANGID")) {
+        const auto language=std::strtoul(value,nullptr,10);
+        if(language>0 && language<=0xFFFFU)return static_cast<uint32_t>(language);
+    }
+    return 0x0409U; // Android host locale unavailable: Windows English US.
 #else
     throw Error("host UI language adapter is unavailable on this platform");
 #endif
