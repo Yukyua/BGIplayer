@@ -5,13 +5,56 @@ namespace bgiplayer {
 bool VM::accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t x,int32_t y,
                                     uint32_t mode,uint32_t parameter,bool direct_copy,bool source_fade) {
     auto target=graphics_surfaces_.find(destination),input=graphics_surfaces_.find(source);
-    if(target==graphics_surfaces_.end() || input==graphics_surfaces_.end() || destination==source)return false;
+    if(target==graphics_surfaces_.end() || input==graphics_surfaces_.end() || (destination==source && (x!=0 || y!=0)))return false;
+    // Keep the original 2->2 opacity kernel and pair/odd-tail phase, but
+    // apply it only to the clipped rows instead of materializing a complete
+    // 1080p destination for a small label. Published owners stay immutable.
+    if(destination!=source && !retain_cpu_pixel_copies() && (mode==1U || mode==0x20U) &&
+            parameter>0 && parameter<256 && target->second.format==2 && input->second.format==2 &&
+            materialize_graphics_pixels(target->second) && materialize_graphics_pixels(input->second)) {
+        auto& out=target->second;auto& in=input->second;
+        const auto base=out.pixels.gpu_storage(),source_owner=in.pixels.gpu_storage();
+        const int64_t left=std::max<int64_t>(x,0),top=std::max<int64_t>(y,0);
+        const int64_t right=std::min<int64_t>(int64_t(x)+in.width,out.width);
+        const int64_t bottom=std::min<int64_t>(int64_t(y)+in.height,out.height);
+        if(left<right && top<bottom && uint64_t(right-left)*uint64_t(bottom-top)<=65536 &&
+            out.pixels.size()>=65536U*4 && base && base->fast_ranges() &&
+            (!source_owner || source_owner->fast_ranges()) && out.bytes_per_pixel==4 && in.bytes_per_pixel==4 &&
+            out.width<=UINT32_MAX/4 && in.width<=UINT32_MAX/4 && out.stride>=out.width*4 && in.stride>=in.width*4 &&
+            uint64_t(out.height)*out.stride<=out.pixels.size() && uint64_t(in.height)*in.stride<=in.pixels.size()) {
+            const auto patch=[&]() -> std::shared_ptr<GpuPixelStorage> {
+                const auto w=static_cast<uint32_t>(right-left),h=static_cast<uint32_t>(bottom-top);
+                PixelBuffer destination_bytes;std::vector<uint8_t> source_bytes(size_t(w)*h*4);
+                auto* bytes=destination_bytes.overwrite(source_bytes.size());
+                const auto* cpu_source=source_owner?nullptr:std::as_const(in.pixels).data();
+                const size_t d0=size_t(top)*out.stride+size_t(left)*4;
+                const size_t s0=size_t(top-y)*in.stride+size_t(left-x)*4;
+                for(uint32_t row=0;row<h;++row) {
+                    if(!base->read_range(d0+size_t(row)*out.stride,{bytes+size_t(row)*w*4,w*4}))return {};
+                    auto source_row=std::span<uint8_t>(source_bytes).subspan(size_t(row)*w*4,w*4);
+                    if(source_owner) {if(!source_owner->read_range(s0+size_t(row)*in.stride,source_row))return {};}
+                    else std::copy_n(cpu_source+s0+size_t(row)*in.stride,source_row.size(),source_row.data());
+                }
+                if(!blend_original_glyph_opacity({{bytes,source_bytes.size()},0,w*4,w,h,2,4},
+                        {source_bytes,0,w*4,w,h,2,4},0,0,parameter) || !destination_bytes.offload())return {};
+                return patched_pixel_storage(base,destination_bytes.gpu_storage(),d0,out.stride,w*4,h);
+            }();
+            if(patch) {
+                out.pixels.replace_gpu_storage(patch);refresh_bgra_mirror(out);
+                if(debug_enabled())bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
+                display_dirty_=true;return true;
+            }
+        }
+    }
     // Host accelerator for the original0040BDD0/0040BED0 copy,
     // 0040C5E0 constant opacity and modeC0 source fade. Geometry and
     // admitted format/mode dispatch above remain engine-owned.
     std::optional<PixelTransferOperation> gpu_operation;
     if (direct_copy &&
         target->second.bytes_per_pixel==4 && input->second.bytes_per_pixel==4)
+        gpu_operation=PixelTransferOperation::Copy;
+    else if((mode==1 || mode==0x20) && parameter==0 && input->second.format==1 &&
+        (target->second.format==1 || target->second.format==2))
         gpu_operation=PixelTransferOperation::Copy;
     else if(source_fade && parameter<=256 && target->second.format==1 && input->second.format==1)
         gpu_operation=PixelTransferOperation::FadeSource;
@@ -26,6 +69,17 @@ bool VM::accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t
             const uint64_t d0=uint64_t(top)*out.stride+uint64_t(left)*4;
             const uint64_t s0=uint64_t(top-y)*in.stride+uint64_t(left-x)*4;
             const auto w=static_cast<uint32_t>(right-left),h=static_cast<uint32_t>(bottom-top);
+            if(out.pixels.size()>=65536U*4U && out.pixels.offload() && in.pixels.offload()) {
+                if(auto result=compose_host_resident_transfer({
+                    {{},static_cast<uint32_t>(d0),out.stride,w,h,out.format,4},
+                    {{},static_cast<uint32_t>(s0),in.stride,w,h,in.format,4},*gpu_operation,parameter,0,
+                    in.pixels.gpu_storage()},out.pixels.gpu_storage())) {
+                    out.pixels.replace_gpu_storage(std::move(result));
+                    refresh_bgra_mirror(out);
+                    if(debug_enabled())bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
+                    display_dirty_=true;return true;
+                }
+            }
             const auto resident=in.pixels.gpu_storage();
             const std::span<uint8_t> source_bytes=resident?std::span<uint8_t>{}:std::span<uint8_t>(in.pixels);
             if(d0<=UINT32_MAX && s0<=UINT32_MAX && compose_host_pixel_transfer({

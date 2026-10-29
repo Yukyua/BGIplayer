@@ -461,7 +461,6 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
     view.format = target->second.format;
     view.bytes_per_pixel = pixel_size;
     view.stride = width * pixel_size;
-    view.pixels.resize(static_cast<std::size_t>(view.stride) * height);
     const std::size_t target_stride = target->second.stride;
     if (target_stride < static_cast<std::size_t>(target->second.width) * pixel_size ||
         target->second.pixels.size() < target_stride * target->second.height) {
@@ -469,9 +468,27 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
     }
     const std::size_t base = static_cast<std::size_t>(callback.source_top) * target_stride +
                              static_cast<std::size_t>(callback.source_left) * pixel_size;
-    for (std::size_t row = 0; row < height; ++row) {
-        std::copy_n(target->second.pixels.begin() + static_cast<std::ptrdiff_t>(base + row * target_stride),
-                    view.stride, view.pixels.begin() + static_cast<std::ptrdiff_t>(row * view.stride));
+    // 56900's scratch is a transactional scene descriptor. A complete
+    // descriptor can share the immutable native owner until an actual write;
+    // cropped descriptors read only their rows and publish a local patch.
+    const bool full_view=base==0 && width==target->second.width && height==target->second.height &&
+        target_stride==view.stride;
+    const auto original_owner=target->second.pixels.gpu_storage();
+    const bool local_resident=!retain_cpu_pixel_copies() && original_owner && original_owner->fast_ranges();
+    if(full_view) {
+        if(!retain_cpu_pixel_copies())(void)target->second.pixels.offload();
+        view.pixels=target->second.pixels;
+    } else {
+        view.pixels.resize(static_cast<std::size_t>(view.stride)*height);
+        auto* destination=view.pixels.data();
+        const auto* source=local_resident?nullptr:std::as_const(target->second.pixels).data();
+        for(size_t row=0;row<height;++row) {
+            if(local_resident) {
+                if(!original_owner->read_range(base+row*target_stride,
+                        {destination+row*view.stride,view.stride}))
+                    return fail("callback destination pixels could not be read");
+            } else std::copy_n(source+base+row*target_stride,view.stride,destination+row*view.stride);
+        }
     }
     uint32_t scratch = 0xFFFFFFFFU;
     while (graphics_surfaces_.count(scratch) != 0) {
@@ -590,14 +607,23 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
                           scratch, callback.display_object, x, y);
         }
         if (composed) {
-            const auto& result = graphics_surfaces_.at(scratch);
-            for (std::size_t row = 0; row < height; ++row) {
-                std::copy_n(
-                    result.pixels.begin() +
-                        static_cast<std::ptrdiff_t>(row * result.stride),
-                    result.stride,
-                    target->second.pixels.begin() +
-                        static_cast<std::ptrdiff_t>(base + row * target_stride));
+            auto& result = graphics_surfaces_.at(scratch);
+            bool published=false;
+            if(full_view) {
+                if(local_resident)(void)result.pixels.offload();
+                target->second.pixels=std::move(result.pixels);
+                published=true;
+            } else if(local_resident && result.pixels.offload()) {
+                if(auto patch=patched_pixel_storage(original_owner,result.pixels.gpu_storage(),base,
+                        target_stride,result.stride,height)) {
+                    target->second.pixels.replace_gpu_storage(std::move(patch));published=true;
+                }
+            }
+            if(!published) {
+                const auto* source=std::as_const(result.pixels).data();
+                auto* destination=target->second.pixels.data();
+                for(size_t row=0;row<height;++row)
+                    std::copy_n(source+row*result.stride,result.stride,destination+base+row*target_stride);
             }
             if (filter_rgb555) target->second.rgba.clear();
             else refresh_bgra_mirror(target->second);

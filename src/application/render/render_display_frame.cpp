@@ -19,6 +19,11 @@ bool render_display_frame(SDL_Renderer* renderer, const VM& vm,
         cache.invalidate();
         return false;
     }
+    const char* native_present=std::getenv("BGI_NATIVE_PRESENT");
+    if(!(native_present && std::string_view(native_present)=="0") &&
+        !retain_cpu_pixel_copies() && (frame.format==1 || frame.format==2) &&
+        cache.upload_native(renderer,static_cast<int>(frame.width),static_cast<int>(frame.height),frame.pixels.gpu_storage()))
+        return cache.draw(vm.screen_shake_offset_x(),vm.screen_shake_offset_y());
     return cache.upload(renderer,static_cast<int>(frame.width),static_cast<int>(frame.height),frame.rgba,
         retain_cpu_pixel_copies()?std::span<const uint8_t>{}:std::span<const uint8_t>(frame.pixels)) &&
         cache.draw(vm.screen_shake_offset_x(), vm.screen_shake_offset_y());

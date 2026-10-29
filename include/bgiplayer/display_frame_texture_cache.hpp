@@ -5,6 +5,7 @@
 #include <optional>
 #include <span>
 #include <vector>
+#include "bgiplayer/pixel_storage.hpp"
 
 namespace bgiplayer {
 // Host-only resources. The owner must outlive neither its SDL renderer nor
@@ -35,7 +36,8 @@ public:
                 std::span<const uint8_t> rgba, std::span<const uint8_t> raw_bgra = {}) {
         if (width <= 0 || height <= 0 || rgba.size() != uint64_t(width)*height*4U)
             return false;
-        if (renderer_ != renderer || width_ != width || height_ != height) {
+        if (native_display_ || renderer_ != renderer || width_ != width || height_ != height) {
+            native_display_=false;
             SDL_DestroyTexture(texture_);SDL_DestroyTexture(raw_texture_);
             texture_ = nullptr;raw_texture_=nullptr;
         }
@@ -58,9 +60,37 @@ public:
         valid_ = true;
         return true;
     }
-    bool has_raw_pixels() const { return valid_ && raw_valid_ && raw_texture_; }
+    // The caller clears the logical primary to opaque before draw(). Keep
+    // that alpha while copying native BGRA colors, avoiding a second swizzled
+    // upload. Retain the immutable native owner for on-demand raw captures.
+    // Backends without custom alpha blending use the ordinary RGBA route.
+    bool upload_native(SDL_Renderer* renderer,int width,int height,std::shared_ptr<GpuPixelStorage> native) {
+        if(width<=0 || height<=0 || !native || native->size()!=uint64_t(width)*height*4U)return false;
+        const bool reuse=native_display_ && renderer_==renderer && width_==width && height_==height;
+        auto* candidate=reuse?texture_:SDL_CreateTexture(renderer,SDL_PIXELFORMAT_BGRA32,SDL_TEXTUREACCESS_STATIC,width,height);
+        if(!candidate)return false;
+        const auto opaque=SDL_ComposeCustomBlendMode(SDL_BLENDFACTOR_ONE,SDL_BLENDFACTOR_ZERO,SDL_BLENDOPERATION_ADD,
+            SDL_BLENDFACTOR_ZERO,SDL_BLENDFACTOR_ONE,SDL_BLENDOPERATION_ADD);
+        if(SDL_SetTextureBlendMode(candidate,opaque)!=0) {if(!reuse)SDL_DestroyTexture(candidate);return false;}
+        std::vector<uint8_t> bytes(native->size());
+        if(!native->read(bytes)) {if(!reuse)SDL_DestroyTexture(candidate);return false;}
+        invalidate();
+        if(SDL_UpdateTexture(candidate,nullptr,bytes.data(),width*4)!=0) {
+            if(!reuse)SDL_DestroyTexture(candidate);return false;
+        }
+        if(!reuse) {SDL_DestroyTexture(texture_);texture_=candidate;}
+        SDL_DestroyTexture(raw_texture_);raw_texture_=nullptr;
+        renderer_=renderer;width_=width;height_=height;invalidate();
+        native_display_=true;raw_owner_=std::move(native);valid_=true;++generation_;return true;
+    }
+    bool has_raw_pixels() const { return valid_ && (raw_owner_ || (raw_valid_ && raw_texture_)); }
     bool read_raw_pixels(std::vector<uint8_t>& pixels,int& width,int& height) const {
         if(!has_raw_pixels())return false;
+        if(raw_owner_) {
+            std::vector<uint8_t> result(raw_owner_->size());
+            if(!raw_owner_->read(result))return false;
+            pixels=std::move(result);width=width_;height=height_;return true;
+        }
         auto* previous=SDL_GetRenderTarget(renderer_);
         if(SDL_SetRenderTarget(renderer_,raw_texture_)!=0)return false;
         std::vector<uint8_t> result(static_cast<size_t>(width_)*static_cast<size_t>(height_)*4U);
@@ -99,14 +129,15 @@ public:
     void mark_presented(const CaptureKey& key) { presented_ = key; }
     void record_capture_reuse() { ++capture_reuses_; }
     uint64_t capture_reuses() const { return capture_reuses_; }
-    void invalidate() { valid_ = false; raw_valid_=false; presented_.reset(); }
-    void reset() { invalidate(); SDL_DestroyTexture(texture_);SDL_DestroyTexture(raw_texture_); texture_ = nullptr;raw_texture_=nullptr; }
+    void invalidate() { valid_ = false; raw_valid_=false; raw_owner_.reset(); presented_.reset(); }
+    void reset() { invalidate(); SDL_DestroyTexture(texture_);SDL_DestroyTexture(raw_texture_); texture_ = nullptr;raw_texture_=nullptr;native_display_=false; }
 private:
     SDL_Texture* texture_ = nullptr;
     SDL_Texture* raw_texture_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;
     int width_=0,height_=0;
-    bool valid_=false,raw_valid_=false;
+    bool valid_=false,raw_valid_=false,native_display_=false;
+    std::shared_ptr<GpuPixelStorage> raw_owner_;
     uint64_t generation_=0;
     uint64_t capture_reuses_=0;
     std::optional<CaptureKey> presented_;

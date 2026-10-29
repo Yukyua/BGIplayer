@@ -1,4 +1,5 @@
 #include "bgiplayer/vm.hpp"
+#include "bgiplayer/gpu_pixel_kernels.hpp"
 
 namespace bgiplayer {
 // Original 00485C10 -> 00408E50 -> 0040B3D0; format kernels
@@ -12,6 +13,15 @@ void VM::set_surface_command(uint32_t type, uint32_t value) {
     GraphicsSurface& target = surface->second;
     const std::size_t size =
         static_cast<std::size_t>(target.stride) * target.height;
+    if(target.format==1U || target.format==2U) {
+        if(auto native=store_host_filled_pixels(size,target.format==1U?value&0xFFFFFFU:value)) {
+            if(auto mirror=bgra_presentation_storage(native,static_cast<size_t>(target.width)*target.height,target.format==1U)) {
+                target.pixels.replace_gpu_storage(std::move(native));
+                target.rgba.replace_gpu_storage(std::move(mirror));
+                display_dirty_=true;return;
+            }
+        }
+    }
     target.pixels.assign(size, 0);
     // Resolve the mutable buffer once after full replacement. Per-component
     // PixelBuffer access repeats residency checks and blocks vectorization.

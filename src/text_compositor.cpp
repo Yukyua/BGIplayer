@@ -662,6 +662,59 @@ bool VM::record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
         const auto width=static_cast<uint32_t>(right-left+1),height=static_cast<uint32_t>(bottom-top+1);
         const auto d0=static_cast<uint64_t>(top)*output.stride+static_cast<uint64_t>(left)*4U;
         const auto s0=static_cast<uint64_t>(top-y)*image.stride+static_cast<uint64_t>(left-x)*4U;
+        const char* forced=std::getenv("BGI_GPU");
+        const auto base=output.pixels.gpu_storage(),input_storage=image.pixels.gpu_storage();
+        if(destination!=source && uint64_t(width)*height<=65536 && output.pixels.size()>=65536U*4U &&
+            base && base->fast_ranges() && (!input_storage || input_storage->fast_ranges()) &&
+            !(forced && std::strcmp(forced,"1")==0)) {
+            const auto patch=[&]() -> std::shared_ptr<GpuPixelStorage> {
+                std::vector<uint8_t> old(size_t(width)*height*4),source_bytes(old.size());
+                const auto* cpu_source=input_storage?nullptr:std::as_const(image.pixels).data();
+                for(uint32_t row=0;row<height;++row) {
+                    auto dst=std::span<uint8_t>(old).subspan(size_t(row)*width*4,width*4);
+                    auto src=std::span<uint8_t>(source_bytes).subspan(size_t(row)*width*4,width*4);
+                    if(!base->read_range(size_t(d0)+size_t(row)*output.stride,dst))return {};
+                    const size_t offset=size_t(s0)+size_t(row)*image.stride;
+                    if(input_storage) {if(!input_storage->read_range(offset,src))return {};}
+                    else std::copy_n(cpu_source+offset,src.size(),src.data());
+                }
+                uint32_t first=0xffffffffU;
+                while(graphics_surfaces_.count(first) || graphics_surfaces_.count(first-1U))--first;
+                const auto count=bitmap_blits_.size();const bool dirty=display_dirty_;
+                const auto cleanup=[&] {graphics_surfaces_.erase(first);graphics_surfaces_.erase(first-1U);
+                    bitmap_blits_.resize(count);display_dirty_=dirty;};
+                GraphicsSurface temp;temp.width=width;temp.height=height;temp.stride=width*4;
+                temp.format=output.format;temp.bytes_per_pixel=4;temp.defer_rgba_mirror=true;temp.pixels=std::move(old);
+                graphics_surfaces_[first]=std::move(temp);
+                temp={};temp.width=width;temp.height=height;temp.stride=width*4;
+                temp.format=2;temp.bytes_per_pixel=4;temp.defer_rgba_mirror=true;temp.pixels=std::move(source_bytes);
+                graphics_surfaces_[first-1U]=std::move(temp);
+                try {
+                    if(!record_bitmap_mode0_alpha(first,first-1U,0,0,mode,parameter)) {cleanup();return {};}
+                    auto& result=graphics_surfaces_.at(first).pixels;
+                    if(!result.offload()){cleanup();return {};}
+                    auto storage=patched_pixel_storage(base,result.gpu_storage(),size_t(d0),output.stride,size_t(width)*4,height);
+                    cleanup();return storage;
+                } catch(...) {cleanup();throw;}
+            }();
+            if(patch) {
+                output.pixels.replace_gpu_storage(patch);refresh_bgra_mirror(output);
+                if(debug_enabled())bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
+                display_dirty_=true;return true;
+            }
+        }
+        if((destination!=source || (x==0 && y==0)) && d0<=UINT32_MAX && s0<=UINT32_MAX && output.pixels.size()>=65536U*4U &&
+            output.pixels.offload() && image.pixels.offload()) {
+            if(auto result=compose_host_resident_layer({
+                {{},static_cast<uint32_t>(d0),output.stride,width,height,output.format,4},
+                {{},static_cast<uint32_t>(s0),image.stride,width,height,2,4},
+                reciprocal_corrections,image.pixels.gpu_storage()},output.pixels.gpu_storage())) {
+                output.pixels.replace_gpu_storage(std::move(result));
+                refresh_bgra_mirror(output);
+                if(debug_enabled())bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
+                display_dirty_=true;return true;
+            }
+        }
         const auto resident=destination!=source?image.pixels.gpu_storage():std::shared_ptr<GpuPixelStorage>{};
         const std::span<uint8_t> source_bytes=resident?std::span<uint8_t>{}:std::span<uint8_t>(image.pixels);
         if(d0<=UINT32_MAX && s0<=UINT32_MAX && compose_host_layer_composite({
@@ -673,6 +726,15 @@ bool VM::record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
             display_dirty_=true;return true;
         }
     }
+    // Completely clipped controls still publish the original mirror/dirty
+    // effects, but must not materialize a whole GPU target for an empty loop.
+    if(left>right || top>bottom) {
+        refresh_bgra_mirror(output);
+        if(debug_enabled())bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
+        display_dirty_=true;return true;
+    }
+    auto* output_bytes=output.pixels.data();
+    const auto* image_bytes=std::as_const(image.pixels).data();
     for (int64_t row = top; row <= bottom; ++row) {
         for (int64_t column = left; column <= right; column += 2) {
             const uint32_t count = column < right ? 2U : 1U;
@@ -680,45 +742,45 @@ bool VM::record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
                                        static_cast<std::size_t>(column - x) * 4U;
             const auto output_offset = static_cast<std::size_t>(row) * output.stride +
                                        static_cast<std::size_t>(column) * 4U;
-            const uint32_t first_alpha = image.pixels[source_offset + 3U];
-            const uint32_t second_alpha = count == 2U ? image.pixels[source_offset + 7U] : 0U;
+            const uint32_t first_alpha = image_bytes[source_offset + 3U];
+            const uint32_t second_alpha = count == 2U ? image_bytes[source_offset + 7U] : 0U;
             if (count == 2U && first_alpha == 0U && second_alpha == 0U) continue;
             const bool opaque_pair = count == 2U &&
                 (output.format == 1U ? first_alpha >= 254U && second_alpha >= 254U
                                      : first_alpha == 255U && second_alpha == 255U);
             if (opaque_pair) {
-                std::copy_n(image.pixels.begin() + static_cast<std::ptrdiff_t>(source_offset), 8,
-                            output.pixels.begin() + static_cast<std::ptrdiff_t>(output_offset));
+                std::copy_n(image_bytes + static_cast<std::ptrdiff_t>(source_offset), 8,
+                            output_bytes + static_cast<std::ptrdiff_t>(output_offset));
                 continue;
             }
             for (uint32_t pixel = 0; pixel < count; ++pixel) {
                 const std::size_t src = source_offset + pixel * 4U;
                 const std::size_t dst = output_offset + pixel * 4U;
-                const uint32_t alpha = image.pixels[src + 3U];
+                const uint32_t alpha = image_bytes[src + 3U];
                 if (output.format == 1U) {
                     uint32_t factor = alpha >> 1U;
                     // 00408653..0040868A overwrites table entry127 with128.
                     if (factor == 127U) {
-                        std::copy_n(image.pixels.begin() + static_cast<std::ptrdiff_t>(src), 3,
-                                    output.pixels.begin() + static_cast<std::ptrdiff_t>(dst));
-                        if (count == 1U) output.pixels[dst + 3U] = 0;
+                        std::copy_n(image_bytes + static_cast<std::ptrdiff_t>(src), 3,
+                                    output_bytes + static_cast<std::ptrdiff_t>(dst));
+                        if (count == 1U) output_bytes[dst + 3U] = 0;
                     } else if (factor != 0U) {
                         // 00530650's fourth word is zero: alpha is retained.
                         for (uint32_t byte = 0; byte < 3; ++byte) {
-                            const int32_t old = output.pixels[dst + byte];
-                            const int32_t delta = static_cast<int32_t>(image.pixels[src + byte]) - old;
-                            output.pixels[dst + byte] = static_cast<uint8_t>(
+                            const int32_t old = output_bytes[dst + byte];
+                            const int32_t delta = static_cast<int32_t>(image_bytes[src + byte]) - old;
+                            output_bytes[dst + byte] = static_cast<uint8_t>(
                                 old + ((delta * static_cast<int32_t>(factor)) >> 7));
                         }
                     }
                 } else {
                     if (count == 1U && alpha == 0U) continue;
                     if (count == 1U && alpha == 255U) {
-                        std::copy_n(image.pixels.begin() + static_cast<std::ptrdiff_t>(src), 4,
-                                    output.pixels.begin() + static_cast<std::ptrdiff_t>(dst));
+                        std::copy_n(image_bytes + static_cast<std::ptrdiff_t>(src), 4,
+                                    output_bytes + static_cast<std::ptrdiff_t>(dst));
                         continue;
                     }
-                    const uint32_t destination_alpha = output.pixels[dst + 3U];
+                    const uint32_t destination_alpha = output_bytes[dst + 3U];
                     const uint32_t destination_component = destination_alpha * (256U - alpha);
                     const uint32_t total = alpha * 256U + destination_component;
                     int32_t source_weight = total == 0 ? 0 : (alpha << 16U) / total;
@@ -733,11 +795,11 @@ bool VM::record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
                         }
                     }
                     for (uint32_t byte = 0; byte < 3; ++byte) {
-                        const uint32_t value = image.pixels[src + byte] * source_weight +
-                                               output.pixels[dst + byte] * destination_weight;
-                        output.pixels[dst + byte] = static_cast<uint8_t>((value & 0xFFFFU) >> 8U);
+                        const uint32_t value = image_bytes[src + byte] * source_weight +
+                                               output_bytes[dst + byte] * destination_weight;
+                        output_bytes[dst + byte] = static_cast<uint8_t>((value & 0xFFFFU) >> 8U);
                     }
-                    output.pixels[dst + 3U] = static_cast<uint8_t>(total >> 8U);
+                    output_bytes[dst + 3U] = static_cast<uint8_t>(total >> 8U);
                 }
             }
         }

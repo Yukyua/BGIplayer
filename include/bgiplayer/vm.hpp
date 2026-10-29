@@ -1,4 +1,5 @@
 #pragma once
+#include "bgiplayer/render_policy.hpp"
 #include "bgiplayer/resource_integrity.hpp"
 #include "bgiplayer/media_source.hpp"
 #include "bgiplayer/pixel_buffer.hpp"
@@ -8889,6 +8890,17 @@ public:
             // 004318F0 copies the window's owned +154 composite descriptor.
             // The host display/SDL backbuffer is not the source of this native.
             if (!recompose_window_basic_planes(handle)) return false;
+            auto& owned=window->second;
+            const size_t bytes=static_cast<size_t>(owned.width)*owned.height*4U;
+            if(owned.width && owned.height && (current_capture_format_==1U || current_capture_format_==2U) && owned.plane_format==2U &&
+                owned.composite_plane.size()==bytes && !retain_cpu_pixel_copies() && owned.composite_plane.offload()) {
+                GraphicsSurface surface;
+                surface.width=owned.width;surface.height=owned.height;surface.format=2;
+                surface.bytes_per_pixel=4;surface.stride=owned.width*4U;
+                surface.pixels=owned.composite_plane;
+                surface.rgba.replace_gpu_storage(bgra_presentation_storage(surface.pixels.gpu_storage(),bytes/4,true));
+                install_allocated_graphics_surface(type,std::move(surface));return true;
+            }
             captured = WindowCaptureSnapshot{window->second.width,window->second.height,
                 2U,std::as_const(window->second.composite_plane).cpu_pixels()};
         }
@@ -9124,6 +9136,7 @@ public:
         uint32_t icon_count = 0;
         std::vector<uint32_t> group_counts;
     };
+    bool draw_static_window_icons_batch(uint32_t window,std::span<const WindowBitmapCommand> commands);
     uint32_t apply_icon_input_layout(uint32_t window, uint32_t descriptor,
                                      uint32_t base) {
         if (window_objects_.count(window) == 0) {
@@ -9190,7 +9203,7 @@ public:
         // live input processor. 00452EB0 / 140092F20 reset the old window-local
         // children/overlay and commit each selected child into that overlay.
         auto& owned = window_objects_.at(window);
-        std::fill(owned.overlay_plane.begin(), owned.overlay_plane.end(), 0);
+        owned.overlay_plane.assign(owned.overlay_plane.size(),0);
         owned.field_18c = 1;
         owned.overlay_level = 0;
         for (auto& image : owned.image_layers) image.enabled = 0;
@@ -9199,7 +9212,14 @@ public:
         selection_icon_processors_.erase(window);
         std::stable_sort(static_icons.begin(), static_icons.end(),
             [](const StaticIcon& left, const StaticIcon& right) { return left.depth < right.depth; });
-        for (const auto& icon : static_icons) {
+        std::vector<WindowBitmapCommand> batch_commands;
+        for(const auto& icon:static_icons) {
+            const auto& image=graphics_surfaces_.at(icon.bitmap);
+            batch_commands.push_back({icon.bitmap,icon.x,icon.y,image.width,image.height,
+                icon.depth,-1,1U,0U,1U,true});
+        }
+        if(draw_static_window_icons_batch(window,batch_commands))commands=std::move(batch_commands);
+        else for (const auto& icon : static_icons) {
             const auto& image = graphics_surfaces_.at(icon.bitmap);
             const bool written = draw_window_plane(window, icon.x, icon.y, icon.bitmap, 1U, 0U, true);
             commands.push_back({icon.bitmap, icon.x, icon.y, image.width, image.height,
@@ -12932,6 +12952,14 @@ public:
     static void refresh_bgra_mirror(GraphicsSurface& surface) {
         if(surface.defer_rgba_mirror){surface.rgba.clear();return;}
         const size_t count=static_cast<size_t>(surface.width)*surface.height;
+        if(!retain_cpu_pixel_copies() && count>=65536 &&
+                (surface.format==1U || surface.format==2U))
+            (void)surface.pixels.offload();
+        if((surface.format==1U || surface.format==2U) && surface.pixels.gpu_storage()) {
+            if(auto view=bgra_presentation_storage(surface.pixels.gpu_storage(),count,surface.format==1U)) {
+                surface.rgba.replace_gpu_storage(std::move(view));return;
+            }
+        }
         auto* rgba=surface.rgba.overwrite(count*4U);
         if(surface.format!=1U && surface.format!=2U) {
             std::fill_n(rgba,count*4U,uint8_t{0});return;
@@ -13018,6 +13046,7 @@ public:
         }
         if ((mode == 1U || mode == 0x20U) && parameter>0U && parameter<0x100U &&
             input->second.format==2U && target->second.format==2U) {
+            if(accelerate_bitmap_transfer(destination,source,x,y,mode,parameter,false,false))return true;
             if(!materialize_graphics_pixels(target->second) || !materialize_graphics_pixels(input->second))return false;
             auto& out=target->second;auto& in=input->second;
             if(!blend_original_glyph_opacity({out.pixels,0,out.stride,out.width,out.height,2,4},

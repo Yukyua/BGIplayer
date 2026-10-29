@@ -12,6 +12,16 @@ NativeSignal grp0_blit_bitmap(VM& vm, Thread& thread) {
     const int32_t y = static_cast<int32_t>(thread.stack.pop());
     const int32_t x = static_cast<int32_t>(thread.stack.pop());
     const uint32_t destination = thread.stack.pop();
+    if(debug_trace(DebugTrace::GpuFrames) && std::getenv("BGI_TRACE_BITMAP_GEOMETRY")) {
+        std::cerr<<"BITMAP_TRANSFER dst="<<destination<<" src="<<source<<" xy="<<x<<','<<y
+            <<" mode="<<mode<<" parameter="<<parameter;
+        for(const auto id:{destination,source}) {
+            const auto it=vm.graphics_surfaces().find(id);
+            if(it!=vm.graphics_surfaces().end())std::cerr<<" surface="<<id<<':'<<it->second.format<<':'
+                <<it->second.width<<'x'<<it->second.height<<":"<<bool(it->second.pixels.gpu_storage());
+        }
+        std::cerr<<'\n';
+    }
     if (!vm.record_bitmap_blit(
             destination, source, x, y, mode, parameter)) {
         std::ostringstream message;

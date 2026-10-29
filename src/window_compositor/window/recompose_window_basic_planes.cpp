@@ -37,7 +37,11 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
         bitmap_blits_.resize(count);
         display_dirty_ = dirty;
     };
-    graphics_surfaces_[target] = plane;
+    graphics_surfaces_[target] = std::move(plane);
+    if(!retain_cpu_pixel_copies()) {
+        (void)state.background_plane.offload();
+        (void)state.overlay_plane.offload();
+    }
     const auto previous_overlay = state.overlay_plane;
     std::vector<WindowBitmapCommand*> newly_executed;
     const auto commands = window_bitmap_commands_.find(window);
@@ -79,6 +83,10 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
                 if (state.field_16c == 0) {
                     std::fill(graphics_surfaces_.at(target).pixels.begin(),
                               graphics_surfaces_.at(target).pixels.end(), 0);
+                } else if(state.background_plane.size()==static_cast<size_t>(plane.stride)*state.height) {
+                    // 004319C0's complete same-format mode80/zero copy. GPU
+                    // owners are immutable; later writes detach into a result.
+                    graphics_surfaces_.at(target).pixels=state.background_plane;
                 } else {
                     plane.pixels = state.background_plane;
                     plane.pixels.resize(static_cast<std::size_t>(plane.stride) * plane.height, 0);
@@ -186,9 +194,16 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
                         const auto d0=uint64_t(top)*output.stride+uint64_t(left)*4;
                         const auto s0=uint64_t(top-y)*source.stride+uint64_t(left-x)*4;
                         if(d0>UINT32_MAX || s0>UINT32_MAX)return false;
-                        layers.push_back({{output.pixels,static_cast<uint32_t>(d0),output.stride,width,height,output.format,4},
+                        layers.push_back({{{},static_cast<uint32_t>(d0),output.stride,width,height,output.format,4},
                             {{},static_cast<uint32_t>(s0),source.stride,width,height,2,4},corrections,source.pixels.gpu_storage()});
                     }
+                    if(output.pixels.offload()) {
+                        if(auto resident=compose_host_resident_layers(layers,output.pixels.gpu_storage())) {
+                            output.pixels.replace_gpu_storage(std::move(resident));return true;
+                        }
+                    }
+                    auto bytes=std::span<uint8_t>(output.pixels);
+                    for(auto& layer:layers)layer.destination.pixels=bytes;
                     const auto result=compose_host_layer_composite_batch(layers);
                     if(result.success && debug_trace(DebugTrace::GpuFrames))
                         std::cout<<"GPU_WINDOW_ICON_BATCH window="<<window<<" layers="<<layers.size()<<" total_ns="<<result.total_ns<<'\n';

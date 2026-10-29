@@ -118,6 +118,13 @@ public:
     PixelKernelResult layer_composite_batch(std::span<const LayerCompositePixels> layers);
     PixelKernelResult background_mask(const BackgroundMaskPixels& pixels);
     PixelKernelResult pixel_transfer(const PixelTransferPixels& pixels);
+    std::shared_ptr<GpuPixelStorage> resident_transfer(const PixelTransferPixels& pixels,
+        std::shared_ptr<GpuPixelStorage> destination);
+    std::shared_ptr<GpuPixelStorage> resident_layer(const LayerCompositePixels& pixels,
+        std::shared_ptr<GpuPixelStorage> destination);
+    std::shared_ptr<GpuPixelStorage> resident_layers(std::span<const LayerCompositePixels> layers,
+        std::shared_ptr<GpuPixelStorage> destination);
+    std::shared_ptr<GpuPixelStorage> filled_pixels(size_t bytes,uint32_t value);
     PixelKernelResult effector_blur(const EffectorBlurPixels& pixels);
     PixelKernelResult effector_displacement(const EffectorDisplacementPixels& pixels);
     PixelKernelResult effector_vector(const EffectorVectorPixels& pixels);
@@ -142,6 +149,13 @@ PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& pixel
 bool valid_layer_composite_batch(std::span<const LayerCompositePixels> layers);
 PixelKernelResult compose_host_layer_composite_batch(std::span<const LayerCompositePixels> layers);
 PixelKernelResult compose_host_pixel_transfer(const PixelTransferPixels& pixels);
+std::shared_ptr<GpuPixelStorage> compose_host_resident_transfer(const PixelTransferPixels& pixels,
+    std::shared_ptr<GpuPixelStorage> destination);
+std::shared_ptr<GpuPixelStorage> compose_host_resident_layer(const LayerCompositePixels& pixels,
+    std::shared_ptr<GpuPixelStorage> destination);
+std::shared_ptr<GpuPixelStorage> compose_host_resident_layers(std::span<const LayerCompositePixels> layers,
+    std::shared_ptr<GpuPixelStorage> destination);
+std::shared_ptr<GpuPixelStorage> store_host_filled_pixels(size_t bytes,uint32_t value);
 PixelKernelResult compose_host_effector_blur(const EffectorBlurPixels& pixels);
 PixelKernelResult compose_host_effector_displacement(const EffectorDisplacementPixels& pixels);
 PixelKernelResult compose_host_effector_vector(const EffectorVectorPixels& pixels);

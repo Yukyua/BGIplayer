@@ -26,7 +26,14 @@ NativeSignal NativeRegistry::invoke(uint8_t family, uint8_t sub, VM& vm,
     const auto result = handler(vm, thread);
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count();
-    if (elapsed >= 2000000) {
+    static const int64_t minimum_ns=[] {
+        const char* value=std::getenv("BGI_NATIVE_COST_MIN_US");
+        if(!value)return int64_t{2000000};
+        char* end=nullptr;const auto us=std::strtoull(value,&end,10);
+        return end!=value && *end=='\0' && us>=1 && us<=1000000
+            ? static_cast<int64_t>(us)*1000 : int64_t{2000000};
+    }();
+    if (elapsed >= minimum_ns) {
         std::string source = "<main>";
         if (segment != 0xFFFFFFFFU) {
             const auto prefix = std::to_string(segment) + ":";

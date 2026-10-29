@@ -38,12 +38,15 @@ public:
     size_t size() const {return cpu_.empty() && gpu_?gpu_->size():cpu_.size();}
     bool empty() const {return size()==0;}
     size_t capacity() const {return cpu_.capacity();}
-    size_t gpu_bytes() const {return gpu_?gpu_->size():0;}
+    size_t gpu_bytes() const {return gpu_?gpu_->resident_bytes():0;}
     const std::shared_ptr<GpuPixelStorage>& gpu_storage() const {return gpu_;}
     std::span<const uint8_t> upload_bytes() const {return cpu_;}
     bool adopt_gpu_storage(std::shared_ptr<GpuPixelStorage> storage) {
         if(!storage || storage->size()!=size())return false;
         gpu_=std::move(storage);std::vector<uint8_t>().swap(cpu_);return true;
+    }
+    void replace_gpu_storage(std::shared_ptr<GpuPixelStorage> storage) {
+        gpu_=std::move(storage);std::vector<uint8_t>().swap(cpu_);
     }
     uint8_t* data() {materialize(true);return cpu_.data();}
     const uint8_t* data() const {materialize(false);return cpu_.data();}

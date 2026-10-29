@@ -122,7 +122,7 @@ PixelKernelResult compose_host_fast_background_mask(const BackgroundMaskPixels& 
 
 PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& p) {
     const uint64_t pixels=uint64_t(p.destination.width)*p.destination.height;
-    if(!choose_gpu(pixels,p.source_storage?0U:512U*512U))return {};
+    if(!choose_gpu(pixels,p.source_storage?16384U:512U*512U))return {};
     auto result=backend(true).layer_composite(p);
     return result.success?record("layer_composite",result,pixels):result;
 }
@@ -152,6 +152,47 @@ PixelKernelResult compose_host_layer_composite_batch(std::span<const LayerCompos
     uint64_t pixels=0;for(const auto& p:layers)pixels+=uint64_t(p.destination.width)*p.destination.height;
     const auto result=backend(true).layer_composite_batch(layers);
     return result.success?record("layer_batch",result,pixels):result;
+}
+
+#if !defined(__APPLE__)
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_transfer(const PixelTransferPixels&,std::shared_ptr<GpuPixelStorage>) { return {}; }
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_layer(const LayerCompositePixels&,std::shared_ptr<GpuPixelStorage>) { return {}; }
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_layers(std::span<const LayerCompositePixels>,std::shared_ptr<GpuPixelStorage>) { return {}; }
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::filled_pixels(size_t,uint32_t) { return {}; }
+#endif
+std::shared_ptr<GpuPixelStorage> compose_host_resident_transfer(const PixelTransferPixels& p,std::shared_ptr<GpuPixelStorage> destination) {
+    if(!destination || !choose_gpu(destination->size()/4,65536))return {};
+    const auto start=debug_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    auto result=backend(true).resident_transfer(p,std::move(destination));
+    if(result && result!=p.source_storage)record("resident_transfer",{true,true,debug_enabled()?static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count()):0},
+        uint64_t(p.destination.width)*p.destination.height);
+    return result;
+}
+std::shared_ptr<GpuPixelStorage> compose_host_resident_layer(const LayerCompositePixels& p,std::shared_ptr<GpuPixelStorage> destination) {
+    if(!destination || !choose_gpu(destination->size()/4,65536))return {};
+    const auto start=debug_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    auto result=backend(true).resident_layer(p,std::move(destination));
+    if(result)record("resident_layer",{true,true,debug_enabled()?static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count()):0},
+        uint64_t(p.destination.width)*p.destination.height);
+    return result;
+}
+
+std::shared_ptr<GpuPixelStorage> compose_host_resident_layers(std::span<const LayerCompositePixels> layers,std::shared_ptr<GpuPixelStorage> destination) {
+    if(!destination || !choose_gpu(destination->size()/4,65536))return {};
+    const auto start=debug_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    auto result=backend(true).resident_layers(layers,std::move(destination));
+    if(result) {
+        uint64_t pixels=0;for(const auto& layer:layers)pixels+=uint64_t(layer.destination.width)*layer.destination.height;
+        record("resident_layers",{true,true,debug_enabled()?static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count()):0},pixels);
+    }
+    return result;
+}
+std::shared_ptr<GpuPixelStorage> store_host_filled_pixels(size_t bytes,uint32_t value) {
+    if(retain_cpu_pixel_copies() || !choose_gpu(bytes/4,65536))return {};
+    return backend(true).filled_pixels(bytes,value);
 }
 
 bool valid_pixel_transfer(const PixelTransferPixels& p) {

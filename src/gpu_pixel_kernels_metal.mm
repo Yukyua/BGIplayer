@@ -436,8 +436,21 @@ public:
         device([d retain]),queue([q retain]),buffer([b retain]) {}
     ~MetalPixelStorage() override {[buffer release];[queue release];[device release];}
     size_t size() const override {return [buffer length];}
+    bool fast_ranges() const override {return [buffer storageMode]==MTLStorageModeShared;}
+    bool read_range(size_t offset,std::span<uint8_t> out) const override {
+        if(offset>size() || out.size()>size()-offset)return false;
+        if(!fast_ranges())return GpuPixelStorage::read_range(offset,out);
+        std::memcpy(out.data(),static_cast<const uint8_t*>([buffer contents])+offset,out.size());return true;
+    }
     bool read(std::span<uint8_t> destination) const override {
         if(destination.size()!=size())return false;
+        // Stored bitmap allocations are immutable shader inputs. On unified
+        // memory the shared MTLBuffer is the single GPU allocation, so a
+        // native read needs no staging allocation, GPU copy or queue wait.
+        if([buffer storageMode]==MTLStorageModeShared) {
+            std::memcpy(destination.data(),[buffer contents],destination.size());
+            return true;
+        }
         @autoreleasepool {
             id<MTLBuffer> staging=[device newBufferWithLength:size() options:MTLResourceStorageModeShared];
             if(!staging)return false;
@@ -452,6 +465,12 @@ public:
         }
     }
 };
+}
+namespace {
+std::shared_ptr<MetalPixelStorage> metal_storage(const std::shared_ptr<GpuPixelStorage>& value) {
+    if(auto stored=std::dynamic_pointer_cast<MetalPixelStorage>(value))return stored;
+    return value?std::dynamic_pointer_cast<MetalPixelStorage>(value->concrete_storage()):nullptr;
+}
 }
 struct GpuPixelKernels::Impl {
     id<MTLDevice> device=nil;
@@ -636,7 +655,7 @@ PixelKernelResult GpuPixelKernels::crossfade(const CrossfadePixels& p) {
 
 PixelKernelResult GpuPixelKernels::affine(const AffinePixels& p) {
     PixelKernelResult result;
-    const auto resident=std::dynamic_pointer_cast<MetalPixelStorage>(p.source_storage);
+    const auto resident=metal_storage(p.source_storage);
     if(p.source_storage && (!resident || resident->device!=impl_->device || !p.source.empty()))return result;
     const bool timing=debug_enabled();
     const auto start=timing?Clock::now():Clock::time_point{};
@@ -756,7 +775,7 @@ PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels& p
         const uintptr_t x=reinterpret_cast<uintptr_t>(a.data()),y=reinterpret_cast<uintptr_t>(b.data());
         return x<=y?y-x<a.size():x-y<b.size();
     };
-    const auto resident=std::dynamic_pointer_cast<MetalPixelStorage>(p.source_storage);
+    const auto resident=metal_storage(p.source_storage);
     auto source_view=p.source;
     const auto source_size=resident?resident->size():source_view.pixels.size();
     const bool source_valid=source_view.format==2 && source_view.bytes_per_pixel==4 && source_view.width && source_view.height &&
@@ -809,7 +828,7 @@ PixelKernelResult GpuPixelKernels::layer_composite_batch(std::span<const LayerCo
     if(!available() || !impl_->layer_pipeline || !valid_layer_composite_batch(layers))return result;
     std::vector<std::shared_ptr<MetalPixelStorage>> sources;sources.reserve(layers.size());
     for(const auto& p:layers) {
-        auto source=std::dynamic_pointer_cast<MetalPixelStorage>(p.source_storage);
+        auto source=metal_storage(p.source_storage);
         if(!source || source->device!=impl_->device)return result;
         sources.push_back(std::move(source));
     }
@@ -857,7 +876,7 @@ PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels& p) 
     PixelKernelResult result;
     if(!available() || !impl_->transfer_pipeline || !valid_pixel_transfer(p))return result;
     const bool timing=debug_enabled();const auto start=timing?Clock::now():Clock::time_point{};
-    const auto resident=std::dynamic_pointer_cast<MetalPixelStorage>(p.source_storage);
+    const auto resident=metal_storage(p.source_storage);
     if(p.source_storage && (!resident || resident->device!=impl_->device))return result;
     const bool needs_source=p.operation!=PixelTransferOperation::ColorFilter && p.operation!=PixelTransferOperation::Clear;
     @autoreleasepool {
@@ -1102,6 +1121,19 @@ std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const u
 std::vector<std::shared_ptr<GpuPixelStorage>> GpuPixelKernels::store_pixels_batch(std::span<const std::span<const uint8_t>> pixels) {
     std::vector<std::shared_ptr<GpuPixelStorage>> result(pixels.size());
     if(!available())return result;
+    const char* private_pixels=std::getenv("BGI_METAL_PRIVATE_PIXELS");
+    if([impl_->device hasUnifiedMemory] && !(private_pixels && std::strcmp(private_pixels,"1")==0)) {
+        @autoreleasepool {
+            for(size_t n=0;n<pixels.size();++n) {
+                const auto bytes=pixels[n];if(bytes.empty())continue;
+                id<MTLBuffer> buffer=[impl_->device newBufferWithBytes:bytes.data() length:bytes.size()
+                    options:MTLResourceStorageModeShared];
+                if(buffer)result[n]=std::make_shared<MetalPixelStorage>(impl_->device,impl_->queue,buffer);
+                [buffer release];
+            }
+        }
+        return result;
+    }
     // One wait for a bounded group, rather than one GPU round trip per bitmap.
     // Cap transient staging to32MiB unless a single resource is larger.
     for(size_t first=0;first<pixels.size();) {
@@ -1137,4 +1169,163 @@ std::vector<std::shared_ptr<GpuPixelStorage>> GpuPixelKernels::store_pixels_batc
     return result;
 }
 
+}
+
+namespace bgiplayer {
+namespace {
+// Reuse the exact transfer/layer shaders with an immutable GPU destination.
+// Each result has independent ownership; rejection never changes either input.
+template<class State>
+std::shared_ptr<GpuPixelStorage> resident_bitmap_operation(State& state,
+    const PixelTransferPixels& p,std::shared_ptr<GpuPixelStorage> previous,
+    std::span<const uint8_t> corrections,bool layer) {
+    const auto dst=metal_storage(previous);
+    const auto src=metal_storage(p.source_storage);
+    const auto valid=[](const GlyphBitmapView& v,size_t bytes) {
+        return v.pixels.empty() && v.width && v.height && v.bytes_per_pixel==4 &&
+            (v.format==1 || v.format==2) && bytes<=UINT32_MAX &&
+            v.stride>=uint64_t(v.width)*4 &&
+            uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=bytes;
+    };
+    if(!dst || !src || !state.device || !state.transfer_pipeline || !state.layer_pipeline ||
+        dst->device!=state.device || src->device!=state.device ||
+        !valid(p.destination,dst->size()) || !valid(p.source,src->size()) ||
+        p.destination.width!=p.source.width || p.destination.height!=p.source.height || p.parameter>256)return {};
+    if(layer) {if(p.source.format!=2 || corrections.size()!=65536)return {};}
+    else switch(p.operation) {
+        case PixelTransferOperation::Copy:break;
+        case PixelTransferOperation::FadeSource:
+        case PixelTransferOperation::BlendOpaque:
+            if(p.destination.format!=1 || p.source.format!=1)return {};break;
+        case PixelTransferOperation::BlendAlpha:
+            if(p.destination.format!=1 || p.source.format!=2 || !p.parameter || p.parameter>=256)return {};break;
+        default:return {};
+    }
+    const char* forced=std::getenv("BGI_GPU");
+    if(!(forced && std::strcmp(forced,"1")==0) && !layer && p.operation==PixelTransferOperation::Copy &&
+        p.destination.format==p.source.format && p.destination.byte_offset==0 && p.source.byte_offset==0 &&
+        p.destination.stride==p.source.stride && p.destination.stride==uint64_t(p.destination.width)*4 &&
+        dst->size()==src->size() && uint64_t(p.destination.height)*p.destination.stride==dst->size())return p.source_storage;
+    @autoreleasepool {
+        id<MTLBuffer> output=[state.device newBufferWithLength:dst->size() options:MTLResourceStorageModeShared];
+        if(!output)return {};
+        id<MTLCommandBuffer> command=[state.queue commandBuffer];
+        id<MTLBlitCommandEncoder> copy=[command blitCommandEncoder];
+        if(!command || !copy){[output release];return {};}
+        [copy copyFromBuffer:dst->buffer sourceOffset:0 toBuffer:output destinationOffset:0 size:dst->size()];
+        [copy endEncoding];
+        id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+        if(!encoder){[output release];return {};}
+        [encoder setBuffer:output offset:0 atIndex:0];
+        [encoder setBuffer:src->buffer offset:0 atIndex:1];
+        if(layer) {
+            if(!state.second || [state.second length]<corrections.size()) {
+                [state.second release];state.second=[state.device newBufferWithLength:corrections.size() options:MTLResourceStorageModeShared];
+            }
+            if(!state.second){[encoder endEncoding];[output release];return {};}
+            std::memcpy([state.second contents],corrections.data(),corrections.size());
+            const uint32_t args[]={p.destination.stride,p.source.stride,p.destination.byte_offset,
+                p.source.byte_offset,p.destination.width,p.destination.height,p.destination.format};
+            [encoder setComputePipelineState:state.layer_pipeline];
+            [encoder setBuffer:state.second offset:0 atIndex:2];
+            [encoder setBytes:args length:sizeof(args) atIndex:3];
+            [encoder dispatchThreads:MTLSizeMake((p.destination.width+1U)/2U,p.destination.height,1)
+                threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        } else {
+            const uint32_t args[]={p.destination.stride,p.source.stride,p.destination.byte_offset,
+                p.source.byte_offset,p.destination.width,p.destination.height,p.destination.format,p.source.format,
+                static_cast<uint32_t>(p.operation),p.parameter,p.color};
+            [encoder setComputePipelineState:state.transfer_pipeline];
+            [encoder setBytes:args length:sizeof(args) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(p.destination.width,p.destination.height,1)
+                threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        }
+        [encoder endEncoding];[command commit];[command waitUntilCompleted];
+        std::shared_ptr<GpuPixelStorage> result;
+        if([command status]==MTLCommandBufferStatusCompleted)
+            result=std::make_shared<MetalPixelStorage>(state.device,state.queue,output);
+        [output release];return result;
+    }
+}
+}
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_transfer(
+    const PixelTransferPixels& p,std::shared_ptr<GpuPixelStorage> destination) {
+    return resident_bitmap_operation(*impl_,p,std::move(destination),{},false);
+}
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_layer(
+    const LayerCompositePixels& p,std::shared_ptr<GpuPixelStorage> destination) {
+    return resident_bitmap_operation(*impl_,{p.destination,p.source,PixelTransferOperation::Copy,0,0,p.source_storage},
+        std::move(destination),p.reciprocal_corrections,true);
+}
+}
+
+namespace bgiplayer {
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::filled_pixels(size_t bytes,uint32_t value) {
+    if(!available() || !bytes || ![impl_->device hasUnifiedMemory])return {};
+    @autoreleasepool {
+        id<MTLBuffer> buffer=[impl_->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if(!buffer)return {};
+        auto* words=static_cast<uint32_t*>([buffer contents]);
+        std::fill_n(words,bytes/4,value);
+        auto* tail=static_cast<uint8_t*>([buffer contents])+bytes/4*4;
+        std::fill_n(tail,bytes%4,uint8_t{0});
+        auto result=std::make_shared<MetalPixelStorage>(impl_->device,impl_->queue,buffer);
+        [buffer release];return result;
+    }
+}
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_layers(
+    std::span<const LayerCompositePixels> layers,std::shared_ptr<GpuPixelStorage> previous) {
+    const auto dst=metal_storage(previous);
+    if(!available() || !dst || dst->device!=impl_->device || layers.size()<2 || layers.size()>256)return {};
+    const auto valid=[](const GlyphBitmapView& v,size_t bytes) {
+        return v.pixels.empty() && v.width && v.height && v.bytes_per_pixel==4 && bytes<=UINT32_MAX &&
+            v.stride>=uint64_t(v.width)*4 && uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=bytes;
+    };
+    std::vector<std::shared_ptr<MetalPixelStorage>> sources;sources.reserve(layers.size());
+    const auto& first=layers.front();
+    for(const auto& p:layers) {
+        auto source=metal_storage(p.source_storage);
+        if(!source || source->device!=impl_->device || p.source.format!=2 ||
+            (p.destination.format!=1 && p.destination.format!=2) || p.destination.format!=first.destination.format ||
+            p.destination.stride!=first.destination.stride || p.reciprocal_corrections.size()!=65536 ||
+            p.reciprocal_corrections.data()!=first.reciprocal_corrections.data() ||
+            p.source.width!=p.destination.width || p.source.height!=p.destination.height ||
+            !valid(p.source,source->size()) || !valid(p.destination,dst->size()))return {};
+        sources.push_back(std::move(source));
+    }
+    @autoreleasepool {
+        id<MTLBuffer> output=[impl_->device newBufferWithLength:dst->size() options:MTLResourceStorageModeShared];
+        id<MTLBuffer> corrections=[impl_->device newBufferWithBytes:first.reciprocal_corrections.data()
+            length:65536 options:MTLResourceStorageModeShared];
+        if(!output || !corrections){[output release];[corrections release];return {};}
+        id<MTLCommandBuffer> command=[impl_->queue commandBuffer];
+        id<MTLBlitCommandEncoder> copy=[command blitCommandEncoder];
+        if(!command || !copy){[output release];[corrections release];return {};}
+        [copy copyFromBuffer:dst->buffer sourceOffset:0 toBuffer:output destinationOffset:0 size:dst->size()];
+        [copy endEncoding];
+        bool good=true;
+        for(size_t n=0;n<layers.size();++n) {
+            const auto& p=layers[n];
+            id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+            if(!encoder){good=false;break;}
+            const uint32_t args[]={p.destination.stride,p.source.stride,p.destination.byte_offset,
+                p.source.byte_offset,p.destination.width,p.destination.height,p.destination.format};
+            [encoder setComputePipelineState:impl_->layer_pipeline];
+            [encoder setBuffer:output offset:0 atIndex:0];
+            [encoder setBuffer:sources[n]->buffer offset:0 atIndex:1];
+            [encoder setBuffer:corrections offset:0 atIndex:2];
+            [encoder setBytes:args length:sizeof(args) atIndex:3];
+            [encoder dispatchThreads:MTLSizeMake((p.destination.width+1U)/2U,p.destination.height,1)
+                threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+            [encoder endEncoding];
+        }
+        std::shared_ptr<GpuPixelStorage> result;
+        if(good) {
+            [command commit];[command waitUntilCompleted];
+            if([command status]==MTLCommandBufferStatusCompleted)
+                result=std::make_shared<MetalPixelStorage>(impl_->device,impl_->queue,output);
+        }
+        [output release];[corrections release];return result;
+    }
+}
 }

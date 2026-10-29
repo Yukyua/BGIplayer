@@ -24,7 +24,7 @@ bool VM::draw_window_plane(uint32_t window, int32_t x, int32_t y,
     auto& owned = overlay ? state.overlay_plane : state.background_plane;
     int32_t local_x = 0, local_y = 0;
     bool local_plane = false;
-    const auto& image = graphics_surfaces_.at(bitmap);
+    auto& image = graphics_surfaces_.at(bitmap);
     // B7's mode1/zero-opacity source-alpha arm is 0040C090/0040C210.
     // Only the source/window intersection is read or written. Keep that
     // entire clipped row (including pixels outside the window's valid region)
@@ -37,7 +37,9 @@ bool VM::draw_window_plane(uint32_t window, int32_t x, int32_t y,
         const int64_t top = std::max<int64_t>(y, 0);
         const int64_t right = std::min<int64_t>(int64_t(x) + image.width, plane.width);
         const int64_t bottom = std::min<int64_t>(int64_t(y) + image.height, plane.height);
-        if (left < right && top < bottom) {
+        if(left>=right || top>=bottom)return materialize_graphics_pixels(image);
+        if (left < right && top < bottom &&
+            (left!=0 || top!=0 || right!=plane.width || bottom!=plane.height)) {
             local_plane = true;
             local_x = static_cast<int32_t>(left);
             local_y = static_cast<int32_t>(top);
@@ -45,13 +47,17 @@ bool VM::draw_window_plane(uint32_t window, int32_t x, int32_t y,
             plane.height = static_cast<uint32_t>(bottom - top);
             plane.stride = plane.width * 4U;
             plane.pixels.resize(static_cast<std::size_t>(plane.stride) * plane.height);
-            const auto* source = std::as_const(owned).data();
+            const auto owner=owned.gpu_storage();
+            const bool resident=!retain_cpu_pixel_copies() && owner && owner->fast_ranges();
+            const auto* source = resident?nullptr:std::as_const(owned).data();
             auto* destination = plane.pixels.data();
             for (uint32_t row = 0; row < plane.height; ++row) {
                 const auto offset = (static_cast<std::size_t>(local_y) + row) * state.width * 4U +
                     static_cast<std::size_t>(local_x) * 4U;
-                std::copy_n(source + offset, plane.stride,
-                            destination + static_cast<std::size_t>(row) * plane.stride);
+                auto row_bytes=std::span<uint8_t>(destination+static_cast<size_t>(row)*plane.stride,plane.stride);
+                if(resident) {
+                    if(!owner->read_range(offset,row_bytes))return false;
+                } else std::copy_n(source+offset,plane.stride,row_bytes.data());
             }
         }
     }
@@ -88,9 +94,25 @@ bool VM::draw_window_plane(uint32_t window, int32_t x, int32_t y,
                 // Publish only after the original operation succeeded. A
                 // rejected/throwing draw has not touched the owned plane.
                 if (left <= right && top <= bottom) {
+                    const auto length = static_cast<std::size_t>(right - left + 1) * 4U;
+                    const auto owner=owned.gpu_storage();
+                    if(!retain_cpu_pixel_copies() && owner && owner->fast_ranges()) {
+                        PixelBuffer patch;
+                        const auto* source=std::as_const(result.pixels).data();
+                        const auto rows=static_cast<size_t>(bottom-top+1);
+                        auto* bytes=patch.overwrite(length*rows);
+                        for(int32_t row=top;row<=bottom;++row)
+                            std::copy_n(source+static_cast<size_t>(row-local_y)*result.stride+
+                                static_cast<size_t>(left-local_x)*4,length,bytes+static_cast<size_t>(row-top)*length);
+                        if(patch.offload()) {
+                            const auto offset=(static_cast<size_t>(top)*state.width+static_cast<size_t>(left))*4;
+                            if(auto output=patched_pixel_storage(owner,patch.gpu_storage(),offset,state.width*4,length,rows)) {
+                                owned.replace_gpu_storage(std::move(output));cleanup();return true;
+                            }
+                        }
+                    }
                     const auto* source = std::as_const(result.pixels).data();
                     auto* destination = owned.data();
-                    const auto length = static_cast<std::size_t>(right - left + 1) * 4U;
                     for (int32_t row = top; row <= bottom; ++row) {
                         const auto from = static_cast<std::size_t>(row - local_y) * result.stride +
                             static_cast<std::size_t>(left - local_x) * 4U;
@@ -99,7 +121,9 @@ bool VM::draw_window_plane(uint32_t window, int32_t x, int32_t y,
                         std::copy_n(source + from, length, destination + to);
                     }
                 }
-            } else if (overlay && state.valid_region_set) {
+            } else if (overlay && state.valid_region_set &&
+                (state.valid_x0>0 || state.valid_y0>0 || state.valid_x1<static_cast<int32_t>(state.width)-1 ||
+                 state.valid_y1<static_cast<int32_t>(state.height)-1)) {
                 owned.resize(result.pixels.size(), 0);
                 const int32_t left = std::max(state.valid_x0, 0);
                 const int32_t top = std::max(state.valid_y0, 0);
@@ -124,3 +148,39 @@ bool VM::draw_window_plane(uint32_t window, int32_t x, int32_t y,
     }
 }
 }  // namespace bgiplayer
+
+namespace bgiplayer {
+bool VM::draw_static_window_icons_batch(uint32_t window,std::span<const WindowBitmapCommand> commands) {
+    if(retain_cpu_pixel_copies() || commands.size()<2 || commands.size()>256)return false;
+    auto& state=window_objects_.at(window);
+    if((state.plane_format!=1 && state.plane_format!=2) ||
+        (state.valid_region_set && (state.valid_x0>0 || state.valid_y0>0 ||
+         state.valid_x1<static_cast<int32_t>(state.width)-1 || state.valid_y1<static_cast<int32_t>(state.height)-1)) ||
+        state.width>UINT32_MAX/4 || (!state.overlay_plane.empty() && state.overlay_plane.size()!=size_t(state.width)*state.height*4))return false;
+    std::vector<LayerCompositePixels> layers;
+    const auto corrections=original_layer_reciprocal_corrections();
+    for(const auto& command:commands) {
+        auto& source=graphics_surfaces_.at(command.bitmap);
+        if(source.format!=2 || source.bytes_per_pixel!=4 || source.width>UINT32_MAX/4 ||
+            source.stride<source.width*4 || !materialize_graphics_pixels(source) ||
+            source.pixels.size()<uint64_t(source.stride)*source.height)return false;
+        const int64_t left=std::max<int64_t>(command.x,0),top=std::max<int64_t>(command.y,0);
+        const int64_t right=std::min<int64_t>(int64_t(command.x)+source.width,state.width);
+        const int64_t bottom=std::min<int64_t>(int64_t(command.y)+source.height,state.height);
+        if(left>=right || top>=bottom)continue;
+        const uint64_t d0=uint64_t(top)*state.width*4+uint64_t(left)*4;
+        const uint64_t s0=uint64_t(top-command.y)*source.stride+uint64_t(left-command.x)*4;
+        if(d0>UINT32_MAX || s0>UINT32_MAX || !source.pixels.offload())return false;
+        const auto w=static_cast<uint32_t>(right-left),h=static_cast<uint32_t>(bottom-top);
+        layers.push_back({{{},static_cast<uint32_t>(d0),state.width*4,w,h,state.plane_format,4},
+            {{},static_cast<uint32_t>(s0),source.stride,w,h,2,4},corrections,source.pixels.gpu_storage()});
+    }
+    auto base=state.overlay_plane;
+    if(base.empty())base.assign(size_t(state.width)*state.height*4,0);
+    if(!base.offload())return false;
+    if(auto output=compose_host_resident_layers(layers,base.gpu_storage())) {
+        state.overlay_plane.replace_gpu_storage(std::move(output));return true;
+    }
+    return false;
+}
+}
