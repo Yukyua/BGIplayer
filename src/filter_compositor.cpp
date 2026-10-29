@@ -1,5 +1,6 @@
 #include "bgiplayer/vm.hpp"
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include "bgiplayer/filter_color.hpp"
 #include "bgiplayer/filter_mask.hpp"
 #include "bgiplayer/filter_rgb555.hpp"
@@ -52,11 +53,37 @@ bool VM::compose_filter_at(uint32_t destination, uint32_t object,
     }
     if (weight>256) return fail("filter effective strength exceeds 256");
     auto& out=target->second;
+    const auto exact_filter = [&](ExactPixelOperation operation, GraphicsSurface& source, uint32_t source_offset=0) {
+        if(!exact_pixels_worthwhile(out.width,out.height,bool(out.pixels.gpu_storage())))return false;
+        const auto read_view=[](const PixelBuffer& bytes) {
+            if(bytes.gpu_storage())return std::span<uint8_t>{};
+            const auto cpu=bytes.upload_bytes();
+            return std::span<uint8_t>(const_cast<uint8_t*>(cpu.data()),cpu.size());
+        };
+        ExactPixelPixels pixels{
+            {read_view(out.pixels),0,out.stride,out.width,out.height,out.format,out.bytes_per_pixel},
+            {read_view(source.pixels),source_offset,source.stride,out.width,out.height,source.format,source.bytes_per_pixel},
+            {},operation};
+        pixels.destination_storage=out.pixels.gpu_storage();
+        pixels.source_storage=source.pixels.gpu_storage();
+        pixels.parameters[0]=f.field_14c;
+        pixels.parameters[1]=weight;
+        pixels.parameters[2]=f.field_154;
+        auto result=compose_host_resident_exact_pixels(pixels);
+        if(!result)return false;
+        if(retain_cpu_pixel_copies()) {
+            std::vector<uint8_t> bytes(result->size());
+            if(!result->read(bytes))return false;
+            out.pixels=std::move(bytes);
+        } else out.pixels.replace_gpu_storage(std::move(result));
+        return true;
+    };
     if (out.format==0 && out.bytes_per_pixel==2) {
         // Only mode0 has an original16-bit pixel arm. Other color selectors
         // and active bitmap masks return without drawing in both profiles.
         if (f.active || f.field_148!=0) return true;
-        if (!filter_rgb555_color(out.pixels,out.stride,out.pixels,out.stride,
+        if (!exact_filter(ExactPixelOperation::FilterRgb555,out) &&
+            !filter_rgb555_color(out.pixels,out.stride,out.pixels,out.stride,
                 out.width,out.height,f.field_14c,weight))
             return fail("RGB555 color filter rejected its pixel views");
         // The host has no verified format0 presentation conversion here.
@@ -82,36 +109,41 @@ bool VM::compose_filter_at(uint32_t destination, uint32_t object,
         if (uint64_t(mask_left)+out.width>source.width || uint64_t(mask_top)+out.height>source.height)
             return fail("filter mask clip exceeds its bitmap");
         const uint64_t offset=uint64_t(mask_top)*source.stride+mask_left;
-        if (offset>source.pixels.size() || !filter_bitmap_mask(out.pixels,out.stride,
+        if (offset>source.pixels.size() || (!(offset<=UINT32_MAX && exact_filter(ExactPixelOperation::FilterMask,source,uint32_t(offset))) &&
+            !filter_bitmap_mask(out.pixels,out.stride,
                 std::span<const uint8_t>(source.pixels).subspan(size_t(offset)),source.stride,
-                out.width,out.height,f.field_14c,f.field_154,weight))
+                out.width,out.height,f.field_14c,f.field_154,weight)))
             return fail("bitmap-mask filter rejected its pixel views");
         refresh_bgra_mirror(out);
         return true;
     }
     if (f.field_148 == 1) {
-        if (!filter_addsub_color(out.pixels,out.stride,out.pixels,out.stride,
+        if (!exact_filter(ExactPixelOperation::FilterAddSub,out) &&
+            !filter_addsub_color(out.pixels,out.stride,out.pixels,out.stride,
                 out.width,out.height,out.format,f.field_14c,weight))
             return fail("add/subtract color filter rejected its pixel views",1);
         refresh_bgra_mirror(out);
         return true;
     }
     if (f.field_148 == 3) {
-        if (!filter_xor_color(out.pixels,out.stride,out.pixels,out.stride,
+        if (!exact_filter(ExactPixelOperation::FilterXor,out) &&
+            !filter_xor_color(out.pixels,out.stride,out.pixels,out.stride,
                 out.width,out.height,out.format,f.field_14c,weight))
             return fail("XOR color filter rejected its pixel views",3);
         refresh_bgra_mirror(out);
         return true;
     }
     if (f.field_148 == 2) {
-        if (!filter_luminance_color(out.pixels,out.stride,out.pixels,out.stride,
+        if (!exact_filter(ExactPixelOperation::FilterLuminance,out) &&
+            !filter_luminance_color(out.pixels,out.stride,out.pixels,out.stride,
                 out.width,out.height,out.format,f.field_14c,weight))
             return fail("luminance color filter rejected its pixel views",2);
         refresh_bgra_mirror(out);
         return true;
     }
     if (f.field_14c == 0 && out.format == 2U) {
-        if (!filter_black_alpha(out.pixels,out.stride,out.pixels,out.stride,
+        if (!exact_filter(ExactPixelOperation::FilterBlackAlpha,out) &&
+            !filter_black_alpha(out.pixels,out.stride,out.pixels,out.stride,
                 out.width,out.height,weight))
             return fail("black source-alpha filter rejected its pixel views");
         refresh_bgra_mirror(out);

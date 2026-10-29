@@ -1,4 +1,5 @@
 #include "bgiplayer/sprite_terminal_blend.hpp"
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include <algorithm>
 namespace bgiplayer {
 bool blend_original_sprite_terminal(GlyphBitmapView destination,
@@ -16,6 +17,12 @@ bool blend_original_sprite_terminal(GlyphBitmapView destination,
                 uint64_t(view.width) * 4U <= view.pixels.size();
     };
     if (!valid(destination) || !valid(source)) return false;
+    if (exact_pixels_worthwhile(destination.width,destination.height)) {
+    ExactPixelPixels gpu{destination,source,{},ExactPixelOperation::SpriteTerminal};
+    gpu.parameters[0]=mode;
+    gpu.parameters[1]=parameter;
+    if (compose_host_exact_pixels(gpu).success) return true;
+    }
     const uint32_t strength = mode >= 0x20U ? 256U - parameter : parameter;
     const bool subtract = mode == 3U || mode == 0x22U;
     for (uint32_t y = 0; y < source.height; ++y)

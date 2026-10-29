@@ -1,4 +1,5 @@
 #include "bgiplayer/sprite_crossfade.hpp"
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include "bgiplayer/rcpss.hpp"
 #include <algorithm>
 #include <array>
@@ -7,6 +8,22 @@ namespace {
 int32_t signed_shift8(int32_t value) {
     return value >= 0 ? value / 256 : -((-value + 255) / 256);
 }
+// 1400416A0 -> 14003C5C0 uses the original RCPPS estimate, not integer
+// division. Pack the already captured estimate table without changing a bit:
+// each adjacent pair is identical, and successive 11-bit units differ by1..4.
+// Six independent entries fit in a dword (12-bit base, five3-bit deltas).
+constexpr auto packed_sprite_reciprocals() {
+    std::array<uint32_t,342> result{};
+    for (size_t block=0;block<result.size();++block) {
+        const size_t first=block*6U;
+        result[block]=(detail::kRcpSsEstimateTable[first*2U]-0x3F000000U)>>11U;
+        for (size_t i=1;i<6U && first+i<2048U;++i)
+            result[block]|=((detail::kRcpSsEstimateTable[(first+i-1U)*2U]-
+                detail::kRcpSsEstimateTable[(first+i)*2U])>>11U)<<(12U+(i-1U)*3U);
+    }
+    return result;
+}
+constexpr auto sprite_reciprocals=packed_sprite_reciprocals();
 }
 bool blend_original_sprite_crossfade(GlyphBitmapView destination,
     GlyphBitmapView first, GlyphBitmapView second, int32_t mix, uint32_t opacity) {
@@ -64,6 +81,12 @@ bool blend_original_sprite_cache(GlyphBitmapView destination,
             view.byte_offset>view.pixels.size() ||
             (width && height && uint64_t(height-1U)*view.stride+uint64_t(width)*4U>
                 view.pixels.size()-view.byte_offset)) return false;
+    if (exact_pixels_worthwhile(width,height)) {
+    ExactPixelPixels gpu{destination,first,second,ExactPixelOperation::SpritePairMix};
+    gpu.parameters[0]=uint32_t(mix);
+    std::copy(sprite_reciprocals.begin(),sprite_reciprocals.end(),gpu.parameters.begin()+32);
+    if (compose_host_exact_pixels(gpu).success) return true;
+    }
     for (uint32_t y=0;y<height;++y) for (uint32_t x=0;x<width;++x) {
         const size_t a=first.byte_offset+size_t(y)*first.stride+x*4U;
         const size_t b=second.byte_offset+size_t(y)*second.stride+x*4U;

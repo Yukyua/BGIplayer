@@ -1,5 +1,6 @@
 #include "bgiplayer/vm.hpp"
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include "bgiplayer/background_motion.hpp"
 #include "bgiplayer/background_transform.hpp"
 
@@ -50,6 +51,38 @@ bool VM::compose_main_background_at(uint32_t destination,
         !materialize_graphics_pixels(target->second)) {
         return fail("background destination bitmap is missing or cannot be materialized");
     }
+    const auto exact_pixels = [&](GraphicsSurface& output,ExactPixelOperation operation,
+                                  GraphicsSurface* source=nullptr,uint32_t source_offset=0,uint32_t color=0) {
+        if(!exact_pixels_worthwhile(output.width,output.height,bool(output.pixels.gpu_storage())) ||
+                (source==&output && operation==ExactPixelOperation::RawCopy))return false;
+        const auto read_view=[](const PixelBuffer& bytes) {
+            if(bytes.gpu_storage())return std::span<uint8_t>{};
+            const auto cpu=bytes.upload_bytes();
+            return std::span<uint8_t>(const_cast<uint8_t*>(cpu.data()),cpu.size());
+        };
+        ExactPixelPixels pixels{{read_view(output.pixels),0,output.stride,output.width,output.height,
+            output.format,output.bytes_per_pixel},{},{},operation};
+        pixels.destination_storage=output.pixels.gpu_storage();
+        pixels.parameters[0]=color;
+        if(operation==ExactPixelOperation::Fill && output.stride==uint64_t(output.width)*output.bytes_per_pixel &&
+                output.pixels.size()==uint64_t(output.stride)*output.height) {
+            pixels.destination.pixels={};pixels.destination_storage={};
+            pixels.destination_bytes=output.pixels.size();
+        }
+        if(source) {
+            pixels.source={read_view(source->pixels),source_offset,source->stride,output.width,output.height,
+                source->format,source->bytes_per_pixel};
+            pixels.source_storage=source->pixels.gpu_storage();
+        }
+        auto result=compose_host_resident_exact_pixels(pixels);
+        if(!result)return false;
+        if(retain_cpu_pixel_copies()) {
+            std::vector<uint8_t> bytes(result->size());
+            if(!result->read(bytes))return false;
+            output.pixels=std::move(bytes);
+        } else output.pixels.replace_gpu_storage(std::move(result));
+        return true;
+    };
     if (background_type_ == 4U && background_render_enabled_ != 0U) {
         return compose_background_f_at(destination, callback);
     }
@@ -98,6 +131,11 @@ bool VM::compose_main_background_at(uint32_t destination,
             if (output.stride < bytes || output.pixels.size() <
                     static_cast<std::size_t>(output.stride) * output.height)
                 return fail("background clear destination stride or capacity is invalid");
+            // B1: 004234A0's absent-slot arm ->0040B270 clears visible bytes.
+            if (exact_pixels(output,ExactPixelOperation::Fill)) {
+                refresh_bgra_mirror(output);
+                return true;
+            }
             for (std::size_t row = 0; row < output.height; ++row)
                 std::fill_n(output.pixels.begin() + static_cast<std::ptrdiff_t>(row * output.stride),
                             bytes, uint8_t{0});
@@ -164,12 +202,18 @@ bool VM::compose_main_background_at(uint32_t destination,
             const auto crop=classify_background_exact_copy(*transform,destination_x,destination_y,
                 output.width,output.height,input->second.width,input->second.height);
             if(crop) {
-                const auto& source=input->second;
+                auto& source=input->second;
                 if(uint64_t(output.width)*4U>output.stride ||
                     uint64_t(source.width)*4U>source.stride ||
                     uint64_t(output.stride)*output.height>output.pixels.size() ||
                     uint64_t(source.stride)*source.height>source.pixels.size())
                     return fail("background exact-copy pixel view is invalid");
+                // B2: 004199D0 containment admits0041D0C0's raw copy only.
+                const size_t source_offset=size_t(crop->second)*source.stride+size_t(crop->first)*4U;
+                if (source_offset<=UINT32_MAX && exact_pixels(output,ExactPixelOperation::RawCopy,&source,uint32_t(source_offset))) {
+                    refresh_bgra_mirror(output);
+                    return true;
+                }
                 for(uint32_t row=0;row<output.height;++row)
                     std::copy_n(source.pixels.data()+size_t(row+crop->second)*source.stride+
                             size_t(crop->first)*4U,size_t(output.width)*4U,

@@ -1,5 +1,6 @@
 #include "bgiplayer/vm.hpp"
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include "bgiplayer/background_mask.hpp"
 
 #include <cstdlib>
@@ -64,6 +65,38 @@ bool VM::compose_background_f_at(uint32_t destination, const DisplayBitmapDraw& 
     auto target = graphics_surfaces_.find(destination);
     if (target == graphics_surfaces_.end() || !materialize_graphics_pixels(target->second))
         return fail("BackF destination bitmap is missing or cannot be materialized");
+    const auto exact_pixels = [&](GraphicsSurface& output,ExactPixelOperation operation,
+                                  GraphicsSurface* source=nullptr,uint32_t source_offset=0,uint32_t color=0) {
+        if(!exact_pixels_worthwhile(output.width,output.height,bool(output.pixels.gpu_storage())) ||
+                (source==&output && operation==ExactPixelOperation::RawCopy))return false;
+        const auto read_view=[](const PixelBuffer& bytes) {
+            if(bytes.gpu_storage())return std::span<uint8_t>{};
+            const auto cpu=bytes.upload_bytes();
+            return std::span<uint8_t>(const_cast<uint8_t*>(cpu.data()),cpu.size());
+        };
+        ExactPixelPixels pixels{{read_view(output.pixels),0,output.stride,output.width,output.height,
+            output.format,output.bytes_per_pixel},{},{},operation};
+        pixels.destination_storage=output.pixels.gpu_storage();
+        pixels.parameters[0]=color;
+        if(operation==ExactPixelOperation::Fill && output.stride==uint64_t(output.width)*output.bytes_per_pixel &&
+                output.pixels.size()==uint64_t(output.stride)*output.height) {
+            pixels.destination.pixels={};pixels.destination_storage={};
+            pixels.destination_bytes=output.pixels.size();
+        }
+        if(source) {
+            pixels.source={read_view(source->pixels),source_offset,source->stride,output.width,output.height,
+                source->format,source->bytes_per_pixel};
+            pixels.source_storage=source->pixels.gpu_storage();
+        }
+        auto result=compose_host_resident_exact_pixels(pixels);
+        if(!result)return false;
+        if(retain_cpu_pixel_copies()) {
+            std::vector<uint8_t> bytes(result->size());
+            if(!result->read(bytes))return false;
+            output.pixels=std::move(bytes);
+        } else output.pixels.replace_gpu_storage(std::move(result));
+        return true;
+    };
     const auto clear = [&] {
         auto& out = target->second;
         const std::size_t bytes = static_cast<std::size_t>(out.width) * out.bytes_per_pixel;
@@ -128,12 +161,14 @@ bool VM::compose_background_f_at(uint32_t destination, const DisplayBitmapDraw& 
             if (!draw(c.secondary_bitmap,c.field4,c.field5,0x80U,0)) return false;
         } else if (c.secondary_bitmap==0x7000U || c.secondary_bitmap==0x7001U) {
             const uint8_t color=c.secondary_bitmap==0x7001U?0xFFU:0;
-            for (size_t row=0;row<out.height;++row)
-                for (size_t column=0;column<out.width;++column) {
-                    const size_t offset=row*out.stride+column*4U;
-                    out.pixels[offset]=color;out.pixels[offset+1]=color;
-                    out.pixels[offset+2]=color;out.pixels[offset+3]=0;
-                }
+            // B3: 00422840/140058910 sentinel bottom color, alpha byte zero.
+            if (!exact_pixels(out,ExactPixelOperation::Fill,nullptr,0,color?0x00ffffffU:0U))
+                for (size_t row=0;row<out.height;++row)
+                    for (size_t column=0;column<out.width;++column) {
+                        const size_t offset=row*out.stride+column*4U;
+                        out.pixels[offset]=color;out.pixels[offset+1]=color;
+                        out.pixels[offset+2]=color;out.pixels[offset+3]=0;
+                    }
         }
         const bool composed=compose_original_background_mask(
             {out.pixels,0,out.stride,out.width,out.height,out.format,out.bytes_per_pixel},
@@ -163,12 +198,13 @@ bool VM::compose_background_f_at(uint32_t destination, const DisplayBitmapDraw& 
         // low24-bit constant (black0 or white00FFFFFF).
         auto& out = target->second;
         const uint8_t color = c.secondary_bitmap == 0x7001U ? 0xFFU : 0;
-        for (std::size_t y = 0; y < out.height; ++y)
-            for (std::size_t x = 0; x < out.width; ++x) {
-                const std::size_t offset = y * out.stride + x * out.bytes_per_pixel;
-                out.pixels[offset] = color; out.pixels[offset + 1] = color; out.pixels[offset + 2] = color;
-                if (out.bytes_per_pixel == 4) out.pixels[offset + 3] = 0;
-            }
+        if (!(out.bytes_per_pixel==4 && exact_pixels(out,ExactPixelOperation::Fill,nullptr,0,color?0x00ffffffU:0U)))
+            for (std::size_t y = 0; y < out.height; ++y)
+                for (std::size_t x = 0; x < out.width; ++x) {
+                    const std::size_t offset = y * out.stride + x * out.bytes_per_pixel;
+                    out.pixels[offset] = color; out.pixels[offset + 1] = color; out.pixels[offset + 2] = color;
+                    if (out.bytes_per_pixel == 4) out.pixels[offset + 3] = 0;
+                }
         refresh_bgra_mirror(out);
         mode = c.secondary_bitmap == 0x7001U ? 0xC1U : 0xC0U;
     }

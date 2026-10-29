@@ -1,4 +1,5 @@
 #include "bgiplayer/sprite_reduced_cache.hpp"
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include <algorithm>
 namespace bgiplayer {
 bool reduce_original_sprite_cache(GlyphBitmapView destination,
@@ -15,6 +16,9 @@ bool reduce_original_sprite_cache(GlyphBitmapView destination,
         uint64_t(destination.byte_offset) + uint64_t(destination.stride) * (destination.height - 1U) +
             uint64_t(destination.width) * 4U > destination.pixels.size())
         return false;
+    if (exact_pixels_worthwhile(destination.width,destination.height) &&
+        compose_host_exact_pixels({destination,source,{},
+            ExactPixelOperation::SpriteReduction}).success) return true;
     const auto average = [](unsigned a, unsigned b) { return (a + b + 1U) >> 1U; };
     for (uint32_t y = 0; y < destination.height; ++y) {
         const uint32_t top = y * 2U;
