@@ -1,4 +1,5 @@
 #pragma once
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include "bgiplayer/render_policy.hpp"
 #include "bgiplayer/resource_integrity.hpp"
 #include "bgiplayer/media_source.hpp"
@@ -4901,6 +4902,26 @@ public:
             piece.rgba.resize(
                 static_cast<std::size_t>(piece.width) *
                 piece.height * 4U);
+            // 004382C0/004381D0: preserve per-slot replacement order.
+            // A source overlapping generated slots retains the original CPU path.
+            const bool independent_source=uint32_t(bitmap)<0xFF01U || uint32_t(bitmap)>=0xFF01U+count;
+            const uint64_t source_offset=uint64_t(index)*piece.stride;
+            const bool raw_gpu=independent_source && source_offset<=UINT32_MAX &&
+                exact_pixels_worthwhile(piece.width,piece.height,false) && compose_host_exact_pixel_buffers({
+                {{},0,piece.stride,piece.width,piece.height,piece.format,piece.bytes_per_pixel},
+                {{},uint32_t(source_offset),source->second.stride,piece.width,piece.height,
+                    source->second.format,source->second.bytes_per_pixel},{},ExactPixelOperation::RawCopy},
+                piece.pixels,&source->second.pixels,nullptr,true);
+            const bool rgba_available=source->second.rgba.size()>=
+                uint64_t(source->second.width)*source->second.height*4U;
+            const uint64_t rgba_offset=uint64_t(index)*piece.width*4U;
+            const bool rgba_gpu=independent_source && rgba_available && rgba_offset<=UINT32_MAX &&
+                exact_pixels_worthwhile(piece.width,piece.height,false) &&
+                compose_host_exact_pixel_buffers({
+                    {{},0,piece.width*4U,piece.width,piece.height,2,4},
+                    {{},uint32_t(rgba_offset),source->second.width*4U,piece.width,piece.height,2,4},
+                    {},ExactPixelOperation::RawCopy},piece.rgba,&source->second.rgba,nullptr,true);
+            if(!raw_gpu || (rgba_available && !rgba_gpu))
             for (uint32_t y = 0; y < piece.height; ++y) {
                 const std::size_t source_row =
                     static_cast<std::size_t>(y) *
@@ -4909,17 +4930,14 @@ public:
                     static_cast<std::size_t>(index) * piece.stride;
                 const std::size_t destination_row =
                     static_cast<std::size_t>(y) * piece.stride;
-                std::copy_n(
+                if(!raw_gpu) std::copy_n(
                     source->second.pixels.begin() +
                         static_cast<std::ptrdiff_t>(
                             source_row + source_x),
                     piece.stride,
                     piece.pixels.begin() +
                         static_cast<std::ptrdiff_t>(destination_row));
-                if (source->second.rgba.size() >=
-                    static_cast<std::size_t>(
-                        source->second.width) *
-                        source->second.height * 4U) {
+                if (rgba_available && !rgba_gpu) {
                     const std::size_t source_rgba =
                         static_cast<std::size_t>(y) *
                             source->second.width * 4U +
@@ -4971,6 +4989,27 @@ public:
             install_allocated_graphics_surface(destination, std::move(output));
             return 22;
         }
+        // 004061B0 mode0/1: native raw bytes and the existing RGBA mirror
+        // are independent flipped views; padding remains zero-initialized.
+        const auto try_flip = [&](bool rgba) {
+            if(!exact_pixels_worthwhile(output.width,output.height,false))return false;
+            ExactPixelPixels exact;
+            exact.operation=ExactPixelOperation::Flip;exact.parameters[0]=mode;
+            if(rgba) {
+                exact.destination={{},0,output.width*4U,output.width,output.height,2,4};
+                exact.source={{},0,output.width*4U,output.width,output.height,2,4};
+                return compose_host_exact_pixel_buffers(exact,output.rgba,&input->second.rgba,nullptr,true);
+            } else {
+                exact.destination={{},0,output.stride,output.width,output.height,output.format,output.bytes_per_pixel};
+                exact.source={{},0,input->second.stride,input->second.width,input->second.height,
+                    input->second.format,input->second.bytes_per_pixel};
+                return compose_host_exact_pixel_buffers(exact,output.pixels,&input->second.pixels,nullptr,true);
+            }
+        };
+        const bool raw_gpu=try_flip(false);
+        const bool rgba_available=input->second.rgba.size()>=uint64_t(output.width)*output.height*4U;
+        const bool rgba_gpu=rgba_available && try_flip(true);
+        if(!raw_gpu || (rgba_available && !rgba_gpu))
         for (uint32_t row = 0; row < output.height; ++row) {
             const uint32_t source_row = output.height - 1U - row;
             for (uint32_t column = 0; column < output.width; ++column) {
@@ -4985,15 +5024,13 @@ public:
                     static_cast<std::size_t>(row) *
                         destination_stride +
                     static_cast<std::size_t>(column) * pixel_bytes;
-                std::copy_n(
+                if(!raw_gpu) std::copy_n(
                     input->second.pixels.begin() +
                         static_cast<std::ptrdiff_t>(source_offset),
                     pixel_bytes,
                     output.pixels.begin() +
                         static_cast<std::ptrdiff_t>(destination_offset));
-                if (input->second.rgba.size() >=
-                    static_cast<std::size_t>(output.width) *
-                        output.height * 4U) {
+                if (rgba_available && !rgba_gpu) {
                     const std::size_t source_rgba =
                         (static_cast<std::size_t>(source_row) *
                              output.width +
@@ -6028,6 +6065,29 @@ public:
             bytes_per_pixel;
         const int64_t destination_column =
             destination_left + (clipped_left - source_left);
+        // 004037F0 ->0040BFD0: preserve directional self-copy behavior
+        // by retaining the original row loop whenever handles coincide.
+        if(destination_type!=source_type && exact_pixels_worthwhile(uint32_t(copy_right-clipped_left+1),
+                uint32_t(copy_bottom-clipped_top+1),bool(destination->second.pixels.gpu_storage()))) {
+            const int64_t destination_row=destination_top+(clipped_top-source_top);
+            const uint64_t source_offset=uint64_t(clipped_top)*source->second.stride+
+                uint64_t(clipped_left)*bytes_per_pixel;
+            const uint64_t destination_offset=uint64_t(destination_row)*destination->second.stride+
+                uint64_t(destination_column)*bytes_per_pixel;
+            if(destination_row>=0 && destination_column>=0 && source_offset<=UINT32_MAX && destination_offset<=UINT32_MAX &&
+                compose_host_exact_pixel_buffers({
+                    {{},uint32_t(destination_offset),destination->second.stride,
+                        uint32_t(copy_right-clipped_left+1),uint32_t(copy_bottom-clipped_top+1),
+                        destination->second.format,destination->second.bytes_per_pixel},
+                    {{},uint32_t(source_offset),source->second.stride,
+                        uint32_t(copy_right-clipped_left+1),uint32_t(copy_bottom-clipped_top+1),
+                        source->second.format,source->second.bytes_per_pixel},{},ExactPixelOperation::RawCopy},
+                    destination->second.pixels,&source->second.pixels)) {
+                destination->second.rgba.clear();
+                display_dirty_=true;
+                return 0;
+            }
+        }
         for (int64_t row = clipped_top; row <= copy_bottom; ++row) {
             const std::size_t source_offset =
                 static_cast<std::size_t>(row) *
@@ -6114,6 +6174,40 @@ public:
         if (!materialize_graphics_pixels(source_surface)) {
             return 7;
         }
+        // Exact GPU work uses the same tight source/destination row stepping
+        // as004187B0, after the existing allocation, format and mask guards.
+        const auto exact_masked_worthwhile = [&] {
+            const int64_t left=std::max<int64_t>(0,x), top=std::max<int64_t>(0,y);
+            const int64_t right=std::min<int64_t>(destination_surface.width,int64_t(x)+source_surface.width);
+            const int64_t bottom=std::min<int64_t>(destination_surface.height,int64_t(y)+source_surface.height);
+            return left<right && top<bottom && exact_pixels_worthwhile(uint32_t(right-left),uint32_t(bottom-top),
+                bool(destination_surface.pixels.gpu_storage()));
+        };
+        const auto try_exact_masked = [&](ExactPixelPixels pixels,const PixelBuffer* mask_pixels=nullptr) {
+            if(!exact_masked_worthwhile())return false;
+            const int64_t left=std::max<int64_t>(0,x), top=std::max<int64_t>(0,y);
+            const int64_t right=std::min<int64_t>(destination_surface.width,int64_t(x)+source_surface.width);
+            const int64_t bottom=std::min<int64_t>(destination_surface.height,int64_t(y)+source_surface.height);
+            if(left>=right || top>=bottom)return false;
+            const uint64_t ds=uint64_t(destination_surface.width)*destination_surface.bytes_per_pixel;
+            const uint64_t ss=uint64_t(source_surface.width)*source_surface.bytes_per_pixel;
+            const uint64_t doff=uint64_t(top)*ds+uint64_t(left)*4U;
+            const uint64_t soff=uint64_t(top-y)*ss+uint64_t(left-x)*4U;
+            if(ds>UINT32_MAX || ss>UINT32_MAX || doff>UINT32_MAX || soff>UINT32_MAX)return false;
+            const uint32_t width=uint32_t(right-left),height=uint32_t(bottom-top);
+            pixels.destination={{},uint32_t(doff),uint32_t(ds),width,height,
+                destination_surface.format,destination_surface.bytes_per_pixel};
+            pixels.source={{},uint32_t(soff),uint32_t(ss),width,height,
+                source_surface.format,source_surface.bytes_per_pixel};
+            if(pixels.parameters[0]!=0) {
+                const uint64_t moff=uint64_t(pixels.second.byte_offset)+uint64_t(top-y)*pixels.second.stride+uint64_t(left-x);
+                if(moff>UINT32_MAX)return false;
+                pixels.second.byte_offset=uint32_t(moff);
+                pixels.second.width=width;pixels.second.height=height;
+            }
+            pixels.operation=ExactPixelOperation::MaskedBlend;
+            return compose_host_exact_pixel_buffers(pixels,destination_surface.pixels,&source_surface.pixels,mask_pixels);
+        };
         if (mask == graphics_surfaces_.end()) {
             if (destination_surface.format != source_surface.format ||
                 (destination_surface.format != 1U &&
@@ -6127,6 +6221,10 @@ public:
             const uint32_t source_stride =
                 source_surface.bytes_per_pixel *
                 source_surface.width;
+            ExactPixelPixels exact;
+            exact.parameters[0]=0;
+            exact.parameters[1]=static_cast<uint32_t>(static_cast<int32_t>(factor));
+            if(try_exact_masked(exact))return 0;
             for (uint32_t source_y = 0;
                  source_y < source_surface.height; ++source_y) {
                 const int32_t target_y = y +
@@ -6211,6 +6309,27 @@ public:
             destination_surface.width;
         const uint32_t source_stride =
             source_surface.bytes_per_pixel * source_surface.width;
+        if(exact_masked_worthwhile()) {
+        ExactPixelPixels exact;
+        exact.parameters[0]=1;
+        exact.second={{},0,mask_surface.stride,mask_surface.width,mask_surface.height,
+            mask_surface.format,mask_surface.bytes_per_pixel};
+        for(uint32_t value=0;value<256;++value) {
+            int32_t threshold;
+            int16_t factor=0;
+            if(opacity<8U) {
+                const uint32_t shift=opacity&31U;
+                threshold=static_cast<int32_t>((value<<shift)+256U-(mode<<shift)-mode);
+                if(threshold>0 && threshold<256)factor=threshold_factors[size_t(threshold>>1)];
+            } else {
+                threshold=static_cast<int32_t>(value)+(128-static_cast<int32_t>(opacity))*2;
+                if(threshold>0 && threshold<256)factor=smooth_factors[size_t(threshold)];
+            }
+            exact.parameters[16+value]=threshold<=0?0x10001U:(threshold>=256?0x10000U:
+                static_cast<uint32_t>(static_cast<int32_t>(factor)));
+        }
+        if(try_exact_masked(exact,&mask_surface.pixels))return 0;
+        }
         bool intersected = false;
         for (uint32_t source_y = 0;
              source_y < source_surface.height; ++source_y) {
@@ -6770,6 +6889,10 @@ public:
         if (surface.pixels.size() < required) {
             return false;
         }
+        if(exact_pixels_worthwhile(surface.width,surface.height,bool(surface.pixels.gpu_storage())) &&
+            compose_host_exact_pixel_buffers({
+                {{},0,surface.stride,surface.width,surface.height,surface.format,surface.bytes_per_pixel},
+                {},{},ExactPixelOperation::Invert},surface.pixels))return true;
         for (std::size_t y = 0; y < surface.height; ++y) {
             for (std::size_t x = 0; x < surface.width; ++x) {
                 uint8_t& value =
@@ -7311,6 +7434,12 @@ public:
         if (surface.pixels.size() < required) {
             return 2;
         }
+        if(exact_pixels_worthwhile(surface.width,surface.height,bool(surface.pixels.gpu_storage()))) {
+            ExactPixelPixels exact{{{},0,surface.stride,surface.width,surface.height,
+                surface.format,surface.bytes_per_pixel},{},{},ExactPixelOperation::ReplaceColor};
+            exact.parameters[0]=old_color;exact.parameters[1]=new_color;
+            if(compose_host_exact_pixel_buffers(exact,surface.pixels))return 0;
+        }
         for (uint32_t y = 0; y < surface.height; ++y) {
             for (uint32_t x = 0; x < surface.width; ++x) {
                 const std::size_t offset =
@@ -7409,6 +7538,11 @@ public:
         if (input.pixels.size() < input_required) {
             return 10;
         }
+        const bool exact_gpu=exact_pixels_worthwhile(output.width,output.height,false) && compose_host_exact_pixel_buffers({
+            {{},0,output.stride,output.width,output.height,output.format,output.bytes_per_pixel},
+            {{},0,input.stride,input.width,input.height,input.format,input.bytes_per_pixel},
+            {},ExactPixelOperation::Grayscale},output.pixels,&input.pixels,nullptr,true);
+        if(!exact_gpu)
         for (uint32_t y = 0; y < input.height; ++y) {
             const std::size_t source_row =
                 static_cast<std::size_t>(y) * input.stride;
@@ -7746,55 +7880,7 @@ public:
     };
     uint32_t append_window_bitmap_records(
         uint32_t window, uint32_t count, uint32_t records,
-        uint32_t base, bool extended_records) {
-        if (count == 0 || count > 0x40U) {
-            return 1;
-        }
-        const auto object = window_objects_.find(window);
-        if (object == window_objects_.end()) {
-            return 0xFF;
-        }
-        const uint32_t stride = extended_records ? 0x40U : 0x10U;
-        // Original B5 compacts offsets 0/4/8 from each 0x40-byte record.
-        const uint32_t x_offset = 0U;
-        const uint32_t y_offset = 4U;
-        const uint32_t bitmap_offset = 8U;
-        std::fill(object->second.overlay_plane.begin(), object->second.overlay_plane.end(), 0);
-        object->second.field_18c = 1;
-        object->second.overlay_level = 0;
-        for (auto& image : object->second.image_layers) image.enabled = 0;
-        auto& commands = window_bitmap_commands_[window];
-        for (uint32_t index = 0; index < count; ++index) {
-            const uint32_t record = records + index * stride;
-            const int32_t x = static_cast<int32_t>(
-                memory_.read_u32(record + x_offset, base));
-            const int32_t y = static_cast<int32_t>(
-                memory_.read_u32(record + y_offset, base));
-            const uint32_t bitmap =
-                memory_.read_u32(record + bitmap_offset, base);
-            const auto surface = graphics_surfaces_.find(bitmap);
-            if (surface == graphics_surfaces_.end()) {
-                continue;
-            }
-            const bool written = draw_window_plane(window,x,y,bitmap,0U,0U,true);
-            commands.push_back({
-                bitmap,
-                x,
-                y,
-                surface->second.width,
-                surface->second.height,
-                extended_records ? 0xFFFFFFFFU
-                                : memory_.read_u32(record + 12U, base),
-                -1,
-                0U,
-                0U,
-                1U,
-                written,
-            });
-        }
-        display_dirty_ = true;
-        return 0;
-    }
+        uint32_t base, bool extended_records);
     uint32_t draw_window_bitmap(uint32_t window, int32_t x, int32_t y,
                                 uint32_t bitmap, uint32_t mode,
                                 uint32_t opacity, uint32_t layer = 0,
@@ -7830,79 +7916,8 @@ public:
         display_dirty_ = true;
         return 0;
     }
-    uint32_t fill_window_background(uint32_t window, uint32_t color) {
-        const auto object = window_objects_.find(window);
-        if (object == window_objects_.end()) {
-            return 0xFF;
-        }
-        WindowObject& value = object->second;
-        if (value.width == 0 || value.height == 0) {
-            return 1;
-        }
-        const uint32_t format = value.plane_format;
-        const uint32_t bytes_per_pixel =
-            bitmap_bytes_per_pixel(format);
-        if (bytes_per_pixel == 0) {
-            return 1;
-        }
-        value.background_plane.resize(
-            static_cast<std::size_t>(value.width) *
-                value.height * bytes_per_pixel,
-            0);
-        for (std::size_t pixel = 0;
-             pixel <
-             static_cast<std::size_t>(value.width) * value.height;
-             ++pixel) {
-            const std::size_t offset = pixel * bytes_per_pixel;
-            switch (format) {
-                case 0: {
-                    const uint32_t stored = color & 0xFFFFU;
-                    for (uint32_t byte = 0; byte < 2U; ++byte) {
-                        value.background_plane[offset + byte] =
-                            static_cast<uint8_t>(stored >> (byte * 8U));
-                    }
-                    break;
-                }
-                case 1:
-                case 2: {
-                    const uint32_t stored =
-                        format == 1U ? color & 0xFFFFFFU : color;
-                    for (uint32_t byte = 0; byte < 4U; ++byte) {
-                        value.background_plane[offset + byte] =
-                            static_cast<uint8_t>(stored >> (byte * 8U));
-                    }
-                    break;
-                }
-                case 3:
-                    value.background_plane[offset] =
-                        static_cast<uint8_t>(color);
-                    break;
-                default:
-                    break;
-            }
-        }
-        value.background_fill_color = color;
-        value.background_bitmap = -1;
-        value.background_active = false;
-        display_dirty_ = true;
-        return 0;
-    }
-    bool reset_window_composition(uint32_t window) {
-        const auto object = window_objects_.find(window);
-        if (object == window_objects_.end()) {
-            return false;
-        }
-        std::fill(object->second.overlay_plane.begin(), object->second.overlay_plane.end(), 0);
-        for (auto& layer : object->second.image_layers) {
-            layer.enabled = 0;
-        }
-        window_bitmap_commands_.erase(window);
-        selection_icon_processors_.erase(window);
-        (void)set_window_text_direction(
-            window, object->second.text_boundary_mode_398);
-        display_dirty_ = true;
-        return true;
-    }
+    uint32_t fill_window_background(uint32_t window, uint32_t color);
+    bool reset_window_composition(uint32_t window);
     [[nodiscard]] const std::vector<uint8_t>& window_background_plane(
         uint32_t window) const {
         static const std::vector<uint8_t> empty;
@@ -9959,6 +9974,18 @@ public:
             static_cast<uint32_t>(to_fixed(sine));
         const uint32_t row_step_y =
             static_cast<uint32_t>(to_fixed(cosine));
+        // 00419F30 at icon opacity1 exposes the original four-neighbor sampler.
+        if (exact_pixels_worthwhile(width,height)) {
+            ExactPixelPixels gpu_icon;
+            gpu_icon.operation=ExactPixelOperation::IconRotate;
+            gpu_icon.destination={output.rgba,0,width*4U,width,height,2,4};
+            gpu_icon.source={std::span<uint8_t>(const_cast<uint8_t*>(source->rgba.data()),
+                source->rgba.size()),0,source->width*4U,source->width,source->height,2,4};
+            gpu_icon.parameters[0]=start_x;gpu_icon.parameters[1]=start_y;
+            gpu_icon.parameters[2]=column_step_x;gpu_icon.parameters[3]=column_step_y;
+            gpu_icon.parameters[4]=row_step_x;gpu_icon.parameters[5]=row_step_y;
+            if (compose_host_exact_pixels(gpu_icon).success) return output;
+        }
         const auto sample = [&](int32_t x, int32_t y,
                                 std::array<uint8_t, 4>& pixel) {
             pixel.fill(0);
@@ -12973,6 +13000,7 @@ public:
             rgba[at+3U]=surface.format==1U?0xffU:pixels[at+3U];
         }
     }
+    bool accelerate_exact_bitmap_blit(uint32_t destination,uint32_t source,int32_t x,int32_t y,uint32_t mode,uint32_t parameter);
     bool accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t x,int32_t y,
                                     uint32_t mode,uint32_t parameter,bool direct_copy,bool source_fade);
     bool record_bitmap_mode0_alpha(uint32_t destination, uint32_t source,
@@ -13056,6 +13084,7 @@ public:
         }
         if(accelerate_bitmap_transfer(destination,source,x,y,mode,parameter,
                 matching_direct_copy || format1_to_format2 || format2_to_format1,mode5))return true;
+        if(accelerate_exact_bitmap_blit(destination,source,x,y,mode,parameter))return true;
         const bool clear_intersection = mode == 0x41U;
         const bool clear_source_key = mode == 0x40U;
         if (mode_ff_packed) {
@@ -13391,19 +13420,20 @@ public:
                          input->second.height);
             const uint32_t clear_bytes =
                 clear_width * target->second.bytes_per_pixel;
+            const bool full_native=clear_width==target->second.width && clear_height==target->second.height &&
+                target->second.stride==clear_bytes && target->second.pixels.size()==uint64_t(clear_bytes)*clear_height;
+            auto* native=full_native?target->second.pixels.overwrite(target->second.pixels.size()):target->second.pixels.data();
+            const bool full_rgba=clear_width==target->second.width && clear_height==target->second.height;
+            auto* rgba=full_rgba?target->second.rgba.overwrite(target->second.rgba.size()):target->second.rgba.data();
             for (uint32_t y = 0; y < clear_height; ++y) {
                 const std::size_t offset =
                     static_cast<std::size_t>(y) *
                     target->second.stride;
                 std::fill_n(
-                    target->second.pixels.begin() +
-                        static_cast<std::ptrdiff_t>(offset),
+                    native+offset,
                     clear_bytes, uint8_t{0});
                 std::fill_n(
-                    target->second.rgba.begin() +
-                        static_cast<std::ptrdiff_t>(
-                            static_cast<std::size_t>(y) *
-                            target->second.width * 4U),
+                    rgba+static_cast<std::size_t>(y)*target->second.width*4U,
                     static_cast<std::size_t>(clear_width) * 4U,
                     uint8_t{0});
             }
@@ -14876,6 +14906,9 @@ public:
                 source_surface->second.height) {
             return 3;
         }
+        const auto exact_view = [](const GraphicsSurface& s) {
+            return GlyphBitmapView{{},0,s.stride,s.width,s.height,s.format,s.bytes_per_pixel};
+        };
         if (opacity == 0 &&
             destination_surface->second.width ==
                 source_surface->second.width &&
@@ -14900,6 +14933,14 @@ public:
             const uint32_t row_bytes =
                 destination_surface->second.width *
                 destination_surface->second.bytes_per_pixel;
+            const bool gpu_scaled=exact_pixels_worthwhile(destination_surface->second.width,
+                destination_surface->second.height,bool(destination_surface->second.pixels.gpu_storage() || source_surface->second.pixels.gpu_storage())) && [&] {
+            ExactPixelPixels exact_scaled{exact_view(destination_surface->second),
+                exact_view(source_surface->second),{},ExactPixelOperation::ScaledKernel};
+            exact_scaled.parameters[0]=mode;exact_scaled.parameters[1]=opacity;
+            return compose_host_exact_pixel_buffers(exact_scaled,destination_surface->second.pixels,&source_surface->second.pixels,nullptr,true);
+            }();
+            if (!gpu_scaled) {
             for (uint32_t y = 0;
                  y < destination_surface->second.height; ++y) {
                 const std::size_t source_offset =
@@ -14915,6 +14956,7 @@ public:
                     destination_surface->second.pixels.begin() +
                         static_cast<std::ptrdiff_t>(
                             destination_offset));
+            }
             }
             for (uint32_t y = 0;
                  y < destination_surface->second.height; ++y) {
@@ -14956,6 +14998,14 @@ public:
             const uint32_t half_radius = radius >> 1U;
             const uint32_t factor =
                 (radius * 2U + 0x20000U) / radius;
+            const bool gpu_scaled=exact_pixels_worthwhile(destination_surface->second.width,
+                destination_surface->second.height,bool(destination_surface->second.pixels.gpu_storage() || source_copy.pixels.gpu_storage())) && [&] {
+            ExactPixelPixels exact_scaled{exact_view(destination_surface->second),
+                exact_view(source_copy),{},ExactPixelOperation::ScaledKernel};
+            exact_scaled.parameters[0]=mode;exact_scaled.parameters[1]=opacity;
+            return compose_host_exact_pixel_buffers(exact_scaled,destination_surface->second.pixels,&source_copy.pixels,nullptr,true);
+            }();
+            if (!gpu_scaled) {
             for (uint32_t y = 0;
                  y < destination_surface->second.height; ++y) {
                 const std::size_t source_row =
@@ -15013,6 +15063,7 @@ public:
                                     0xFFU));
                     }
                 }
+            }
             }
             if (destination_surface->second.rgba.size() !=
                 static_cast<std::size_t>(
@@ -15278,6 +15329,20 @@ public:
                      static_cast<uint16_t>(second) + 1U) >>
                     1U);
             };
+        const auto exact_view = [](const GraphicsSurface& s) {
+            return GlyphBitmapView{{},0,s.stride,s.width,s.height,s.format,s.bytes_per_pixel};
+        };
+            if (exact_pixels_worthwhile(output.width,output.height,bool(source_surface->second.pixels.gpu_storage())) &&
+                compose_host_exact_pixel_buffers({exact_view(output),exact_view(source_surface->second),
+                    {},ExactPixelOperation::HalfDownsample},output.pixels,&source_surface->second.pixels,nullptr,true)) {
+            for (uint32_t yy=0;yy<output.height;++yy) for (uint32_t xx=0;xx<output.width;++xx) {
+                const size_t a=size_t(yy)*output.stride+size_t(xx)*4U;
+                const size_t d=(size_t(yy)*output.width+xx)*4U;
+                output.rgba[d]=output.pixels[a+2U];output.rgba[d+1U]=output.pixels[a+1U];
+                output.rgba[d+2U]=output.pixels[a];
+                output.rgba[d+3U]=output.format==1U?255U:output.pixels[a+3U];
+            }
+            } else {
             for (uint32_t y = 0; y < output.height; ++y) {
                 const uint32_t source_y0 = y * 2U;
                 const bool has_bottom = source_y0 + 1U <
@@ -15372,6 +15437,7 @@ public:
                             output.pixels[destination_offset + 3U];
                     }
                 }
+            }
             }
         }
         install_allocated_graphics_surface(destination, std::move(output));
@@ -15480,6 +15546,26 @@ public:
                 clipped_bottom,
                 top + static_cast<int64_t>(mask_copy->height) - 1);
         }
+        const auto exact_view = [](const GraphicsSurface& s) {
+            return GlyphBitmapView{{},0,s.stride,s.width,s.height,s.format,s.bytes_per_pixel};
+        };
+        const bool gpu_alpha=exact_pixels_worthwhile(output.width,output.height,
+            bool(source_copy.pixels.gpu_storage() || (mask_copy && mask_copy->pixels.gpu_storage()))) && mode<=256U &&
+            (!mask_copy || mask_copy->stride==source_copy.stride) && [&] {
+        ExactPixelPixels exact_alpha{exact_view(output),exact_view(source_copy),{},ExactPixelOperation::ComposeAlpha};
+        if(mask_copy)exact_alpha.second=exact_view(*mask_copy);
+        exact_alpha.parameters[0]=uint32_t(x);exact_alpha.parameters[1]=uint32_t(y);
+        exact_alpha.parameters[2]=mask_copy?1U:0U;exact_alpha.parameters[3]=mode;
+        return compose_host_exact_pixel_buffers(exact_alpha,output.pixels,&source_copy.pixels,mask_copy?&mask_copy->pixels:nullptr,true);
+        }();
+        if(gpu_alpha) {
+            for(int64_t yy=clipped_top;yy<=clipped_bottom;++yy) for(int64_t xx=clipped_left;xx<=clipped_right;++xx) {
+                const size_t d=size_t(yy)*output.stride+size_t(xx);
+                const uint8_t alpha=output.pixels[d];
+                output.rgba[d*4U]=alpha;output.rgba[d*4U+1U]=alpha;
+                output.rgba[d*4U+2U]=alpha;output.rgba[d*4U+3U]=255U;
+            }
+        } else {
         if (clipped_left <= clipped_right &&
             clipped_top <= clipped_bottom) {
             for (int64_t destination_y = clipped_top;
@@ -15518,6 +15604,7 @@ public:
                     output.rgba[destination_offset * 4U + 3U] = 0xFFU;
                 }
             }
+        }
         }
         install_allocated_graphics_surface(destination, std::move(output));
         if (debug_enabled()) bitmap_composite_operations_.push_back({
@@ -15563,6 +15650,15 @@ public:
                 output.height * 4U,
             0);
         const uint32_t radius = mode;
+        const auto exact_view = [](const GraphicsSurface& s) {
+            return GlyphBitmapView{{},0,s.stride,s.width,s.height,s.format,s.bytes_per_pixel};
+        };
+        const bool gpu_expand=exact_pixels_worthwhile(output.width,output.height,bool(source_copy.pixels.gpu_storage())) && [&] {
+        ExactPixelPixels exact_expand{exact_view(output),exact_view(source_copy),{},ExactPixelOperation::Expand};
+        exact_expand.parameters[0]=radius;
+        return compose_host_exact_pixel_buffers(exact_expand,output.pixels,&source_copy.pixels,nullptr,true);
+        }();
+        if(!gpu_expand) {
         for (uint32_t source_y = 0;
              source_y < source_copy.height; ++source_y) {
             for (uint32_t source_x = 0;
@@ -15627,6 +15723,7 @@ public:
                          (0x100U - alpha)) >>
                         8U);
             }
+        }
         }
         for (std::size_t index = 0;
              index < output.pixels.size(); ++index) {
@@ -16399,7 +16496,53 @@ public:
         create_graphics_surface(destination, height, width,
                                 src->second.format);
         GraphicsSurface& output = graphics_surfaces_.at(destination);
-        if (interpolation == 0) {
+        const auto exact_view = [](const GraphicsSurface& s) {
+            return GlyphBitmapView{{},0,s.stride,s.width,s.height,s.format,s.bytes_per_pixel};
+        };
+        const bool gpu_scaled = exact_pixels_worthwhile(width,height,bool(src->second.pixels.gpu_storage() || output.pixels.gpu_storage())) && [&] {
+            if(width>uint32_t(INT32_MAX) || height>uint32_t(INT32_MAX) ||
+               !materialize_graphics_pixels(src->second) || !materialize_graphics_pixels(output))return false;
+            ExactPixelPixels exact_scale{exact_view(output),exact_view(src->second),{},ExactPixelOperation::Resize};
+            auto& p=exact_scale.parameters;
+            p[7]=output.width;p[8]=output.height;
+            if(interpolation==0) {
+                p[0]=0;p[3]=(src->second.width<<16U)/width;p[4]=(src->second.height<<16U)/height;
+            } else if(scale_x>=65536U && scale_y>=65536U) {
+                p[0]=1;p[3]=uint32_t((uint64_t(src->second.width-1U)<<16U)/width);
+                p[4]=uint32_t((uint64_t(src->second.height-1U)<<16U)/height);
+            } else {
+                if((scale_x>>8U)==0U || (scale_y>>8U)==0U)return false;
+                p[0]=((scale_x>=32768U && scale_x<65536U) ||
+                      (scale_y>=32768U && scale_y<65536U))?2U:3U;
+                p[9]=65536U/(scale_x>>8U);p[10]=65536U/(scale_y>>8U);
+                p[1]=p[9]<<7U;p[2]=p[10]<<7U;
+                p[3]=uint32_t((src->second.width-(p[9]>>8U))<<16U)/width;
+                p[4]=uint32_t((src->second.height-(p[10]>>8U))<<16U)/height;
+            }
+            const uint64_t last_x=uint64_t(p[1])+uint64_t(width-1U)*p[3];
+            const uint64_t last_y=uint64_t(p[2])+uint64_t(height-1U)*p[4];
+            if(last_x>UINT32_MAX || last_y>UINT32_MAX)return false;
+            if(p[0]==2U) {
+                // Retain the CPU fault path for boxes without nonzero coverage.
+                const uint64_t bound_x=uint32_t(src->second.width<<8U),bound_y=uint32_t(src->second.height<<8U);
+                const uint64_t left=last_x>>8U,top=last_y>>8U;
+                if(left>=bound_x || top>=bound_y)return false;
+                const uint64_t clipped_w=std::min<uint64_t>(p[9],bound_x-left);
+                const uint64_t clipped_h=std::min<uint64_t>(p[10],bound_y-top);
+                if((clipped_w*clipped_h>>8U)==0U)return false;
+            }
+            return compose_host_exact_pixel_buffers(exact_scale,output.pixels,&src->second.pixels,nullptr,true);
+        }();
+        if(gpu_scaled) {
+            output.rgba.resize(size_t(output.width)*output.height*4U);
+            for (uint32_t yy=0;yy<output.height;++yy) for (uint32_t xx=0;xx<output.width;++xx) {
+                const size_t a=size_t(yy)*output.stride+size_t(xx)*4U;
+                const size_t d=(size_t(yy)*output.width+xx)*4U;
+                output.rgba[d]=output.pixels[a+2U];output.rgba[d+1U]=output.pixels[a+1U];
+                output.rgba[d+2U]=output.pixels[a];
+                output.rgba[d+3U]=output.format==1U?255U:output.pixels[a+3U];
+            }
+        } else if (interpolation == 0) {
             if (!materialize_graphics_pixels(src->second) ||
                 !materialize_graphics_pixels(output)) {
                 return 3;
@@ -17195,6 +17338,24 @@ public:
         }
         const uint32_t bytes_per_pixel =
             src->second.bytes_per_pixel;
+        // 004038C0 recreates the destination first. Keep the original
+        // self-handle behavior; distinct sources use a clipped raw GPU copy.
+        const int64_t left=std::max<int64_t>(0,x),top=std::max<int64_t>(0,y);
+        const int64_t right=std::min<int64_t>(src->second.width,int64_t(x)+output.width);
+        const int64_t bottom=std::min<int64_t>(src->second.height,int64_t(y)+output.height);
+        bool raw_gpu=false;
+        if(destination!=source && left<right && top<bottom &&
+                exact_pixels_worthwhile(uint32_t(right-left),uint32_t(bottom-top),bool(output.pixels.gpu_storage()))) {
+            const uint64_t source_offset=uint64_t(top)*src->second.stride+uint64_t(left)*bytes_per_pixel;
+            const uint64_t destination_offset=uint64_t(top-y)*output.stride+uint64_t(left-x)*output.bytes_per_pixel;
+            if(source_offset<=UINT32_MAX && destination_offset<=UINT32_MAX)
+                raw_gpu=compose_host_exact_pixel_buffers({
+                    {{},uint32_t(destination_offset),output.stride,uint32_t(right-left),uint32_t(bottom-top),
+                        output.format,output.bytes_per_pixel},
+                    {{},uint32_t(source_offset),src->second.stride,uint32_t(right-left),uint32_t(bottom-top),
+                        src->second.format,src->second.bytes_per_pixel},{},ExactPixelOperation::RawCopy},
+                    output.pixels,&src->second.pixels,nullptr,true);
+        }
         for (uint32_t target_y = 0; target_y < output.height;
              ++target_y) {
             const int64_t source_y =
@@ -17223,7 +17384,7 @@ public:
                         output.stride +
                     static_cast<std::size_t>(target_x) *
                         output.bytes_per_pixel;
-                for (uint32_t byte = 0; byte < bytes_per_pixel;
+                if(!raw_gpu) for (uint32_t byte = 0; byte < bytes_per_pixel;
                      ++byte) {
                     output.pixels[destination_offset + byte] =
                         src->second.pixels[source_offset + byte];

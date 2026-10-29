@@ -1,5 +1,6 @@
 #include "bgiplayer/vm.hpp"
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 
 namespace bgiplayer {
 // Original 00485C10 -> 00408E50 -> 0040B3D0; format kernels
@@ -13,6 +14,22 @@ void VM::set_surface_command(uint32_t type, uint32_t value) {
     GraphicsSurface& target = surface->second;
     const std::size_t size =
         static_cast<std::size_t>(target.stride) * target.height;
+    if(target.format<=3U && target.bytes_per_pixel &&
+            uint64_t(target.width)*target.bytes_per_pixel==target.stride) {
+        uint32_t packed=value;
+        if(target.format==0U)packed=((value>>9U)&0x7C00U)|((value>>6U)&0x03E0U)|((value>>3U)&31U);
+        else if(target.format==1U)packed&=0xFFFFFFU;
+        else if(target.format==3U)packed&=255U;
+        ExactPixelPixels fill{{{},0,target.stride,target.width,target.height,target.format,target.bytes_per_pixel},
+            {},{},ExactPixelOperation::Fill};
+        fill.parameters[0]=packed;fill.destination_bytes=size;
+        if(auto result=compose_host_resident_exact_pixels(fill)) {
+            target.pixels.replace_gpu_storage(std::move(result));
+            if(target.format==1U || target.format==2U)refresh_bgra_mirror(target);
+            else target.rgba.assign(static_cast<size_t>(target.width)*target.height*4U,0);
+            display_dirty_=true;return;
+        }
+    }
     if(target.format==1U || target.format==2U) {
         if(auto native=store_host_filled_pixels(size,target.format==1U?value&0xFFFFFFU:value)) {
             if(auto mirror=bgra_presentation_storage(native,static_cast<size_t>(target.width)*target.height,target.format==1U)) {
