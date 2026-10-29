@@ -2,6 +2,7 @@
 // reference; EGL and packed SSBO words replace Metal's byte-addressed buffers.
 #ifdef __ANDROID__
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include "bgiplayer/debug.hpp"
 #include "bgiplayer/rcpss_estimate_table.hpp"
 #include "bgiplayer/sprite_scaled_alpha.hpp"
@@ -313,13 +314,20 @@ struct GlesDevice {
 namespace {
 class GlesPixelStorage final : public GpuPixelStorage {
 public:
- GlesPixelStorage(std::shared_ptr<GlesDevice> device,GLuint buffer,size_t bytes)
-     :device_(std::move(device)),buffer_(buffer),bytes_(bytes){}
+ GlesPixelStorage(std::shared_ptr<GlesDevice> device,GLuint buffer,size_t bytes,bool owns=true,std::shared_ptr<GpuPixelStorage> imported={})
+     :device_(std::move(device)),buffer_(buffer),bytes_(bytes),owns_(owns),imported_(std::move(imported)){}
  ~GlesPixelStorage() override {
+  if(!owns_)return;
   std::lock_guard lock(device_->mutex);RestoreContext restore;
   if(eglMakeCurrent(device_->display,device_->surface,device_->surface,device_->context))glDeleteBuffers(1,&buffer_);
  }
  size_t size()const override{return bytes_;}
+ const void* native_handle(std::string_view kind)const override {
+  if(kind=="gles-buffer")return reinterpret_cast<const void*>(uintptr_t(buffer_));
+  if(kind=="gles-context")return device_->context;
+  if(kind=="gles-display")return device_->display;
+  return nullptr;
+ }
  bool compatible(const std::shared_ptr<GlesDevice>& device)const{return device_.get()==device.get();}
  GLuint buffer()const{return buffer_;}
  bool read(std::span<uint8_t> output)const override {
@@ -338,7 +346,15 @@ private:
  std::shared_ptr<GlesDevice> device_;
  GLuint buffer_=0;
  size_t bytes_=0;
+ bool owns_=true;std::shared_ptr<GpuPixelStorage> imported_;
 };
+std::shared_ptr<GlesPixelStorage> gles_storage(const std::shared_ptr<GpuPixelStorage>& owner,const std::shared_ptr<GlesDevice>& device) {
+ if(auto native=std::dynamic_pointer_cast<GlesPixelStorage>(owner))return native;
+ if(!owner || owner->native_handle("gles-context")!=device->context || owner->native_handle("gles-display")!=device->display)return {};
+ const auto value=reinterpret_cast<uintptr_t>(owner->native_handle("gles-buffer"));
+ if(!value || value>UINT32_MAX)return {};
+ return std::make_shared<GlesPixelStorage>(device,static_cast<GLuint>(value),owner->size(),false,owner);
+}
 }
 struct GpuPixelKernels::Impl {std::shared_ptr<GlesDevice> device=std::make_shared<GlesDevice>();};
 GpuPixelKernels::GpuPixelKernels(bool enabled):impl_(std::make_unique<Impl>()){
@@ -374,6 +390,11 @@ std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const u
 GpuPixelKernels::~GpuPixelKernels()=default;
 bool GpuPixelKernels::available()const{return impl_->device->program!=0;}
 std::string GpuPixelKernels::device_name()const{return impl_->device->name;}
+NativePixelContext GpuPixelKernels::native_context()const {
+ if(!available())return {};
+ auto d=impl_->device;
+ return {d->display,d->context,d->surface,&d->mutex,d};
+}
 PixelKernelResult GpuPixelKernels::scaled_alpha(const ScaledAlphaPixels& p){
  auto fallback=[&](){return PixelKernelResult{compose_scaled_alpha_bgra(p.destination,p.destination_width,p.destination_height,p.destination_stride,p.source,p.source_width,p.source_height,p.source_stride,p.x_q16,p.y_q16,p.origin_x_q16,p.origin_y_q16,p.scale_x_q16,p.scale_y_q16,p.parameter,p.filtered),false};};
  if(!available()||p.scale_x_q16<=32768||p.scale_y_q16<=32768||p.parameter>256||p.source_width>32767||p.source_height>32767||p.destination_width>32767||p.destination_height>32767||p.destination_stride<uint64_t(p.destination_width)*4||p.source_stride<uint64_t(p.source_width)*4||p.destination_stride%4||p.source_stride%4||p.source_stride>32764||p.destination.size()<uint64_t(p.destination_stride)*p.destination_height||p.source.size()<uint64_t(p.source_stride)*p.source_height||overlap(p.destination,p.source))return fallback();
@@ -389,13 +410,13 @@ PixelKernelResult GpuPixelKernels::crossfade(const CrossfadePixels& p){
  std::vector<uint32_t>a(64);a[0]=1;a[1]=w;a[2]=h;a[3]=p.destination.stride;a[4]=p.first.stride;a[5]=p.second.stride;a[6]=p.destination.byte_offset;a[7]=p.first.byte_offset;a[8]=p.second.byte_offset;a[10]=p.opacity;a[11]=uint32_t(p.mix);auto r=impl_->device->dispatch(p.destination.pixels,p.first.pixels,p.second.pixels,a,true);return r.success?r:fallback();
 }
 PixelKernelResult GpuPixelKernels::affine(const AffinePixels& p){
- auto storage=std::dynamic_pointer_cast<GlesPixelStorage>(p.source_storage);
+ auto storage=gles_storage(p.source_storage,impl_->device);
  if(p.source_storage&&(!storage||!storage->compatible(impl_->device)||!p.source.empty()))return {};
  if(!available()||!p.destination_width||!p.destination_height||!p.source_width||!p.source_height||p.parameter>256||p.destination_width>32767||p.destination_height>32767||p.source_width>32767||p.source_height>32767||p.destination_stride<uint64_t(p.destination_width)*4||p.source_stride<uint64_t(p.source_width)*4||p.destination_stride%4||p.source_stride%4||p.destination.size()<uint64_t(p.destination_stride)*p.destination_height||(storage?storage->size():p.source.size())<uint64_t(p.source_stride)*p.source_height||(!storage&&overlap(p.destination,p.source)))return {};
  std::vector<uint32_t>a(64);a[0]=2;a[1]=p.destination_width;a[2]=p.destination_height;a[3]=p.destination_stride;a[4]=p.source_stride;a[10]=p.parameter;for(unsigned i=0;i<6;++i)a[16+i]=uint32_t(p.matrix[i]);a[24]=a[20];a[25]=a[21];a[20]=p.source_width;a[21]=p.source_height;a[22]=p.filtered;a[23]=p.blend_alpha;return impl_->device->dispatch(p.destination,p.source,{},a,false,true,storage?storage->buffer():0);
 }
 PixelKernelResult GpuPixelKernels::layer_composite(const LayerCompositePixels& p){
- auto storage=std::dynamic_pointer_cast<GlesPixelStorage>(p.source_storage);
+ auto storage=gles_storage(p.source_storage,impl_->device);
  if(p.source_storage&&(!storage||!storage->compatible(impl_->device)||!p.source.pixels.empty()))return {};
  if(!available()||!valid(p.destination)||!valid(p.source,4,storage?storage->size():0)||p.source.format!=2||(p.destination.format!=1&&p.destination.format!=2)||p.destination.width!=p.source.width||p.destination.height!=p.source.height||p.reciprocal_corrections.size()!=65536||(!storage&&overlap(p.destination.pixels,p.source.pixels)))return {};
  std::vector<uint32_t>a(64);a[0]=3;a[1]=p.destination.width;a[2]=p.destination.height;a[3]=p.destination.stride;a[4]=p.source.stride;a[6]=p.destination.byte_offset;a[7]=p.source.byte_offset;a[9]=p.destination.format;return impl_->device->dispatch(p.destination.pixels,p.source.pixels,p.reciprocal_corrections,a,true,false,storage?storage->buffer():0);
@@ -422,7 +443,7 @@ PixelKernelResult GpuPixelKernels::layer_composite_batch(std::span<const LayerCo
  if(!available()||!valid_layer_composite_batch(layers))return result;
  auto device=impl_->device;
  std::vector<std::shared_ptr<GlesPixelStorage>> sources;sources.reserve(layers.size());
- for(const auto& p:layers){auto source=std::dynamic_pointer_cast<GlesPixelStorage>(p.source_storage);if(!source||!source->compatible(device))return result;sources.push_back(std::move(source));}
+ for(const auto& p:layers){auto source=gles_storage(p.source_storage,device);if(!source||!source->compatible(device))return result;sources.push_back(std::move(source));}
  std::lock_guard lock(device->mutex);RestoreContext restore;
  if(!eglMakeCurrent(device->display,device->surface,device->surface,device->context))return result;
  const bool timing=debug_enabled();auto start=timing?Clock::now():Clock::time_point{};
@@ -510,7 +531,7 @@ PixelKernelResult GpuPixelKernels::background_mask(const BackgroundMaskPixels& p
  std::vector<uint32_t>a(320);a[0]=4;a[1]=p.right-p.left;a[2]=p.bottom-p.top;a[3]=p.destination.stride;a[4]=p.source.stride;a[5]=p.mask.stride;a[6]=p.destination.byte_offset;a[7]=p.source.byte_offset;a[8]=p.mask.byte_offset;a[26]=p.left;a[27]=p.top;a[28]=p.source_top;a[29]=p.mask_left;a[30]=p.mask_top;a[31]=p.source_left;a[32]=p.shift;for(unsigned i=0;i<256;++i)a[64+i]=uint32_t(p.factors[i]);return impl_->device->dispatch(p.destination.pixels,p.source.pixels,p.mask.pixels,a);
 }
 PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels& p){
- auto storage=std::dynamic_pointer_cast<GlesPixelStorage>(p.source_storage);
+ auto storage=gles_storage(p.source_storage,impl_->device);
  if(p.source_storage&&(!storage||!storage->compatible(impl_->device)||!p.source.pixels.empty()))return {};
  if(!available()||!valid_pixel_transfer(p)||p.destination.byte_offset%4||p.destination.stride%4)return {};
  const auto op=static_cast<uint32_t>(p.operation);if(op!=3&&op!=5&&(p.source.byte_offset%4||p.source.stride%4))return {};

@@ -436,6 +436,11 @@ public:
         device([d retain]),queue([q retain]),buffer([b retain]) {}
     ~MetalPixelStorage() override {[buffer release];[queue release];[device release];}
     size_t size() const override {return [buffer length];}
+    const void* native_handle(std::string_view kind) const override {
+        if(kind=="metal-buffer")return static_cast<const void*>(buffer);
+        if(kind=="metal-queue")return static_cast<const void*>(queue);
+        return nullptr;
+    }
     bool fast_ranges() const override {return [buffer storageMode]==MTLStorageModeShared;}
     bool read_range(size_t offset,std::span<uint8_t> out) const override {
         if(offset>size() || out.size()>size()-offset)return false;
@@ -469,7 +474,15 @@ public:
 namespace {
 std::shared_ptr<MetalPixelStorage> metal_storage(const std::shared_ptr<GpuPixelStorage>& value) {
     if(auto stored=std::dynamic_pointer_cast<MetalPixelStorage>(value))return stored;
-    return value?std::dynamic_pointer_cast<MetalPixelStorage>(value->concrete_storage()):nullptr;
+    if(value) {
+        if(const void* native=value->native_handle("metal-buffer")) {
+            auto buffer=(id<MTLBuffer>)native;
+            auto queue=(id<MTLCommandQueue>)value->native_handle("metal-queue");
+            if(buffer && queue && queue.device==buffer.device && [buffer length]>=value->size())return std::make_shared<MetalPixelStorage>(buffer.device,queue,buffer);
+        }
+        return std::dynamic_pointer_cast<MetalPixelStorage>(value->concrete_storage());
+    }
+    return nullptr;
 }
 }
 struct GpuPixelKernels::Impl {

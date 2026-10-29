@@ -1,4 +1,5 @@
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include "bgiplayer/debug.hpp"
 #include "bgiplayer/sprite_scaled_alpha.hpp"
 #include "bgiplayer/sprite_crossfade.hpp"
@@ -104,6 +105,13 @@ PixelKernelResult compose_host_scaled_alpha(const ScaledAlphaPixels& p) {
 PixelKernelResult compose_host_sprite_crossfade(const CrossfadePixels& p) {
     const uint64_t pixels=uint64_t(std::min(p.first.width,p.second.width))*std::min(p.first.height,p.second.height);
     return record("crossfade",backend(choose_gpu(pixels,512U*512U)).crossfade(p),pixels);
+}
+NativePixelContext host_native_pixel_context() {
+#if defined(__ANDROID__)
+    return backend(true).native_context();
+#else
+    return {};
+#endif
 }
 HostPixelKernelStatistics host_pixel_kernel_statistics() { return state().statistics; }
 PixelKernelResult compose_host_fast_affine(const AffinePixels& p) {

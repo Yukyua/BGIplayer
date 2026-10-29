@@ -10,6 +10,7 @@
 #include <string>
 
 namespace bgiplayer {
+struct NativePixelContext;
 struct ScaledAlphaPixels {
     std::span<uint8_t> destination;
     uint32_t destination_width, destination_height, destination_stride;
@@ -109,6 +110,9 @@ public:
     GpuPixelKernels& operator=(const GpuPixelKernels&) = delete;
     [[nodiscard]] bool available() const;
     [[nodiscard]] std::string device_name() const;
+#if defined(__ANDROID__)
+    NativePixelContext native_context() const;
+#endif
     PixelKernelResult scaled_alpha(const ScaledAlphaPixels& pixels);
     PixelKernelResult crossfade(const CrossfadePixels& pixels);
     PixelKernelResult affine(const AffinePixels& pixels);

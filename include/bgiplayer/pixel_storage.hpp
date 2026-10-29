@@ -5,12 +5,14 @@
 #include <memory>
 #include <span>
 #include <vector>
+#include <string_view>
 namespace bgiplayer {
 // Immutable host GPU allocation. It owns no decoded CPU pixel mirror.
 class GpuPixelStorage {
 public:
     virtual ~GpuPixelStorage()=default;
     [[nodiscard]] virtual size_t size() const=0;
+    virtual const void* native_handle(std::string_view) const { return nullptr; }
     [[nodiscard]] virtual size_t resident_bytes() const { return size(); }
     virtual bool read(std::span<uint8_t> destination) const=0;
     virtual bool fast_ranges() const { return false; }
