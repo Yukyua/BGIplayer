@@ -3,6 +3,7 @@
 #include "bgiplayer/render_policy.hpp"
 #include "bgiplayer/resource_integrity.hpp"
 #include "bgiplayer/media_source.hpp"
+#include "bgiplayer/bitmap_resource_memo.hpp"
 #include "bgiplayer/pixel_buffer.hpp"
 
 #include "bgiplayer/window_policy.hpp"
@@ -6553,17 +6554,68 @@ public:
     }
     bool load_bitmap_resource(uint32_t type, std::string archive,
                               std::string resource) {
+        const bool profile=debug_trace(DebugTrace::GpuFrames);
+        const auto start=profile?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         std::vector<uint8_t> data = read_resource(archive, resource);
-        return load_bitmap_resource_data(
+        const auto read_end=profile?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const auto hits=profile?bitmap_resource_memo_statistics().hits:0;
+        const auto bytes=data.size();
+        const bool result=load_bitmap_resource_data(
             type, std::move(archive), std::move(resource), std::move(data));
+        if(profile)trace_bitmap_resource_preparation(type,bytes,bitmap_resource_memo_statistics().hits>hits,result,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(read_end-start).count()),
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-read_end).count()));
+        return result;
     }
     bool load_bitmap_resource_data(
         uint32_t type, std::string archive, std::string resource,
         std::vector<uint8_t> data) {
-        if (data.size() >= 15U &&
-            std::string_view(
-                reinterpret_cast<const char*>(data.data()), 15U).starts_with(
-                "CompressedBG_")) {
+        const bool compressed = data.size() >= 15U &&
+            std::string_view(reinterpret_cast<const char*>(data.data()), 15U)
+                .starts_with("CompressedBG_");
+        std::optional<BitmapResourceMemoKey> memo_key;
+        std::optional<BitmapResourceMemoValue> memo_hit;
+        const bool memo_enabled=bitmap_resource_memo_enabled();
+        if(!memo_enabled)clear_bitmap_resource_memo();
+        if (memo_enabled && (compressed || data.size() >= 65536U)) {
+            try {
+                memo_key=bitmap_resource_memo_key(data,compact_64_opcodes_);
+                memo_hit=find_bitmap_resource_memo(*memo_key);
+            } catch(const std::exception&) {
+                // Host memo allocation failure must not turn a loadable
+                // original resource into a failed bitmap-manager install.
+                memo_key.reset();
+            }
+        }
+        if(memo_hit) {
+            GraphicsSurface surface;
+            surface.width=memo_hit->width; surface.height=memo_hit->height;
+            surface.format=memo_hit->format; surface.bytes_per_pixel=memo_hit->bytes_per_pixel;
+            surface.stride=memo_hit->stride;
+            surface.encoded=std::move(memo_hit->encoded);
+            surface.pixels=std::move(memo_hit->pixels);
+            surface.rgba=std::move(memo_hit->rgba);
+            surface.archive=std::move(archive); surface.resource=std::move(resource);
+            // The immutable host bytes are shared; each VM load still
+            // allocates/reuses its own manager token in the original order.
+            install_allocated_graphics_surface(type,std::move(surface));
+            if(compressed)display_dirty_=true;
+            return true;
+        }
+        const auto remember = [&memo_key](GraphicsSurface& surface) {
+            if(!memo_key)return;
+            BitmapResourceMemoValue memo;
+            memo.width=surface.width; memo.height=surface.height;
+            memo.format=surface.format; memo.bytes_per_pixel=surface.bytes_per_pixel;
+            memo.stride=surface.stride;
+            memo.encoded=std::move(surface.encoded);
+            memo.pixels=std::move(surface.pixels); memo.rgba=std::move(surface.rgba);
+            try {store_bitmap_resource_memo(*memo_key,memo);}
+            catch(const std::exception&) {} // optional host acceleration
+            surface.encoded=std::move(memo.encoded);
+            surface.pixels=std::move(memo.pixels); surface.rgba=std::move(memo.rgba);
+        };
+        if (compressed) {
             std::string decode_error;
             auto decoded = decode_compressed_bg(data, &decode_error, archive + ":" + resource);
             if (!decoded || decoded->width == 0 ||
@@ -6606,6 +6658,7 @@ public:
             surface.archive = std::move(archive);
             surface.resource = std::move(resource);
             refresh_bgra_mirror(surface);
+            remember(surface);
             install_allocated_graphics_surface(type, std::move(surface));
             display_dirty_ = true;
             return true;
@@ -6645,6 +6698,7 @@ public:
                             surface.encoded).subspan(16, pixel_bytes));
                 }
             }
+            remember(surface);
             install_allocated_graphics_surface(type, std::move(surface));
             return true;
         }

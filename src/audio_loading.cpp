@@ -2,6 +2,7 @@
 #include "bgiplayer/audio_decode_controls.hpp"
 #include "bgiplayer/debug.hpp"
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 namespace bgiplayer {
 SoundSubsystem::LoadResult load_audio_for_host(const SoundSubsystem::LoadRequest& request,
@@ -39,6 +40,26 @@ SoundSubsystem::LoadResult load_audio_for_host(const SoundSubsystem::LoadRequest
             << " resource=" << request.primary << " encoded_bytes=" << encoded->size()
             << " cached_bgm=1\n";
         return {0,0,0};
+    }
+    const char* streaming = std::getenv("BGI_AUDIO_STREAMING");
+    const bool stream_enabled = !streaming || std::string_view(streaming) != "0";
+    if (bgm && stream_enabled) {
+        // Host output preparation only. The original operand/order/channel state
+        // remains synchronous; a validated PCM prefix is ready before success.
+        auto progressive = ProgressiveAudio::open(*encoded);
+        if (progressive) {
+            const auto decode_end = profile ? Clock::now() : Clock::time_point{};
+            if (!backend.load_progressive_bgm(request.channel, std::move(progressive),
+                    request.playback_rate, *encoded)) return failure(0x0EU, "progressive backend");
+            if (profile) std::cerr << "AUDIO_LOAD_COST cache_hit=0 progressive=1 encoded_bytes=" << encoded->size()
+                << " read_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(read_end-start).count()
+                << " decode_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(decode_end-read_end).count()
+                << " backend_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-decode_end).count() << '\n';
+            if (trace) std::cout << "SND_LOAD_RESULT status=0 source=" << request.secondary
+                << " resource=" << request.primary << " encoded_bytes=" << encoded->size()
+                << " progressive=1\n";
+            return {0,0,0};
+        }
     }
     AudioDecodeControls controls{request.sample_gain,request.fade_in_ms,pe64};
     auto decoded = decode_audio(*encoded,nullptr,bgm?nullptr:&controls);

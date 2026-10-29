@@ -1,4 +1,5 @@
 #include "bgiplayer/compressed_bg_mt.hpp"
+#include "bgiplayer/host_resource_jobs.hpp"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -15,7 +16,8 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_mt(std::span<const uin
   const uint32_t channels=bits/8,internal=bits==8?1:4,count=(h-1)/stripe+1;
   if(uint64_t(count)*4+48>b.size())fail("MT stripe table");
   CompressedBgV2Decoded out{w,h,bits,bits==8?3U:bits==24?7U:2U,std::vector<uint8_t>(size_t(w)*h*internal)};
-  for(uint32_t s=0;s<count;++s){
+  prepare_resource_parts(count,size_t(w)*h,[&](size_t index){
+   const auto s=static_cast<uint32_t>(index);
    const size_t begin=dword(48+size_t(s)*4),end=s+1<count?dword(52+size_t(s)*4):b.size();
    if(begin<48+size_t(count)*4||end<begin||end>b.size()||end-begin<4)fail("MT stripe bounds");
    size_t p=begin;
@@ -36,7 +38,7 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_mt(std::span<const uin
    // Original allocates raw+1 bytes; only raw prediction bytes are consumed.
    if(residual.size()<raw)fail("MT residual size");
    for(uint32_t y=0;y<rows;++y)for(uint32_t x=0;x<w;++x)for(uint32_t c=0;c<channels;++c){size_t q=(size_t(s*stripe+y)*w+x)*internal+c;unsigned predict=0;if(y&&x)predict=(unsigned(out.pixels[q-w*internal])+out.pixels[q-internal])/2;else if(y)predict=out.pixels[q-w*internal];else if(x)predict=out.pixels[q-internal];out.pixels[q]=uint8_t(residual[(size_t(y)*w+x)*channels+c]+predict);}
-  }
+  });
   return out;
  }catch(const std::exception& e){if(error)*error=e.what();return std::nullopt;}
 }

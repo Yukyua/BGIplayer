@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <iostream>
 
 #include "audio_backend/playback/shared.cpp"
 #include "audio_backend/playback/shared_2.cpp"

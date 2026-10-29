@@ -8,7 +8,17 @@ void SdlAudioBackend::sync(
     const SoundSubsystem& sound, int32_t master_level) {
     const double master_gain =
         SoundSubsystem::master_gain(master_level);
-    std::scoped_lock lock(mutex_);
+    std::shared_ptr<ProgressiveAudio> retired_cache;
+    std::unique_lock lock(mutex_);
+    constexpr size_t cache_limit = 64U * 1024U * 1024U;
+    if (cached_bgm_progressive_ &&
+        (cached_bgm_encoded_.capacity() > cache_limit ||
+         cached_bgm_progressive_->retained_bytes() >
+             cache_limit - cached_bgm_encoded_.capacity())) {
+        retired_cache = std::move(cached_bgm_progressive_);
+        std::vector<uint8_t>().swap(cached_bgm_encoded_);
+        cached_bgm_sample_rate_ = cached_bgm_channels_ = 0;
+    }
     for (uint32_t channel = 0; channel < bgm_tracks_.size();
          ++channel) {
         Track& slot = bgm_tracks_[channel];
@@ -17,7 +27,7 @@ void SdlAudioBackend::sync(
             slot.active = false;
             continue;
         }
-        if (slot.clip) {
+        if (slot.clip || slot.progressive) {
             const bool paused = state.control_value != 0;
             if (slot.paused && !paused) {
                 slot.position = static_cast<double>(
@@ -26,6 +36,14 @@ void SdlAudioBackend::sync(
             }
             slot.paused = paused;
             slot.active = !paused;
+        }
+        if (slot.progressive && slot.progressive->failed()) {
+            slot.active = false;
+            if (!slot.progressive_failure_reported && slot.progressive->complete()) {
+                std::cerr << "warning: AUDIO_STREAM_DECODE_FAILED channel=" << channel
+                          << " reason=" << slot.progressive->error_text() << '\n';
+                slot.progressive_failure_reported = true;
+            }
         }
         const uint32_t full_level =
             state.full_fade.active ? state.full_fade.current

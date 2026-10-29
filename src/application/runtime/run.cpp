@@ -2447,6 +2447,15 @@ int run(const Options& options) {
             ? &movie_playback : nullptr,
         &last_presented_primary, &movie_texture, &logical_primary, &display_texture);
     const auto save_screenshot = [&]() {
+        const char* canvas=std::getenv("BGI_SCREENSHOT_CANVAS");
+        if(canvas && std::string_view(canvas)!="0") {
+            // Explicit diagnostic readback of the actual GPU-composed canvas.
+            // It remains usable when the OS withholds a window drawable.
+            const auto frame=vm.display_frame_snapshot();
+            if(!frame)throw Error("cannot capture composed engine canvas");
+            save_rgba_bmp(*options.screenshot,frame->width,frame->height,frame->rgba);
+            return;
+        }
         int width = 0;
         int height = 0;
         if (SDL_GetRendererOutputSize(

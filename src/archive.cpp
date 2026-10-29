@@ -6,6 +6,7 @@
 
 #include "bgiplayer/common.hpp"
 #include "bgiplayer/dsc.hpp"
+#include "bgiplayer/resource_decode_memo.hpp"
 
 #include <algorithm>
 #include <array>

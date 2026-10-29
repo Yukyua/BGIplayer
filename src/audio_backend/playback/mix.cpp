@@ -12,14 +12,20 @@ void SdlAudioBackend::mix(int16_t* stream, int length) {
                 static_cast<int16_t>(0));
     std::scoped_lock lock(mutex_);
     const auto mix_track = [&](Track& slot) {
-        if (!slot.active || !slot.clip) {
+        if (!slot.active || (!slot.clip && !slot.progressive)) {
             return;
         }
-        const auto& samples = slot.clip->samples;
-        const double frame_count =
-            static_cast<double>(samples.size() / kChannels);
+        const auto* samples = slot.clip ? &slot.clip->samples : nullptr;
+        const auto* progressive = slot.progressive.get();
+        const bool ended = !progressive || progressive->complete();
+        const double frame_count = static_cast<double>(progressive
+            ? progressive->available_frames() : samples->size() / kChannels);
+        if (frame_count == 0 || (progressive && progressive->failed())) return;
         for (int frame = 0; frame < frames; ++frame) {
             if (slot.position >= frame_count) {
+                // A prefix is never an EOF or a loop boundary. Keep position
+                // on an underrun; do not decode, allocate or wait in callback.
+                if (!ended) break;
                 if (slot.bgm) {
                     slot.position = std::fmod(
                         slot.position, frame_count);
@@ -32,10 +38,14 @@ void SdlAudioBackend::mix(int16_t* stream, int length) {
             }
             const auto source =
                 static_cast<std::size_t>(slot.position) * kChannels;
-            const int32_t left = static_cast<int32_t>(
-                samples[source] * slot.left_gain);
-            const int32_t right = static_cast<int32_t>(
-                samples[source + 1U] * slot.right_gain);
+            int16_t input_left, input_right;
+            if (progressive) {
+                if (!progressive->sample(static_cast<uint64_t>(slot.position), input_left, input_right)) break;
+            } else {
+                input_left = (*samples)[source]; input_right = (*samples)[source + 1U];
+            }
+            const int32_t left = static_cast<int32_t>(input_left * slot.left_gain);
+            const int32_t right = static_cast<int32_t>(input_right * slot.right_gain);
             const int32_t mixed_left =
                 static_cast<int32_t>(stream[frame * 2]) + left;
             const int32_t mixed_right =

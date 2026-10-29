@@ -9,11 +9,14 @@ void SdlAudioBackend::stop(bool bgm, uint32_t channel) {
         (!bgm && channel >= effect_tracks_.size())) {
         return;
     }
-    std::scoped_lock lock(mutex_);
+    std::shared_ptr<ProgressiveAudio> retired;
+    std::unique_lock lock(mutex_);
     Track& slot = track(bgm, channel);
+    retired = std::move(slot.progressive);
     slot.active = false;
     slot.clip.reset();
     slot.position = 0.0;
     slot.paused = false;
+    lock.unlock();
 }
 }  // namespace bgiplayer

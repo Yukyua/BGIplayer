@@ -11,9 +11,18 @@ void SdlAudioBackend::shutdown() {
         device_id_ = 0;
     }
     initialized_ = false;
-    std::scoped_lock lock(mutex_);
-    cached_bgm_clip_.reset();
-    std::vector<uint8_t>().swap(cached_bgm_encoded_);
-    cached_bgm_sample_rate_ = cached_bgm_channels_ = 0;
+    // Worker cancellation/join must never run under the callback's mutex.
+    std::array<std::shared_ptr<ProgressiveAudio>, 17> retired;
+    {
+        std::scoped_lock lock(mutex_);
+        for (size_t i = 0; i < bgm_tracks_.size(); ++i) {
+            retired[i] = std::move(bgm_tracks_[i].progressive);
+            bgm_tracks_[i].active = false;
+        }
+        retired.back() = std::move(cached_bgm_progressive_);
+        cached_bgm_clip_.reset();
+        std::vector<uint8_t>().swap(cached_bgm_encoded_);
+        cached_bgm_sample_rate_ = cached_bgm_channels_ = 0;
+    }
 }
 }  // namespace bgiplayer

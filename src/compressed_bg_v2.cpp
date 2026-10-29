@@ -1,6 +1,7 @@
 #include "bgiplayer/compressed_bg_v2.hpp"
 #include "bgiplayer/bmv_idct.hpp"
 #include "bgiplayer/validation.hpp"
+#include "bgiplayer/host_resource_jobs.hpp"
 
 #include <algorithm>
 #include <array>
@@ -234,7 +235,8 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
         result.pixels.resize(static_cast<std::size_t>(width) * height * bytes_per_pixel);
         const std::size_t flags_size = (blocks_x + 7U) / 8U;
         const std::size_t block_count = static_cast<std::size_t>(blocks_x) * 3U;
-        for (uint32_t stripe = 0; stripe < stripes; ++stripe) {
+        prepare_resource_parts(stripes,static_cast<size_t>(width)*height,[&](size_t stripe_index) {
+            const auto stripe=static_cast<uint32_t>(stripe_index);
             const uint64_t start64 = static_cast<uint64_t>(data_base) + offsets[stripe];
             const uint64_t end64 = stripe + 1U == offsets.size()
                 ? encoded.size() : static_cast<uint64_t>(data_base) + offsets[stripe+1U];
@@ -290,7 +292,7 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
                     }
                 }
             }
-        }
+        });
         if (bits_per_pixel == 32U) {
             const uint64_t alpha_start = static_cast<uint64_t>(data_base) + offsets.back();
             if (alpha_start < cursor || alpha_start > encoded.size())

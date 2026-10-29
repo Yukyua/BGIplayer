@@ -19,6 +19,7 @@ bool SdlAudioBackend::load(
         audio.samples.capacity() > (cache_limit - bgm_encoded.size()) / sizeof(int16_t))
         audio.samples.shrink_to_fit();
     auto clip = std::make_shared<const DecodedAudio>(std::move(audio));
+    std::shared_ptr<ProgressiveAudio> retired_cache;
     if (bgm) {
         constexpr std::size_t limit = cache_limit;
         bool cacheable = !bgm_encoded.empty() &&
@@ -32,6 +33,7 @@ bool SdlAudioBackend::load(
             std::vector<uint8_t>().swap(encoded);
         }
         std::scoped_lock lock(mutex_);
+        retired_cache = std::move(cached_bgm_progressive_);
         cached_bgm_encoded_ = std::move(encoded);
         cached_bgm_clip_ = cacheable ? clip : nullptr;
         cached_bgm_sample_rate_ = cacheable ? DecodedAudio::kSampleRate : 0;
@@ -44,16 +46,24 @@ bool SdlAudioBackend::reload_cached_bgm(
     uint32_t channel, std::span<const uint8_t> encoded,
     double playback_rate) {
     std::shared_ptr<const DecodedAudio> clip;
+    std::shared_ptr<ProgressiveAudio> progressive;
     {
         std::scoped_lock lock(mutex_);
-        if (!cached_bgm_clip_ ||
+        constexpr size_t limit = 64U * 1024U * 1024U;
+        if (cached_bgm_progressive_ &&
+            (cached_bgm_encoded_.capacity() > limit ||
+             cached_bgm_progressive_->retained_bytes() >
+                 limit - cached_bgm_encoded_.capacity())) return false;
+        if ((!cached_bgm_clip_ && !cached_bgm_progressive_) ||
             cached_bgm_sample_rate_ != DecodedAudio::kSampleRate ||
             cached_bgm_channels_ != DecodedAudio::kChannels ||
             encoded.size() != cached_bgm_encoded_.size() ||
             !std::equal(encoded.begin(), encoded.end(), cached_bgm_encoded_.begin()))
             return false;
         clip = cached_bgm_clip_;
+        progressive = cached_bgm_progressive_;
     }
+    if (progressive) return load_progressive_bgm(channel, std::move(progressive), playback_rate, encoded);
     return load_shared(true, channel, std::move(clip), playback_rate);
 }
 
@@ -63,9 +73,11 @@ bool SdlAudioBackend::load_shared(
     if (!available() || !clip || clip->samples.empty() || playback_rate <= 0.0 ||
         (bgm && channel >= bgm_tracks_.size()) ||
         (!bgm && channel >= effect_tracks_.size())) return false;
+    std::shared_ptr<ProgressiveAudio> retired;
     {
         std::scoped_lock lock(mutex_);
         Track& slot = track(bgm, channel);
+        retired = std::move(slot.progressive);
         slot.clip = std::move(clip);
         slot.position = 0.0;
         slot.playback_rate = playback_rate;
@@ -79,5 +91,73 @@ bool SdlAudioBackend::load_shared(
         SDL_UnlockAudioDevice(device_id_);
     }
     return true;
+}
+bool SdlAudioBackend::load_progressive_bgm(uint32_t channel,
+    std::shared_ptr<ProgressiveAudio> audio, double playback_rate,
+    std::span<const uint8_t> encoded) {
+    if (!available() || channel >= bgm_tracks_.size() || !audio ||
+        audio->failed() || !audio->available_frames() ||
+        !std::isfinite(playback_rate) || playback_rate <= 0) return false;
+    constexpr size_t limit = 64U * 1024U * 1024U;
+    std::vector<uint8_t> identity;
+    if (encoded.size() <= limit) identity.assign(encoded.begin(), encoded.end());
+    std::shared_ptr<ProgressiveAudio> retired_slot, retired_cache;
+    {
+        std::scoped_lock lock(mutex_);
+        auto& slot = bgm_tracks_[channel];
+        retired_slot = std::move(slot.progressive);
+        slot.clip.reset(); slot.progressive = audio;
+        slot.position = 0; slot.playback_rate = playback_rate;
+        slot.observed_effect_generation = 0;
+        slot.active = true; slot.bgm = true; slot.paused = false;
+        slot.progressive_failure_reported = false;
+        retired_cache = std::move(cached_bgm_progressive_);
+        cached_bgm_clip_.reset();
+        cached_bgm_encoded_ = std::move(identity);
+        cached_bgm_progressive_ = cached_bgm_encoded_.empty() ? nullptr : std::move(audio);
+        cached_bgm_sample_rate_ = DecodedAudio::kSampleRate;
+        cached_bgm_channels_ = DecodedAudio::kChannels;
+    }
+    return true;
+}
+bool SdlAudioBackend::prepare_snapshot() {
+    std::array<std::shared_ptr<ProgressiveAudio>, 16> pending;
+    {
+        std::scoped_lock lock(mutex_);
+        for (size_t i = 0; i < pending.size(); ++i) pending[i] = bgm_tracks_[i].progressive;
+    }
+    for (size_t i = 0; i < pending.size(); ++i) {
+        if (!pending[i]) continue;
+        auto clip = pending[i]->completed_clip();
+        if (!clip) return false;
+        std::scoped_lock lock(mutex_);
+        if (bgm_tracks_[i].progressive == pending[i]) {
+            bgm_tracks_[i].clip = clip;
+            bgm_tracks_[i].progressive.reset();
+        }
+        if (cached_bgm_progressive_ == pending[i]) {
+            constexpr size_t limit = 64U * 1024U * 1024U;
+            if (cached_bgm_encoded_.capacity() <= limit &&
+                clip->samples.capacity() <= (limit-cached_bgm_encoded_.capacity()) / sizeof(int16_t))
+                cached_bgm_clip_ = std::move(clip);
+            else {
+                cached_bgm_clip_.reset();
+                std::vector<uint8_t>().swap(cached_bgm_encoded_);
+                cached_bgm_sample_rate_ = cached_bgm_channels_ = 0;
+            }
+            cached_bgm_progressive_.reset();
+        }
+    }
+    return true;
+}
+void SdlAudioBackend::retire_progressive_tracks() {
+    std::array<std::shared_ptr<ProgressiveAudio>, 16> retired;
+    {
+        std::scoped_lock lock(mutex_);
+        for (size_t i = 0; i < retired.size(); ++i) {
+            retired[i] = std::move(bgm_tracks_[i].progressive);
+            if (retired[i]) bgm_tracks_[i].active = false;
+        }
+    }
 }
 }  // namespace bgiplayer

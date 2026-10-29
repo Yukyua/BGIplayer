@@ -11,7 +11,7 @@ std::vector<uint8_t> Archive::read(const ArchiveEntry& entry) const {
     }
     auto payload = read_raw(entry);
     if (is_dsc(payload)) {
-        return dsc_decode(payload);
+        return decode_archive_resource(payload);
     }
     return payload;
 }

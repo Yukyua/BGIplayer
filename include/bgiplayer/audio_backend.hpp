@@ -13,6 +13,7 @@ namespace bgiplayer {
 
 class SdlAudioBackend {
     friend struct SnapshotCodec;
+    friend struct AudioBackendTestAccess;
 public:
     SdlAudioBackend();
     ~SdlAudioBackend();
@@ -28,6 +29,10 @@ public:
               double playback_rate, std::span<const uint8_t> bgm_encoded = {});
     bool reload_cached_bgm(uint32_t channel, std::span<const uint8_t> encoded,
                            double playback_rate);
+    bool load_progressive_bgm(uint32_t channel, std::shared_ptr<ProgressiveAudio> audio,
+                              double playback_rate, std::span<const uint8_t> encoded);
+    // Explicit debug snapshot boundary. Drains workers before the audio mutex.
+    bool prepare_snapshot();
     void stop(bool bgm, uint32_t channel);
     bool trigger_effect(uint32_t channel);
     bool play_oneshot(DecodedAudio audio);
@@ -48,6 +53,8 @@ public:
 private:
     struct Track {
         std::shared_ptr<const DecodedAudio> clip;
+        std::shared_ptr<ProgressiveAudio> progressive;
+        bool progressive_failure_reported = false;
         double position = 0.0;
         uint64_t observed_effect_generation = 0;
         double playback_rate = 1.0;
@@ -58,6 +65,7 @@ private:
         bool paused = false;
     };
 
+    void retire_progressive_tracks();
     void mix(int16_t* stream, int length);
     static void audio_callback(void* userdata, uint8_t* stream,
                                int length);
@@ -78,6 +86,7 @@ private:
     // One immutable host-side decode result; never part of VM save state.
     std::vector<uint8_t> cached_bgm_encoded_;
     std::shared_ptr<const DecodedAudio> cached_bgm_clip_;
+    std::shared_ptr<ProgressiveAudio> cached_bgm_progressive_;
     uint32_t cached_bgm_sample_rate_ = 0;
     uint32_t cached_bgm_channels_ = 0;
 };

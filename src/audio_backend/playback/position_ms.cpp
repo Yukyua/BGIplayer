@@ -12,7 +12,7 @@ uint32_t SdlAudioBackend::position_ms(
     }
     std::scoped_lock lock(mutex_);
     const Track& slot = track(bgm, channel);
-    if (!slot.clip) {
+    if (!slot.clip && !slot.progressive) {
         return 0;
     }
     return static_cast<uint32_t>(

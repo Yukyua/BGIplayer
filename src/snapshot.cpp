@@ -183,6 +183,7 @@ struct SnapshotCodec {
             if(!w->event.wait_for(locks.back(),std::chrono::seconds(2),[&w]{return w->state==0;}))
                 throw Error("snapshot D0 worker did not reach a checkpoint");
         }
+        if(audio && !audio->prepare_snapshot())throw Error("cannot checkpoint failed audio stream");
         std::unique_lock<std::mutex> audio_lock;
         if(audio)audio_lock=std::unique_lock<std::mutex>(audio->mutex_);
         const uint64_t clock=monotonic_ms();
@@ -237,7 +238,10 @@ struct SnapshotCodec {
         for(auto& [id,mutex]:vm.named_mutexes_){(void)id;if(vm.named_mutex_hooks_.close)vm.named_mutex_hooks_.close(mutex.handle);}
         transfer(vm,candidate);
         vm.display_frame_gpu_cached_=false;
-        if(has_audio) {std::scoped_lock audio_lock(audio->mutex_);transfer(*audio,candidate_audio);}
+        if(has_audio) {
+            audio->retire_progressive_tracks();
+            std::scoped_lock audio_lock(audio->mutex_);transfer(*audio,candidate_audio);
+        }
         // IPL registers aliases in both the VM and its host ArchiveSet. A
         // new process retains the registrar closure, but starts with an empty
         // host alias table; uncached reads must work before any thread resumes.

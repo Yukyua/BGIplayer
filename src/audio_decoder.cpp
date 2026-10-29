@@ -282,15 +282,16 @@ std::optional<std::vector<uint8_t>> decode_wavebox_hfadpcm8(
 
 }  // namespace
 
-std::optional<DecodedAudio> decode_audio(
+static std::optional<DecodedAudio> decode_audio_impl(
     std::span<const uint8_t> encoded, std::string* error,
-    const AudioDecodeControls* controls) {
+    const AudioDecodeControls* controls, const AudioPcmSink* sink) {
+    bool cancelled = false;
     const auto fail =
-        [error, encoded](std::string_view reason) -> std::optional<DecodedAudio> {
+        [error, encoded, &cancelled](std::string_view reason) -> std::optional<DecodedAudio> {
         if (error != nullptr) {
-            *error = std::string(reason);
+            *error = cancelled ? "incremental sink cancelled" : std::string(reason);
         }
-        warn_decode_failure("audio", reason, encoded);
+        if (!cancelled) warn_decode_failure("audio", reason, encoded);
         return std::nullopt;
     };
     if (encoded.empty()) {
@@ -402,7 +403,7 @@ std::optional<DecodedAudio> decode_audio(
         std::copy_n("data", 4, wav.begin() + 36);
         write_u32_le(wav, 40, data_size);
         std::copy(pcm.begin(), pcm.end(), wav.begin() + 44);
-        return decode_audio(wav, error, controls);
+        return decode_audio_impl(wav, error, controls, sink);
     }
     MemoryReader reader{encoded};
     constexpr int kIoBufferSize = 32768;
@@ -495,6 +496,23 @@ std::optional<DecodedAudio> decode_audio(
         return fail("frame allocation");
     }
     DecodedAudio output;
+    bool emitted = false;
+    size_t published_prefix = 0;
+    size_t published_alignment = 0;
+    const auto publish = [&]() -> bool {
+        if (!sink || output.samples.size() == published_prefix) return true;
+        emitted = true;
+        const auto pcm = std::span<const int16_t>(output.samples).subspan(published_prefix);
+        if (!(*sink)(pcm)) { cancelled = true; return false; }
+        // swresample selects scalar/SIMD conversion by destination alignment.
+        // A full decode appends at the cumulative PCM offset. Preserve that
+        // address residue when reusing bounded scratch, rather than forcing
+        // every new packet to a newly aligned beginning (which changes rounding).
+        published_alignment = (published_alignment + pcm.size()) % 16U;
+        output.samples.resize(published_alignment);
+        published_prefix = published_alignment;
+        return true;
+    };
     const auto consume_frames = [&]() -> bool {
         while (true) {
             result = avcodec_receive_frame(
@@ -530,6 +548,7 @@ std::optional<DecodedAudio> decode_audio(
                 static_cast<std::size_t>(converted) *
                     output_channels);
             av_frame_unref(frame.get());
+            if (!publish()) return false;
         }
     };
     while (av_read_frame(format.get(), packet.get()) >= 0) {
@@ -572,7 +591,8 @@ std::optional<DecodedAudio> decode_audio(
             static_cast<std::size_t>(converted) *
                 output_channels);
     }
-    if (output.samples.empty()) return fail("empty pcm");
+    if (!publish()) return fail("incremental sink cancelled");
+    if (output.samples.empty() && !emitted) return fail("empty pcm");
     if (transform_pcm) {
         try {
             apply_audio_decode_controls(output.samples, output_rate, output_channels, *controls);
@@ -613,4 +633,13 @@ std::optional<DecodedAudio> decode_audio(
     return output;
 }
 
+std::optional<DecodedAudio> decode_audio(std::span<const uint8_t> encoded,
+    std::string* error, const AudioDecodeControls* controls) {
+    return decode_audio_impl(encoded, error, controls, nullptr);
+}
+bool decode_audio_incremental(std::span<const uint8_t> encoded,
+    const AudioPcmSink& sink, std::string* error) {
+    if (!sink) return false;
+    return decode_audio_impl(encoded, error, nullptr, &sink).has_value();
+}
 }  // namespace bgiplayer
