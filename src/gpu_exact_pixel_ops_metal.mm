@@ -1,5 +1,6 @@
 #ifdef __APPLE__
 #include "bgiplayer/gpu_exact_pixel_ops.hpp"
+#include "bgiplayer/gpu_raw_patches.hpp"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <chrono>
@@ -103,6 +104,59 @@ PixelKernelResult execute(const ExactPixelPixels& p) {
     std::vector<uint8_t> output(result->size());if(!result->read(output))return {};
     std::copy(output.begin(),output.end(),p.destination.pixels.begin());
     return {true,true,static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count())};
+}
+}
+namespace bgiplayer::raw_patch_detail {
+std::shared_ptr<GpuPixelStorage> execute(const std::shared_ptr<GpuPixelStorage>& base,
+        std::span<const GpuRawPatch> patches) {
+    if(!valid_gpu_raw_patches(base,patches))return {};
+    @autoreleasepool {
+        auto& state=exact_pixel_detail::state();if(!state.pipeline)return {};
+        // Batch callers have already collected a concrete base. Never invoke
+        // concrete_storage()/read() here, which would flatten each input chain.
+        const auto native=[&](const std::shared_ptr<GpuPixelStorage>& owner)->id<MTLBuffer> {
+            auto buffer=(id<MTLBuffer>)owner->native_handle("metal-buffer");
+            auto queue=(id<MTLCommandQueue>)owner->native_handle("metal-queue");
+            if(!buffer || !queue || buffer.device!=state.device || queue.device!=state.device ||
+                    [buffer length]<owner->size())return nil;
+            return buffer;
+        };
+        const auto initial=native(base);if(!initial)return {};
+        std::vector<id<MTLBuffer>> sources;sources.reserve(patches.size());
+        for(const auto& patch:patches) {auto buffer=native(patch.pixels);if(!buffer)return {};sources.push_back(buffer);}
+        id<MTLBuffer> output=[state.device newBufferWithLength:base->size() options:MTLResourceStorageModeShared];
+        if(!output)return {};
+        id<MTLCommandBuffer> command=[state.queue commandBuffer];
+        id<MTLBlitCommandEncoder> copy=[command blitCommandEncoder];
+        if(!command || !copy){[output release];return {};}
+        [copy copyFromBuffer:initial sourceOffset:0 toBuffer:output destinationOffset:0 size:base->size()];
+        [copy endEncoding];
+        bool good=true;
+        for(size_t n=0;n<patches.size();++n) {
+            const auto& p=patches[n];
+            const ExactPixelPixels descriptor{
+                {{},uint32_t(p.offset),uint32_t(p.stride),uint32_t(p.row_bytes),uint32_t(p.rows),3,1},
+                {{},0,uint32_t(p.row_bytes),uint32_t(p.row_bytes),uint32_t(p.rows),3,1},
+                {},ExactPixelOperation::RawCopy};
+            const auto args=exact_pixel_detail::arguments(descriptor);
+            // Separate tracked encoders serialize overlapping destination
+            // writes while retaining one command submission and one wait.
+            id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+            if(!encoder){good=false;break;}
+            [encoder setComputePipelineState:state.pipeline];[encoder setBuffer:output offset:0 atIndex:0];
+            [encoder setBuffer:sources[n] offset:0 atIndex:1];[encoder setBuffer:sources[n] offset:0 atIndex:2];
+            [encoder setBytes:args.data() length:sizeof(args) atIndex:3];
+            [encoder dispatchThreads:MTLSizeMake(p.row_bytes,p.rows,1) threadsPerThreadgroup:MTLSizeMake(16,8,1)];
+            [encoder endEncoding];
+        }
+        std::shared_ptr<GpuPixelStorage> result;
+        if(good) {
+            [command commit];[command waitUntilCompleted];
+            if(command.status==MTLCommandBufferStatusCompleted)
+                result=std::make_shared<exact_pixel_detail::ExactMetalStorage>(output,state.queue,base->size());
+        }
+        [output release];return result;
+    }
 }
 }
 #endif

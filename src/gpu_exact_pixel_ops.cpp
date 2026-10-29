@@ -15,6 +15,11 @@ bool selected(const ExactPixelPixels& p) {
     const bool forced=mode && std::strcmp(mode,"1")==0;
     if(!forced && p.operation==ExactPixelOperation::VmBlit && p.parameters[0]==65)return false;
     if(!forced && p.operation==ExactPixelOperation::RawCopy && !p.destination_storage && !p.source_storage)return false;
+    // A resident raw patch otherwise reads and uploads the full allocation.
+    // Select by that real copy cost even when the changed rectangle is tiny.
+    if(p.operation==ExactPixelOperation::RawCopy && p.destination_storage && p.destination.bytes_per_pixel)
+        return exact_pixels_worthwhile(static_cast<uint32_t>(std::min<size_t>(UINT32_MAX,
+            p.destination_storage->size()/p.destination.bytes_per_pixel)),1,true);
     return exact_pixels_worthwhile(p.destination.width,p.destination.height,bool(p.destination_storage));
 }
 }
@@ -30,7 +35,7 @@ bool valid_exact_pixels(const ExactPixelPixels& p) {
     const auto op=p.operation;
     if((p.source_storage&&!a.pixels.empty()) || (p.second_storage&&!b.pixels.empty()) ||
        (p.destination_storage&&!d.pixels.empty()&&d.pixels.size()!=p.destination_storage->size()))return false;
-    const bool allocation=op==ExactPixelOperation::Fill && p.destination_bytes && d.pixels.empty() && !p.destination_storage;
+    const bool allocation=(op==ExactPixelOperation::Fill || op==ExactPixelOperation::RawCopy) && p.destination_bytes && d.pixels.empty() && !p.destination_storage;
     if(p.destination_bytes && (!allocation || p.destination_bytes>UINT32_MAX))return false;
     if((!allocation && !view_valid(d,p.destination_storage,true)) ||
             !view_valid(a,p.source_storage,false) || !view_valid(b,p.second_storage,false))return false;

@@ -6,6 +6,7 @@
 #include "bgiplayer/sprite_terminal_blend.hpp"
 #include "bgiplayer/background_transform.hpp"
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/pixel_region.hpp"
 
 #include <array>
 #include <cstdlib>
@@ -220,7 +221,20 @@ bool VM::compose_single_bitmap_sprite_at(uint32_t destination, uint32_t handle,
         // Failed/exact-policy admission falls through to the existing sampler
         // and materializes a const CPU view only if that path needs it.
         bool resident_affine=false;
-        if(!terminal_add_sub && angle==0 && sx>0x8000U && sy>0x8000U &&
+        if(!retain_cpu_pixel_copies() && !terminal_add_sub && angle==0 && sx>0x8000U && sy>0x8000U &&
+                source.stride<=32764U && out.stride<=2147483647U &&
+                out.pixels.offload() && source.pixels.offload()) {
+            const auto matrix=inverse_sprite_affine_q16(
+                position_q16(x,0x2F4U,0x2BCU),position_q16(y,0x2F8U,0x2C0U),origin_x,origin_y,0,sx,sy);
+            if(matrix) {
+                if(auto result=compose_host_resident_affine({{},out.width,out.height,out.stride,
+                        {},source.width,source.height,source.stride,*matrix,parameter,
+                        object_raw_field(handle,0x298U)!=0U,true,source.pixels.gpu_storage()},out.pixels.gpu_storage())) {
+                    out.pixels.replace_gpu_storage(std::move(result));resident_affine=true;
+                }
+            }
+        }
+        if(!resident_affine && !terminal_add_sub && angle==0 && sx>0x8000U && sy>0x8000U &&
                 source.stride<=32764U && out.stride<=2147483647U && source.pixels.gpu_storage()) {
             const auto matrix=inverse_sprite_affine_q16(
                 position_q16(x,0x2F4U,0x2BCU),position_q16(y,0x2F8U,0x2C0U),origin_x,origin_y,0,sx,sy);
@@ -476,8 +490,13 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
     const auto original_owner=target->second.pixels.gpu_storage();
     const bool local_resident=!retain_cpu_pixel_copies() && original_owner && original_owner->fast_ranges();
     if(full_view) {
-        if(!retain_cpu_pixel_copies())(void)target->second.pixels.offload();
+        // A covering background frequently replaces a fresh CPU allocation.
+        // Do not upload that old canvas solely to discard it in RawCopy/Fill.
+        if(!retain_cpu_pixel_copies() && callback.display_object!=main_background_handle)
+            (void)target->second.pixels.offload();
         view.pixels=target->second.pixels;
+    } else if(auto cropped=local_resident?crop_host_pixel_storage(original_owner,base,target_stride,view.stride,height):nullptr) {
+        view.pixels.replace_gpu_storage(std::move(cropped));
     } else {
         view.pixels.resize(static_cast<std::size_t>(view.stride)*height);
         auto* destination=view.pixels.data();
@@ -664,6 +683,7 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
             const auto duration=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-callback_start).count();
             std::cout<<"GPU_CALLBACK_COST object="<<callback.display_object<<" width="<<width<<" height="<<height
                 <<" total_ns="<<duration<<" success="<<composed;
+            if(callback.display_object==main_background_handle)std::cout<<" background_kind="<<background_type_;
             if(const auto effect=effector_effects_.find(callback.display_object);effect!=effector_effects_.end())
                 std::cout<<" effector_kind="<<effect->second.mode<<" effector_selector="<<effect->second.mode_value
                     <<" effect_level="<<object_effect_level(callback.display_object);

@@ -47,6 +47,8 @@ bool VM::compose_effector_at(uint32_t destination,uint32_t handle,uint32_t left,
     // 5BD91..5BDA8 runs before dispatch/status validation, including zero or
     // out-of-range strength and missing/stale map tokens. Preserve this input
     // snapshot for subsequent temporal callbacks, and for single-axis blur.
+    if(state.mode==1 && !retain_cpu_pixel_copies() && out.width==width && out.height==height)
+        (void)out.pixels.offload();
     if(state.mode!=4) {
         if(out.width==width&&out.height==height&&out.stride==cache.stride)cache.pixels=out.pixels;
         else for(uint32_t y=0;y<out.height;++y)
@@ -55,8 +57,24 @@ bool VM::compose_effector_at(uint32_t destination,uint32_t handle,uint32_t left,
     }
     const bool trace_cost=debug_trace(DebugTrace::GpuFrames);
     const auto kernel_start=trace_cost?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    // The immutable input is also the history snapshot. Keep it on the GPU
+    // until a CPU fallback actually requests pixels.
+    if(state.mode==1 && weight>0 && weight<=256 && state.mode_value<=5 &&
+            out.width==width && out.height==height && !retain_cpu_pixel_copies() &&
+            out.pixels.gpu_storage() && cache.pixels.gpu_storage()) {
+        EffectorBlurPixels request{{{},0,out.stride,width,height,out.format,4},
+            {{},0,cache.stride,width,height,cache.format,4},weight,state.mode_value,
+            cache.pixels.gpu_storage()};
+        if(auto result=compose_host_resident_effector_blur(request,out.pixels.gpu_storage())) {
+            out.pixels.replace_gpu_storage(std::move(result));cache.rgba.clear();refresh_bgra_mirror(out);
+            if(trace_cost)std::cout<<"GPU_EFFECTOR_KERNEL_COST object="<<handle<<" mode="<<state.mode
+                <<" total_ns="<<std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-kernel_start).count()<<'\n';
+            return true;
+        }
+    }
     const GlyphBitmapView view{out.pixels,0,out.stride,out.width,out.height,out.format,4};
-    GlyphBitmapView input{cache.pixels,0,cache.stride,width,height,cache.format,4};
+    const auto& cached_pixels=std::as_const(cache.pixels);
+    GlyphBitmapView input{{const_cast<uint8_t*>(cached_pixels.data()),cached_pixels.size()},0,cache.stride,width,height,cache.format,4};
     if(state.mode==1) {
         // 4B1A0 ignores the dirty rectangle. A cropped input descriptor does
         // not match cache dimensions, and the ignored status leaves pixels.

@@ -67,7 +67,10 @@ struct EffectorBlurPixels {
     GlyphBitmapView destination, source;
     uint32_t radius;
     uint32_t selector=5;
+    std::shared_ptr<GpuPixelStorage> source_storage{};
 };
+bool valid_resident_effector_blur(const EffectorBlurPixels& pixels,const std::shared_ptr<GpuPixelStorage>& destination);
+bool valid_resident_affine(const AffinePixels& pixels,const std::shared_ptr<GpuPixelStorage>& destination);
 bool valid_effector_blur(const EffectorBlurPixels& pixels);
 struct EffectorDisplacementPixels {
     GlyphBitmapView destination,source,first;
@@ -116,6 +119,11 @@ public:
     PixelKernelResult scaled_alpha(const ScaledAlphaPixels& pixels);
     PixelKernelResult crossfade(const CrossfadePixels& pixels);
     PixelKernelResult affine(const AffinePixels& pixels);
+    // Immutable resident results; source/destination CPU spans must be empty.
+    std::shared_ptr<GpuPixelStorage> resident_affine(const AffinePixels& pixels,
+        std::shared_ptr<GpuPixelStorage> destination);
+    std::shared_ptr<GpuPixelStorage> resident_effector_blur(const EffectorBlurPixels& pixels,
+        std::shared_ptr<GpuPixelStorage> destination);
     PixelKernelResult layer_composite(const LayerCompositePixels& pixels);
     // Ordered, immutable resident layers sharing one destination allocation.
     // Failure never publishes a partial result to CPU destination storage.
@@ -147,6 +155,10 @@ PixelKernelResult compose_host_sprite_crossfade(const CrossfadePixels& pixels);
 // Returns unsuccessful without modifying the target when exact mode, small
 // inputs, unavailable hardware or an unsupported pixel view selects CPU fallback.
 PixelKernelResult compose_host_fast_affine(const AffinePixels& pixels);
+std::shared_ptr<GpuPixelStorage> compose_host_resident_affine(const AffinePixels& pixels,
+    std::shared_ptr<GpuPixelStorage> destination);
+std::shared_ptr<GpuPixelStorage> compose_host_resident_effector_blur(const EffectorBlurPixels& pixels,
+    std::shared_ptr<GpuPixelStorage> destination);
 // Fast-policy dispatch, but integer mask results retain exact CPU byte values.
 PixelKernelResult compose_host_fast_background_mask(const BackgroundMaskPixels& pixels);
 PixelKernelResult compose_host_layer_composite(const LayerCompositePixels& pixels);

@@ -3,6 +3,8 @@
 // Subsystem: render
 // Complete definition: render_vm
 
+#include "bgiplayer/gpu_pixel_cache.hpp"
+
 namespace bgiplayer {
 namespace {
 bool prepare_vm_display_frame_with_movie(
@@ -258,6 +260,7 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
             cost_end - cost_start).count();
         const auto cost_after = host_pixel_kernel_statistics();
         const auto bitmap_bytes=vm.bitmap_pixel_storage_bytes();
+        const auto memo=gpu_pixel_cache_statistics();
         std::cout << "GPU_FRAME_COST tick=" << SDL_GetTicks()
                   << " retained_cpu_pixels=" << vm.retained_display_frame_cpu_bytes()
                   << " bitmap_cpu_bytes=" << bitmap_bytes[0]
@@ -267,6 +270,8 @@ void render_vm(SDL_Renderer* renderer, VM& vm,
                   << " upload_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(present_start-compose_end).count()
                   << " present_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(present_end-present_start).count()
                   << " eviction_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(cost_end-present_end).count()
+                  << " memo_entries=" << memo.entries << " memo_bytes=" << memo.bytes
+                  << " memo_hits=" << memo.hits << " memo_misses=" << memo.misses
                   << " kernel_calls=" << cost_after.calls - cost_before.calls
                   << " gpu_dispatches=" << cost_after.gpu_dispatches - cost_before.gpu_dispatches
                   << " cpu_calls=" << cost_after.cpu_calls - cost_before.cpu_calls << '\n';

@@ -1,5 +1,7 @@
 #include "bgiplayer/gpu_pixel_kernels.hpp"
 #include "bgiplayer/gpu_exact_pixel_ops.hpp"
+#include "bgiplayer/gpu_pixel_cache.hpp"
+#include "bgiplayer/layer_composite.hpp"
 #include "bgiplayer/debug.hpp"
 #include "bgiplayer/sprite_scaled_alpha.hpp"
 #include "bgiplayer/sprite_crossfade.hpp"
@@ -12,6 +14,8 @@
 #if !defined(__APPLE__) && !defined(__ANDROID__)
 namespace bgiplayer {
 struct GpuPixelKernels::Impl {};
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_affine(const AffinePixels&,std::shared_ptr<GpuPixelStorage>) { return {}; }
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_effector_blur(const EffectorBlurPixels&,std::shared_ptr<GpuPixelStorage>) { return {}; }
 std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const uint8_t>) { return {}; }
 PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels&) { return {}; }
 PixelKernelResult GpuPixelKernels::effector_blur(const EffectorBlurPixels&) { return {}; }
@@ -168,27 +172,77 @@ std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_layer(const LayerComp
 std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_layers(std::span<const LayerCompositePixels>,std::shared_ptr<GpuPixelStorage>) { return {}; }
 std::shared_ptr<GpuPixelStorage> GpuPixelKernels::filled_pixels(size_t,uint32_t) { return {}; }
 #endif
+namespace {
+std::array<uint64_t,12> resident_view_arguments(const GlyphBitmapView& d,const GlyphBitmapView& s) {
+    return {d.byte_offset,d.stride,d.width,d.height,d.format,d.bytes_per_pixel,
+        s.byte_offset,s.stride,s.width,s.height,s.format,s.bytes_per_pixel};
+}
+bool cacheable_resident_views(const GlyphBitmapView& d,const GlyphBitmapView& s,
+        const std::shared_ptr<GpuPixelStorage>& destination,const std::shared_ptr<GpuPixelStorage>& source) {
+    const auto valid=[](const GlyphBitmapView& v,size_t bytes) {
+        return v.pixels.empty() && v.width && v.height && v.bytes_per_pixel==4 &&
+            (v.format==1 || v.format==2) && bytes<=UINT32_MAX && v.stride>=uint64_t(v.width)*4 &&
+            uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=bytes;
+    };
+    return destination && source && valid(d,destination->size()) && valid(s,source->size()) &&
+        d.width==s.width && d.height==s.height;
+}
+bool original_corrections(std::span<const uint8_t> values) {
+    const auto original=original_layer_reciprocal_corrections();
+    return values.size()==original.size() && values.data()==original.data();
+}
+}
 std::shared_ptr<GpuPixelStorage> compose_host_resident_transfer(const PixelTransferPixels& p,std::shared_ptr<GpuPixelStorage> destination) {
     if(!destination || !choose_gpu(destination->size()/4,65536))return {};
+    const bool memo=cacheable_resident_views(p.destination,p.source,destination,p.source_storage) && p.parameter<=256;
+    const std::array inputs{p.source_storage,destination};
+    const auto views=resident_view_arguments(p.destination,p.source);
+    std::array<uint64_t,15> arguments{};std::copy(views.begin(),views.end(),arguments.begin());
+    arguments[12]=static_cast<uint32_t>(p.operation);arguments[13]=p.parameter;arguments[14]=p.color;
+    if(memo)if(auto cached=find_gpu_pixel_cache("resident_transfer/v1",inputs,arguments))return cached;
     const auto start=debug_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     auto result=backend(true).resident_transfer(p,std::move(destination));
     if(result && result!=p.source_storage)record("resident_transfer",{true,true,debug_enabled()?static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count()):0},
         uint64_t(p.destination.width)*p.destination.height);
+    if(memo && result)store_gpu_pixel_cache("resident_transfer/v1",inputs,arguments,result);
     return result;
 }
 std::shared_ptr<GpuPixelStorage> compose_host_resident_layer(const LayerCompositePixels& p,std::shared_ptr<GpuPixelStorage> destination) {
     if(!destination || !choose_gpu(destination->size()/4,65536))return {};
+    const bool memo=cacheable_resident_views(p.destination,p.source,destination,p.source_storage) &&
+        p.source.format==2 && original_corrections(p.reciprocal_corrections);
+    const std::array inputs{p.source_storage,destination};
+    const auto arguments=resident_view_arguments(p.destination,p.source);
+    if(memo)if(auto cached=find_gpu_pixel_cache("resident_layer/original-rcp/v1",inputs,arguments))return cached;
     const auto start=debug_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     auto result=backend(true).resident_layer(p,std::move(destination));
     if(result)record("resident_layer",{true,true,debug_enabled()?static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count()):0},
         uint64_t(p.destination.width)*p.destination.height);
+    if(memo && result)store_gpu_pixel_cache("resident_layer/original-rcp/v1",inputs,arguments,result);
     return result;
 }
 
 std::shared_ptr<GpuPixelStorage> compose_host_resident_layers(std::span<const LayerCompositePixels> layers,std::shared_ptr<GpuPixelStorage> destination) {
-    if(!destination || !choose_gpu(destination->size()/4,65536))return {};
+    // The ordinary ordered-layer batch is already admitted at any area.
+    // Keep its resident equivalent on GPU rather than read back small windows.
+    if(!destination || !choose_gpu(0,0))return {};
+    bool memo=layers.size()>=2 && layers.size()<=256;
+    std::vector<std::shared_ptr<GpuPixelStorage>> inputs;
+    std::vector<uint64_t> arguments;
+    if(memo) {
+        inputs.reserve(layers.size()+1);inputs.push_back(destination);
+        arguments.reserve(layers.size()*12+1);arguments.push_back(layers.size());
+        for(const auto& layer:layers) {
+            if(!cacheable_resident_views(layer.destination,layer.source,destination,layer.source_storage) ||
+                    layer.source.format!=2 || !original_corrections(layer.reciprocal_corrections)){memo=false;break;}
+            inputs.push_back(layer.source_storage);
+            const auto views=resident_view_arguments(layer.destination,layer.source);
+            arguments.insert(arguments.end(),views.begin(),views.end());
+        }
+    }
+    if(memo)if(auto cached=find_gpu_pixel_cache("resident_layers/original-rcp/v1",inputs,arguments))return cached;
     const auto start=debug_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     auto result=backend(true).resident_layers(layers,std::move(destination));
     if(result) {
@@ -196,11 +250,16 @@ std::shared_ptr<GpuPixelStorage> compose_host_resident_layers(std::span<const La
         record("resident_layers",{true,true,debug_enabled()?static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count()):0},pixels);
     }
+    if(memo && result)store_gpu_pixel_cache("resident_layers/original-rcp/v1",inputs,arguments,result);
     return result;
 }
 std::shared_ptr<GpuPixelStorage> store_host_filled_pixels(size_t bytes,uint32_t value) {
     if(retain_cpu_pixel_copies() || !choose_gpu(bytes/4,65536))return {};
-    return backend(true).filled_pixels(bytes,value);
+    const std::array<uint64_t,2> arguments{bytes,value};
+    if(auto cached=find_gpu_pixel_cache("filled_pixels/v1",{},arguments))return cached;
+    auto result=backend(true).filled_pixels(bytes,value);
+    if(result)store_gpu_pixel_cache("filled_pixels/v1",{},arguments,result);
+    return result;
 }
 
 bool valid_pixel_transfer(const PixelTransferPixels& p) {
@@ -242,13 +301,75 @@ std::vector<std::shared_ptr<GpuPixelStorage>> store_host_pixel_storage_batch(std
     return backend(true).store_pixels_batch(pixels);
 }
 
+bool valid_resident_affine(const AffinePixels& p,const std::shared_ptr<GpuPixelStorage>& destination) {
+    const auto valid=[](size_t bytes,uint32_t width,uint32_t height,uint32_t stride) {
+        return width && height && width<=32767 && height<=32767 && stride%4==0 &&
+            stride>=uint64_t(width)*4 && bytes<=UINT32_MAX && uint64_t(stride)*height<=bytes;
+    };
+    return destination && p.source_storage && p.destination.empty() && p.source.empty() && p.parameter<=256 &&
+        valid(destination->size(),p.destination_width,p.destination_height,p.destination_stride) &&
+        valid(p.source_storage->size(),p.source_width,p.source_height,p.source_stride);
+}
+bool valid_resident_effector_blur(const EffectorBlurPixels& p,const std::shared_ptr<GpuPixelStorage>& destination) {
+    const auto valid=[](const GlyphBitmapView& v,size_t bytes) {
+        return v.pixels.empty() && (v.format==1 || v.format==2) && v.bytes_per_pixel==4 &&
+            v.width && v.height && bytes<=UINT32_MAX && v.stride>=uint64_t(v.width)*4 &&
+            uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=bytes;
+    };
+    return destination && p.source_storage && p.radius<=256 && p.selector<=5 &&
+        p.destination.width==p.source.width && p.destination.height==p.source.height &&
+        p.destination.format==p.source.format && valid(p.destination,destination->size()) &&
+        valid(p.source,p.source_storage->size());
+}
+std::shared_ptr<GpuPixelStorage> compose_host_resident_affine(const AffinePixels& p,std::shared_ptr<GpuPixelStorage> destination) {
+    const uint64_t pixels=uint64_t(p.destination_width)*p.destination_height;
+    if(!fast_rendering_enabled() || !choose_gpu(pixels,p.filtered?256U*256U:512U*512U) ||
+            !valid_resident_affine(p,destination))return {};
+    const std::array inputs{p.source_storage,destination};
+    const std::array<uint64_t,15> arguments{p.destination_width,p.destination_height,p.destination_stride,
+        p.source_width,p.source_height,p.source_stride,uint32_t(p.matrix[0]),uint32_t(p.matrix[1]),
+        uint32_t(p.matrix[2]),uint32_t(p.matrix[3]),uint32_t(p.matrix[4]),uint32_t(p.matrix[5]),
+        p.parameter,p.filtered,p.blend_alpha};
+    if(auto cached=find_gpu_pixel_cache("resident_affine/v1",inputs,arguments))return cached;
+    const auto start=debug_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    auto result=backend(true).resident_affine(p,std::move(destination));
+    if(result)record("resident_affine",{true,true,debug_enabled()?static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count()):0,0,0,0,true},pixels);
+    if(result)store_gpu_pixel_cache("resident_affine/v1",inputs,arguments,result);
+    return result;
+}
+std::shared_ptr<GpuPixelStorage> compose_host_resident_effector_blur(const EffectorBlurPixels& p,std::shared_ptr<GpuPixelStorage> destination) {
+    const uint64_t pixels=uint64_t(p.destination.width)*p.destination.height;
+    if(!choose_gpu(pixels,256U*256U) || !valid_resident_effector_blur(p,destination))return {};
+    const bool complete=p.destination.byte_offset==0 &&
+        p.destination.stride==uint64_t(p.destination.width)*4 &&
+        destination->size()==uint64_t(p.destination.stride)*p.destination.height;
+    const std::array owners{p.source_storage,destination};
+    // In the complete same-owner case the source key also validates the
+    // destination owner. Other views retain destination identity, including
+    // complete views with an unrelated (potentially unsupported) owner.
+    const auto inputs=std::span<const std::shared_ptr<GpuPixelStorage>>(owners).first(
+        complete && destination==p.source_storage?1U:2U);
+    const std::array<uint64_t,14> arguments{p.destination.byte_offset,p.destination.stride,
+        p.destination.width,p.destination.height,p.destination.format,p.destination.bytes_per_pixel,
+        p.source.byte_offset,p.source.stride,p.source.width,p.source.height,p.source.format,p.source.bytes_per_pixel,
+        p.radius,p.selector};
+    if(auto cached=find_gpu_pixel_cache("resident_effector_blur/v1",inputs,arguments))return cached;
+    const auto previous=destination;
+    const auto start=debug_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    auto result=backend(true).resident_effector_blur(p,std::move(destination));
+    if(result && result!=previous)record("resident_effector_blur",{true,true,debug_enabled()?static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count()):0},pixels);
+    if(result && result!=previous)store_gpu_pixel_cache("resident_effector_blur/v1",inputs,arguments,result);
+    return result;
+}
 bool valid_effector_blur(const EffectorBlurPixels& p) {
     const auto valid=[](const GlyphBitmapView& v) {
         return (v.format==1 || v.format==2) && v.bytes_per_pixel==4 && v.width && v.height &&
             v.pixels.size()<=UINT32_MAX && v.stride>=uint64_t(v.width)*4 &&
             uint64_t(v.byte_offset)+uint64_t(v.height-1)*v.stride+uint64_t(v.width)*4<=v.pixels.size();
     };
-    return valid(p.destination) && valid(p.source) && p.destination.format==p.source.format &&
+    return !p.source_storage && valid(p.destination) && valid(p.source) && p.destination.format==p.source.format &&
         p.destination.width==p.source.width && p.destination.height==p.source.height && p.radius<=256 && p.selector<=5;
 }
 PixelKernelResult compose_host_effector_blur(const EffectorBlurPixels& p) {

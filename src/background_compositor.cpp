@@ -64,7 +64,7 @@ bool VM::compose_main_background_at(uint32_t destination,
             output.format,output.bytes_per_pixel},{},{},operation};
         pixels.destination_storage=output.pixels.gpu_storage();
         pixels.parameters[0]=color;
-        if(operation==ExactPixelOperation::Fill && output.stride==uint64_t(output.width)*output.bytes_per_pixel &&
+        if((operation==ExactPixelOperation::Fill || operation==ExactPixelOperation::RawCopy) && output.stride==uint64_t(output.width)*output.bytes_per_pixel &&
                 output.pixels.size()==uint64_t(output.stride)*output.height) {
             pixels.destination.pixels={};pixels.destination_storage={};
             pixels.destination_bytes=output.pixels.size();

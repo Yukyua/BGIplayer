@@ -1,9 +1,11 @@
 #ifdef __ANDROID__
 #include "bgiplayer/gpu_exact_pixel_ops.hpp"
+#include "bgiplayer/gpu_raw_patches.hpp"
 #include <EGL/egl.h>
 #include <GLES3/gl31.h>
 #include <cstring>
 #include <iostream>
+#include <limits>
 namespace bgiplayer::exact_pixel_detail {
 namespace {
 struct RestoreContext {
@@ -106,5 +108,85 @@ std::shared_ptr<GpuPixelStorage> run(const ExactPixelPixels& p){
 }
 std::shared_ptr<GpuPixelStorage> execute_resident(const ExactPixelPixels& p){return run(p);}
 PixelKernelResult execute(const ExactPixelPixels& p){auto result=run(p);if(!result || result->size()!=p.destination.pixels.size())return {};std::vector<uint8_t> output(result->size());if(!result->read(output))return {};std::copy(output.begin(),output.end(),p.destination.pixels.begin());return {true,true};}
+}
+namespace bgiplayer::raw_patch_detail {
+std::shared_ptr<GpuPixelStorage> execute(const std::shared_ptr<GpuPixelStorage>& base,
+        std::span<const GpuRawPatch> patches) {
+    if(!valid_gpu_raw_patches(base,patches))return {};
+    auto device=exact_pixel_detail::device();if(!device->program || !device->mutex)return {};
+    std::lock_guard lock(*device->mutex);exact_pixel_detail::RestoreContext restore;
+    if(!device->current())return {};
+    for(unsigned n=0;n<16 && glGetError()!=GL_NO_ERROR;++n){}
+    GLint64 maximum=0;glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE,&maximum);
+    GLint alignment=0,maximum_x=0,maximum_y=0;
+    glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT,&alignment);
+    glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT,0,&maximum_x);
+    glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT,1,&maximum_y);
+    const auto rounded=[](size_t n){return (uint64_t(n)+3U)&~uint64_t(3U);};
+    const auto fits=[&](uint64_t n){return maximum>0 && n && n<=uint64_t(maximum) &&
+        n<=uint64_t(std::numeric_limits<GLsizeiptr>::max());};
+    const uint64_t output_bytes=rounded(base->size());
+    if(alignment<=0 || maximum_x<=0 || maximum_y<=0 || !fits(output_bytes))return {};
+    const auto native=[&](const std::shared_ptr<GpuPixelStorage>& owner,bool packed)->GLuint {
+        if(owner->native_handle("gles-context")!=device->context ||
+                owner->native_handle("gles-display")!=device->display)return 0;
+        const auto name=reinterpret_cast<uintptr_t>(owner->native_handle("gles-buffer"));
+        if(!name || name>UINT32_MAX || glIsBuffer(GLuint(name))!=GL_TRUE)return 0;
+        const uint64_t required=packed?rounded(owner->size()):owner->size();if(!fits(required))return 0;
+        glBindBuffer(GL_COPY_READ_BUFFER,GLuint(name));GLint64 capacity=0;
+        glGetBufferParameteri64v(GL_COPY_READ_BUFFER,GL_BUFFER_SIZE,&capacity);
+        return capacity>=0 && uint64_t(capacity)>=required?GLuint(name):0;
+    };
+    const GLuint initial=native(base,false);if(!initial)return {};
+    std::vector<GLuint> sources;sources.reserve(patches.size());
+    for(const auto& patch:patches) {
+        if((patch.row_bytes+15U)/16U>uint32_t(maximum_x) || (patch.rows+7U)/8U>uint32_t(maximum_y))return {};
+        auto name=native(patch.pixels,true);if(!name)return {};sources.push_back(name);
+    }
+    constexpr size_t argument_bytes=sizeof(std::array<uint32_t,536>);
+    const size_t argument_stride=((argument_bytes+size_t(alignment)-1)/size_t(alignment))*size_t(alignment);
+    if(!fits(argument_bytes) || argument_stride>std::numeric_limits<size_t>::max()/patches.size() ||
+            argument_stride*patches.size()>size_t(std::numeric_limits<GLsizeiptr>::max()))return {};
+    std::vector<uint8_t> arguments(argument_stride*patches.size());
+    for(size_t n=0;n<patches.size();++n) {
+        const auto& p=patches[n];
+        const ExactPixelPixels descriptor{
+            {{},uint32_t(p.offset),uint32_t(p.stride),uint32_t(p.row_bytes),uint32_t(p.rows),3,1},
+            {{},0,uint32_t(p.row_bytes),uint32_t(p.row_bytes),uint32_t(p.rows),3,1},
+            {},ExactPixelOperation::RawCopy};
+        const auto args=exact_pixel_detail::arguments(descriptor);
+        std::memcpy(arguments.data()+n*argument_stride,args.data(),argument_bytes);
+    }
+    if(glGetError()!=GL_NO_ERROR)return {};
+    struct Buffers {
+        GLuint output=0,arguments=0;
+        ~Buffers(){if(output)glDeleteBuffers(1,&output);if(arguments)glDeleteBuffers(1,&arguments);}
+    } buffers;
+    glGenBuffers(1,&buffers.output);glGenBuffers(1,&buffers.arguments);
+    if(!buffers.output || !buffers.arguments)return {};
+    glBindBuffer(GL_COPY_WRITE_BUFFER,buffers.output);
+    glBufferData(GL_COPY_WRITE_BUFFER,GLsizeiptr(output_bytes),nullptr,GL_DYNAMIC_COPY);
+    glBindBuffer(GL_COPY_READ_BUFFER,initial);
+    glCopyBufferSubData(GL_COPY_READ_BUFFER,GL_COPY_WRITE_BUFFER,0,0,GLsizeiptr(base->size()));
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers.arguments);
+    glBufferData(GL_SHADER_STORAGE_BUFFER,GLsizeiptr(arguments.size()),arguments.data(),GL_STATIC_DRAW);
+    glBindBufferRange(GL_SHADER_STORAGE_BUFFER,0,buffers.output,0,GLsizeiptr(output_bytes));
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT|GL_SHADER_STORAGE_BARRIER_BIT);
+    glUseProgram(device->program);
+    for(size_t n=0;n<patches.size();++n) {
+        const auto& patch=patches[n];
+        glBindBufferRange(GL_SHADER_STORAGE_BUFFER,1,sources[n],0,GLsizeiptr(rounded(patch.pixels->size())));
+        glBindBufferRange(GL_SHADER_STORAGE_BUFFER,2,sources[n],0,GLsizeiptr(rounded(patch.pixels->size())));
+        glBindBufferRange(GL_SHADER_STORAGE_BUFFER,3,buffers.arguments,GLintptr(n*argument_stride),argument_bytes);
+        glDispatchCompute(GLuint((patch.row_bytes+15U)/16U),GLuint((patch.rows+7U)/8U),1);
+        // The existing exact shader atomically updates packed bytes. The
+        // barrier also makes later overlapping patches observe ordered writes.
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);glFinish();
+    if(glGetError()!=GL_NO_ERROR)return {};
+    auto result=std::make_shared<exact_pixel_detail::Storage>(device,buffers.output,base->size());
+    buffers.output=0;return result;
+}
 }
 #endif

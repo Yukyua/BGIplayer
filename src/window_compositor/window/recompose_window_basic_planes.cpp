@@ -14,6 +14,10 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
     if (bytes == 0 || state.overlay_level > 256U) {
         return false;
     }
+    if(!retain_cpu_pixel_copies()) {
+        (void)state.background_plane.offload();
+        (void)state.overlay_plane.offload();
+    }
     uint32_t target = 0xFFFFFFFFU;
     while (graphics_surfaces_.count(target) != 0 || graphics_surfaces_.count(target - 1U) != 0 || graphics_surfaces_.count(target - 2U) != 0) {
         --target;
@@ -27,7 +31,15 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
     plane.format = state.plane_format;
     plane.bytes_per_pixel = bytes;
     plane.stride = state.width * bytes;
-    plane.pixels.resize(static_cast<std::size_t>(plane.stride) * state.height, 0);
+    const auto plane_size=static_cast<std::size_t>(plane.stride)*state.height;
+    // The first full background copy replaces every initialized byte. Share
+    // its immutable owner instead of clearing an allocation that is discarded.
+    if(!state.compose_order.empty() && state.compose_order.front()==0 && state.field_16c!=0 &&
+            state.background_plane.size()==plane_size)
+        plane.pixels=state.background_plane;
+    else if(auto empty=store_host_filled_pixels(plane_size,0))
+        plane.pixels.replace_gpu_storage(std::move(empty));
+    else plane.pixels.resize(plane_size,0);
     const auto count = bitmap_blits_.size();
     const bool dirty = display_dirty_;
     const auto cleanup = [&] {
@@ -38,10 +50,6 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
         display_dirty_ = dirty;
     };
     graphics_surfaces_[target] = std::move(plane);
-    if(!retain_cpu_pixel_copies()) {
-        (void)state.background_plane.offload();
-        (void)state.overlay_plane.offload();
-    }
     const auto previous_overlay = state.overlay_plane;
     std::vector<WindowBitmapCommand*> newly_executed;
     const auto commands = window_bitmap_commands_.find(window);
@@ -81,8 +89,10 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
         for (const uint32_t stage : state.compose_order) {
             if (stage == 0) {
                 if (state.field_16c == 0) {
-                    std::fill(graphics_surfaces_.at(target).pixels.begin(),
-                              graphics_surfaces_.at(target).pixels.end(), 0);
+                    auto& pixels=graphics_surfaces_.at(target).pixels;
+                    if(auto empty=store_host_filled_pixels(pixels.size(),0))
+                        pixels.replace_gpu_storage(std::move(empty));
+                    else pixels.assign(pixels.size(),0);
                 } else if(state.background_plane.size()==static_cast<size_t>(plane.stride)*state.height) {
                     // 004319C0's complete same-format mode80/zero copy. GPU
                     // owners are immutable; later writes detach into a result.
@@ -110,7 +120,10 @@ bool VM::recompose_window_basic_planes(uint32_t window) {
                         temporary.format = current_capture_format_ == 1U ? 2U : current_capture_format_;
                         temporary.bytes_per_pixel = bitmap_bytes_per_pixel(temporary.format);
                         temporary.stride = temporary.width * temporary.bytes_per_pixel;
-                        temporary.pixels.assign(static_cast<std::size_t>(temporary.stride) * temporary.height, 0);
+                        const auto empty_size=static_cast<std::size_t>(temporary.stride)*temporary.height;
+                        if(auto empty=store_host_filled_pixels(empty_size,0))
+                            temporary.pixels.replace_gpu_storage(std::move(empty));
+                        else temporary.pixels.assign(empty_size,0);
                         graphics_surfaces_[isolated] = std::move(temporary);
                         if (!record_bitmap_blit(isolated, source, 0, 0, 0x80U, 0) ||
                             !paint_layers(isolated, true)) {

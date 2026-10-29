@@ -1,5 +1,6 @@
 #include "bgiplayer/vm.hpp"
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/pixel_region.hpp"
 #include <iostream>
 namespace bgiplayer {
 bool VM::accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t x,int32_t y,
@@ -69,6 +70,17 @@ bool VM::accelerate_bitmap_transfer(uint32_t destination,uint32_t source,int32_t
             const uint64_t d0=uint64_t(top)*out.stride+uint64_t(left)*4;
             const uint64_t s0=uint64_t(top-y)*in.stride+uint64_t(left-x)*4;
             const auto w=static_cast<uint32_t>(right-left),h=static_cast<uint32_t>(bottom-top);
+            // A same-format full copy does not consume any destination byte.
+            // Allocate the packed result directly from the resident source.
+            if(*gpu_operation==PixelTransferOperation::Copy && out.format==in.format && d0==0 &&
+                    w==out.width && h==out.height && out.stride==uint64_t(w)*4 &&
+                    out.pixels.size()==uint64_t(out.stride)*h && in.pixels.offload()) {
+                if(auto result=crop_host_pixel_storage(in.pixels.gpu_storage(),s0,in.stride,out.stride,h)) {
+                    out.pixels.replace_gpu_storage(std::move(result));refresh_bgra_mirror(out);
+                    if(debug_enabled())bitmap_blits_.push_back({destination,source,x,y,mode,parameter});
+                    display_dirty_=true;return true;
+                }
+            }
             if(out.pixels.size()>=65536U*4U && out.pixels.offload() && in.pixels.offload()) {
                 if(auto result=compose_host_resident_transfer({
                     {{},static_cast<uint32_t>(d0),out.stride,w,h,out.format,4},
@@ -98,22 +110,31 @@ void VM::offload_bitmap_cpu_pixels() {
     bool complete=true;
     std::vector<PixelBuffer*> pending;
     std::vector<std::span<const uint8_t>> uploads;
-    const auto buffer=[&](PixelBuffer& p){
+    const bool trace=debug_trace(DebugTrace::GpuFrames);
+    struct Upload {uint32_t id,field;size_t bytes;};
+    std::vector<Upload> records;
+    const auto buffer=[&](PixelBuffer& p,uint32_t id,uint32_t field){
         if(p.gpu_storage() || p.empty()) {if(!p.offload())complete=false;}
-        else {pending.push_back(&p);uploads.push_back(p.upload_bytes());}
+        else {pending.push_back(&p);uploads.push_back(p.upload_bytes());if(trace)records.push_back({id,field,p.size()});}
     };
-    const auto surface=[&](GraphicsSurface& s) {buffer(s.pixels);buffer(s.rgba);buffer(s.encoded);};
-    for(auto& [id,s]:graphics_surfaces_){(void)id;surface(s);}
+    const auto surface=[&](GraphicsSurface& s,uint32_t id) {buffer(s.pixels,id,0);buffer(s.rgba,id,1);buffer(s.encoded,id,2);};
+    for(auto& [id,s]:graphics_surfaces_)surface(s,id);
     for(auto& [id,w]:window_objects_) {
-        (void)id;buffer(w.background_plane);buffer(w.overlay_plane);
-        buffer(w.text_saved_plane);buffer(w.composite_plane);
-        for(auto& layer:w.image_layers)surface(layer.image);
+        buffer(w.background_plane,id,3);buffer(w.overlay_plane,id,4);
+        buffer(w.text_saved_plane,id,5);buffer(w.composite_plane,id,6);
+        for(auto& layer:w.image_layers)surface(layer.image,id);
     }
-    for(auto& [id,e]:effector_effects_) {(void)id;surface(e.temporal_cache);}
+    for(auto& [id,e]:effector_effects_)surface(e.temporal_cache,id);
     if(!pending.empty()) {
         const auto storage=store_host_pixel_storage_batch(uploads);
         for(size_t n=0;n<pending.size();++n)
             if(n>=storage.size() || !pending[n]->adopt_gpu_storage(storage[n]))complete=false;
+    }
+    if(trace && !records.empty()) {
+        std::cout<<"GPU_RESIDENCY_UPLOAD count="<<records.size();
+        for(const auto& record:records)if(record.bytes>=65536)
+            std::cout<<" buffer="<<record.id<<':'<<record.field<<':'<<record.bytes;
+        std::cout<<'\n';
     }
     static bool warned=false;
     if(!complete && !warned) {

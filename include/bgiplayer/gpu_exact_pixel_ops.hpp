@@ -25,7 +25,7 @@ struct ExactPixelPixels {
     ExactPixelOperation operation=ExactPixelOperation::RawCopy;
     std::array<uint32_t,512> parameters{};
     std::shared_ptr<GpuPixelStorage> destination_storage{},source_storage{},second_storage{};
-    size_t destination_bytes=0; // allocation-only full Fill; no CPU initialization
+    size_t destination_bytes=0; // allocation-only full Fill/RawCopy; no CPU initialization
 
 };
 class PixelBuffer;

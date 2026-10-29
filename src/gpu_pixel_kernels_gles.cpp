@@ -537,5 +537,133 @@ PixelKernelResult GpuPixelKernels::pixel_transfer(const PixelTransferPixels& p){
  const auto op=static_cast<uint32_t>(p.operation);if(op!=3&&op!=5&&(p.source.byte_offset%4||p.source.stride%4))return {};
  std::vector<uint32_t>a(64);a[0]=5;a[1]=p.destination.width;a[2]=p.destination.height;a[3]=p.destination.stride;a[4]=p.source.stride;a[6]=p.destination.byte_offset;a[7]=p.source.byte_offset;a[10]=op;a[11]=p.parameter;a[12]=p.color;a[13]=p.destination.format;a[14]=p.source.format;return impl_->device->dispatch(p.destination.pixels,p.source.pixels,{},a,false,false,storage?storage->buffer():0);
 }
+namespace {
+// Resident inputs remain immutable. The only CPU upload is the small argument
+// block; pixel copies, blur scratch and final pixels stay in this GL context.
+std::shared_ptr<GpuPixelStorage> resident_gles_compute(
+    const std::shared_ptr<GlesDevice>& device,
+    const std::shared_ptr<GpuPixelStorage>& destination,
+    const std::shared_ptr<GpuPixelStorage>& source,
+    const std::array<uint32_t,64>& args,bool blur,bool identity=false) {
+ if(!destination||!source||!device->program||(blur&&!device->blur_program))return {};
+ auto dst=gles_storage(destination,device),src=gles_storage(source,device);
+ if(!dst||!src||!dst->compatible(device)||!src->compatible(device)||
+    !dst->size()||!src->size()||dst->size()>UINT32_MAX||src->size()>UINT32_MAX||
+    dst->size()>std::numeric_limits<size_t>::max()-3)return {};
+ std::lock_guard lock(device->mutex);RestoreContext restore;
+ if(!eglMakeCurrent(device->display,device->surface,device->surface,device->context))return {};
+ for(unsigned n=0;n<16&&glGetError()!=GL_NO_ERROR;++n){}
+ GLint64 maximum=0;glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE,&maximum);
+ const size_t output_capacity=(dst->size()+size_t(3))&~size_t(3);
+ const uint64_t scratch_bytes=blur&&args[12]>=4?uint64_t(args[20])*args[21]*4U:0;
+ const auto fits=[&](uint64_t bytes) {
+  return bytes>0&&maximum>0&&bytes<=uint64_t(maximum)&&
+      bytes<=uint64_t(std::numeric_limits<GLsizeiptr>::max());
+ };
+ if(!fits(output_capacity)||!fits(src->size())||!fits(sizeof(args))||
+    (scratch_bytes&&!fits(scratch_bytes)))return {};
+ const auto buffer_valid=[](GLuint buffer,size_t bytes) {
+  if(!buffer||glIsBuffer(buffer)!=GL_TRUE)return false;
+  glBindBuffer(GL_COPY_READ_BUFFER,buffer);GLint64 capacity=0;
+  glGetBufferParameteri64v(GL_COPY_READ_BUFFER,GL_BUFFER_SIZE,&capacity);
+  return capacity>=0&&uint64_t(capacity)>=bytes;
+ };
+ if(!buffer_valid(dst->buffer(),dst->size())||!buffer_valid(src->buffer(),src->size())||
+    glGetError()!=GL_NO_ERROR)return {};
+ // Even a no-dispatch result must be a validated owner from this context.
+ if(identity)return destination;
+ const bool per_pixel=blur&&args[10]<=8;
+ const auto groups_valid=[](uint32_t x,uint32_t y) {
+  GLint maximum_x=0,maximum_y=0;
+  glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT,0,&maximum_x);
+  glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT,1,&maximum_y);
+  return x&&y&&maximum_x>0&&maximum_y>0&&x<=uint32_t(maximum_x)&&y<=uint32_t(maximum_y);
+ };
+ if(blur) {
+  if(per_pixel) {if(!groups_valid((args[20]+63U)/64U,args[21]))return {};}
+  else if((args[12]>=4||args[12]<2)&&!groups_valid((args[21]+63U)/64U,1))return {};
+  if(!per_pixel&&args[12]>=2&&!groups_valid((args[20]+63U)/64U,1))return {};
+ } else if(!groups_valid((args[1]+15U)/16U,(args[2]+7U)/8U))return {};
+ if(glGetError()!=GL_NO_ERROR)return {};
+ struct Buffers {
+  GLuint output=0,scratch=0,arguments=0;
+  ~Buffers(){if(output)glDeleteBuffers(1,&output);if(scratch)glDeleteBuffers(1,&scratch);if(arguments)glDeleteBuffers(1,&arguments);}
+ } buffers;
+ glGenBuffers(1,&buffers.output);glGenBuffers(1,&buffers.arguments);
+ if(!buffers.output||!buffers.arguments)return {};
+ glBindBuffer(GL_COPY_WRITE_BUFFER,buffers.output);
+ glBufferData(GL_COPY_WRITE_BUFFER,static_cast<GLsizeiptr>(output_capacity),nullptr,GL_DYNAMIC_COPY);
+ glBindBuffer(GL_COPY_READ_BUFFER,dst->buffer());
+ glCopyBufferSubData(GL_COPY_READ_BUFFER,GL_COPY_WRITE_BUFFER,0,0,static_cast<GLsizeiptr>(dst->size()));
+ glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers.arguments);
+ glBufferData(GL_SHADER_STORAGE_BUFFER,sizeof(args),args.data(),GL_STREAM_DRAW);
+ if(scratch_bytes) {
+  glGenBuffers(1,&buffers.scratch);if(!buffers.scratch)return {};
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers.scratch);
+  glBufferData(GL_SHADER_STORAGE_BUFFER,static_cast<GLsizeiptr>(scratch_bytes),nullptr,GL_DYNAMIC_COPY);
+ }
+ glBindBufferRange(GL_SHADER_STORAGE_BUFFER,0,buffers.output,0,static_cast<GLsizeiptr>(output_capacity));
+ glBindBufferRange(GL_SHADER_STORAGE_BUFFER,1,src->buffer(),0,static_cast<GLsizeiptr>(src->size()));
+ glBindBufferRange(GL_SHADER_STORAGE_BUFFER,2,buffers.scratch?buffers.scratch:src->buffer(),0,
+     static_cast<GLsizeiptr>(buffers.scratch?scratch_bytes:src->size()));
+ glBindBufferRange(GL_SHADER_STORAGE_BUFFER,3,buffers.arguments,0,sizeof(args));
+ glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT|GL_SHADER_STORAGE_BARRIER_BIT);
+ if(glGetError()!=GL_NO_ERROR)return {};
+ if(blur) {
+  glUseProgram(device->blur_program);glUniform1ui(1,per_pixel?1U:0U);
+  const auto pass=[&](bool vertical) {
+   glUniform1ui(0,vertical?1U:0U);
+   if(per_pixel)glDispatchCompute((args[20]+63U)/64U,args[21],1);
+   else glDispatchCompute(((vertical?args[20]:args[21])+63U)/64U,1,1);
+  };
+  if(buffers.scratch) {
+   glBindBufferRange(GL_SHADER_STORAGE_BUFFER,0,buffers.scratch,0,static_cast<GLsizeiptr>(scratch_bytes));
+   pass(false);glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+   glBindBufferRange(GL_SHADER_STORAGE_BUFFER,0,buffers.output,0,static_cast<GLsizeiptr>(output_capacity));
+   pass(true);
+  } else pass(args[12]>=2);
+ } else {
+  glUseProgram(device->program);glDispatchCompute((args[1]+15U)/16U,(args[2]+7U)/8U,1);
+ }
+ glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT|GL_BUFFER_UPDATE_BARRIER_BIT);
+ if(glGetError()!=GL_NO_ERROR)return {};
+ GLsync fence=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);if(!fence)return {};
+ const GLenum status=glClientWaitSync(fence,GL_SYNC_FLUSH_COMMANDS_BIT,1000000000ULL);glDeleteSync(fence);
+ if((status!=GL_ALREADY_SIGNALED&&status!=GL_CONDITION_SATISFIED)||glGetError()!=GL_NO_ERROR)return {};
+ auto result=std::make_shared<GlesPixelStorage>(device,buffers.output,dst->size());
+ buffers.output=0;return result;
+}
+}
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_effector_blur(
+    const EffectorBlurPixels& p,std::shared_ptr<GpuPixelStorage> destination) {
+ if(!available()||!valid_resident_effector_blur(p,destination))return {};
+ const auto& dst=p.destination;const auto& src=p.source;
+ // The shared descriptor validator also admits Metal byte views; GLES uses
+ // packed uint pixels and therefore needs these additional alignments.
+ if(dst.byte_offset%4||src.byte_offset%4||dst.stride%4||src.stride%4)return {};
+ std::array<uint32_t,64> args{};
+ args[1]=dst.width;args[2]=dst.height;args[3]=dst.stride;args[4]=src.stride;
+ args[6]=dst.byte_offset;args[7]=src.byte_offset;
+ if(!p.radius) {
+  args[0]=5;args[10]=0;args[13]=dst.format;args[14]=src.format;
+  const bool identity=destination==p.source_storage&&dst.byte_offset==src.byte_offset&&dst.stride==src.stride;
+  return resident_gles_compute(impl_->device,destination,p.source_storage,args,false,identity);
+ }
+ const uint32_t radius=std::min(p.radius,255U),diameter=radius*2U+1U;
+ args[10]=radius;args[11]=((0x20000U+diameter*2U)/diameter)&0xffffU;args[12]=p.selector;
+ args[20]=src.width;args[21]=src.height;
+ return resident_gles_compute(impl_->device,destination,p.source_storage,args,true);
+}
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_affine(
+    const AffinePixels& p,std::shared_ptr<GpuPixelStorage> destination) {
+ if(!available()||!valid_resident_affine(p,destination))return {};
+ std::array<uint32_t,64> args{};
+ args[0]=2;args[1]=p.destination_width;args[2]=p.destination_height;args[3]=p.destination_stride;
+ args[4]=p.source_stride;args[10]=p.parameter;
+ for(unsigned i=0;i<6;++i)args[16+i]=uint32_t(p.matrix[i]);
+ args[24]=args[20];args[25]=args[21];args[20]=p.source_width;args[21]=p.source_height;
+ args[22]=p.filtered;args[23]=p.blend_alpha;
+ return resident_gles_compute(impl_->device,destination,p.source_storage,args,false);
+}
 }
 #endif
