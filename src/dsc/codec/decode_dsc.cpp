@@ -23,13 +23,33 @@ std::vector<uint8_t> decode_dsc(std::span<const uint8_t> data) {
     }
     const auto tree = build_tree(depths);
 
+    // Resolve only prefixes already proven to be present in the physical
+    // bitstream. Short final symbols and invalid paths retain the scalar
+    // walk, its consumed bit count and its exact failure messages.
+    struct Prefix {int32_t node=0;unsigned depth=0;};
+    std::array<Prefix,512> prefixes{};
+    const bool use_prefix=output_size>=16384 && decode_count>=512;
+    if(use_prefix)for(uint32_t code=0;code<prefixes.size();++code) {
+        auto& entry=prefixes[code];
+        while(entry.node>=0 && entry.depth<9 && tree[static_cast<size_t>(entry.node)].symbol<0) {
+            const auto& current=tree[static_cast<size_t>(entry.node)];
+            entry.node=(code&(1U<<(8U-entry.depth)))?current.right:current.left;
+            ++entry.depth;
+        }
+    }
     BitReader bits(data, kBitstreamOffset);
-    std::vector<uint8_t> output;
-    output.reserve(output_size);
+    std::vector<uint8_t> output(output_size,0);
+    auto* pixels=output.data();size_t produced=0;
     for (uint32_t record = 0;
-         record < decode_count && output.size() < output_size; ++record) {
+         record < decode_count && produced < output_size; ++record) {
         int32_t node = 0;
         std::size_t depth = 0;
+        uint32_t prefix=0;
+        if(use_prefix && bits.peek(9,prefix)) {
+            node=prefixes[prefix].node;depth=prefixes[prefix].depth;
+            bits.skip(prefixes[prefix].depth);
+            if(node<0)throw Error("invalid DSC Huffman path");
+        }
         while (tree[static_cast<std::size_t>(node)].symbol < 0) {
             const uint32_t bit = bits.read(1);
             node = bit != 0 ? tree[static_cast<std::size_t>(node)].right
@@ -41,23 +61,28 @@ std::vector<uint8_t> decode_dsc(std::span<const uint8_t> data) {
         const uint32_t symbol =
             static_cast<uint32_t>(tree[static_cast<std::size_t>(node)].symbol);
         if (symbol < 0x100U) {
-            if (output.size() < output_size) {
-                output.push_back(static_cast<uint8_t>(symbol));
-            }
+            pixels[produced++]=static_cast<uint8_t>(symbol);
             continue;
         }
 
         const uint32_t distance = bits.read(12) + 2U;
         const uint32_t count = (symbol & 0xFFU) + 2U;
-        if (distance > output.size()) {
+        if (distance > produced) {
             throw Error("DSC back-reference before output start");
         }
-        for (uint32_t index = 0;
-             index < count && output.size() < output_size; ++index) {
-            output.push_back(output[output.size() - distance]);
+        const auto length=std::min<size_t>(count,output_size-produced);
+        // Copy one original period first, then double already produced
+        // periods. Each memcpy has disjoint ranges, including distance<count;
+        // this is the same forward LZ expansion as the byte-at-a-time loop.
+        size_t copied=std::min<size_t>(distance,length);
+        std::memcpy(pixels+produced,pixels+produced-distance,copied);
+        while(copied<length) {
+            const size_t chunk=std::min(copied,length-copied);
+            std::memcpy(pixels+produced+copied,pixels+produced,chunk);
+            copied+=chunk;
         }
+        produced+=length;
     }
-    output.resize(output_size);
     return output;
 }
 }  // namespace

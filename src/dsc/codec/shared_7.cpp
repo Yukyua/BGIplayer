@@ -10,18 +10,21 @@ public:
     BitReader(std::span<const uint8_t> bytes, std::size_t offset)
         : bytes_(bytes), bit_offset_(offset * 8U) {}
 
+    bool peek(unsigned count,uint32_t& result) const {
+        if(count>24 || bit_offset_+count>bytes_.size()*8U)return false;
+        if(!count){result=0;return true;}
+        const auto shift=static_cast<unsigned>(bit_offset_%8U);
+        const auto bytes=(shift+count+7U)/8U;
+        uint32_t word=0;
+        for(unsigned n=0;n<bytes;++n)word=(word<<8U)|bytes_[bit_offset_/8U+n];
+        result=(word>>(bytes*8U-shift-count))&((1U<<count)-1U);
+        return true;
+    }
+    void skip(unsigned count) {bit_offset_+=count;}
     uint32_t read(unsigned count) {
-        if (count > 24 || bit_offset_ + count > bytes_.size() * 8U) {
-            throw Error("DSC bitstream exhausted");
-        }
-        uint32_t result = 0;
-        for (unsigned index = 0; index < count; ++index) {
-            const std::size_t bit = bit_offset_++;
-            const uint8_t byte = bytes_[bit / 8U];
-            result = (result << 1U) |
-                     ((byte >> (7U - (bit % 8U))) & 1U);
-        }
-        return result;
+        uint32_t result=0;
+        if(!peek(count,result))throw Error("DSC bitstream exhausted");
+        skip(count);return result;
     }
 
 private:
