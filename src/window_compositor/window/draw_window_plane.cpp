@@ -22,8 +22,43 @@ bool VM::draw_window_plane(uint32_t window, int32_t x, int32_t y,
     plane.bytes_per_pixel = bitmap_bytes_per_pixel(plane.format);
     plane.stride = plane.width * plane.bytes_per_pixel;
     auto& owned = overlay ? state.overlay_plane : state.background_plane;
-    plane.pixels = owned;
-    plane.pixels.resize(static_cast<std::size_t>(plane.stride) * plane.height, 0);
+    int32_t local_x = 0, local_y = 0;
+    bool local_plane = false;
+    const auto& image = graphics_surfaces_.at(bitmap);
+    // B7's mode1/zero-opacity source-alpha arm is 0040C090/0040C210.
+    // Only the source/window intersection is read or written. Keep that
+    // entire clipped row (including pixels outside the window's valid region)
+    // so adjacent-pair RCPPS and the odd DIV tail retain their original phase.
+    // Other modes retain the full scratch, including their failure behavior.
+    if ((mode == 1U || mode == 0x20U) && opacity == 0U && image.format == 2U &&
+        (plane.format == 1U || plane.format == 2U) &&
+        owned.size() == static_cast<std::size_t>(plane.stride) * plane.height) {
+        const int64_t left = std::max<int64_t>(x, 0);
+        const int64_t top = std::max<int64_t>(y, 0);
+        const int64_t right = std::min<int64_t>(int64_t(x) + image.width, plane.width);
+        const int64_t bottom = std::min<int64_t>(int64_t(y) + image.height, plane.height);
+        if (left < right && top < bottom) {
+            local_plane = true;
+            local_x = static_cast<int32_t>(left);
+            local_y = static_cast<int32_t>(top);
+            plane.width = static_cast<uint32_t>(right - left);
+            plane.height = static_cast<uint32_t>(bottom - top);
+            plane.stride = plane.width * 4U;
+            plane.pixels.resize(static_cast<std::size_t>(plane.stride) * plane.height);
+            const auto* source = std::as_const(owned).data();
+            auto* destination = plane.pixels.data();
+            for (uint32_t row = 0; row < plane.height; ++row) {
+                const auto offset = (static_cast<std::size_t>(local_y) + row) * state.width * 4U +
+                    static_cast<std::size_t>(local_x) * 4U;
+                std::copy_n(source + offset, plane.stride,
+                            destination + static_cast<std::size_t>(row) * plane.stride);
+            }
+        }
+    }
+    if (!local_plane) {
+        plane.pixels = owned;
+        plane.pixels.resize(static_cast<std::size_t>(plane.stride) * plane.height, 0);
+    }
     uint32_t scratch = 0xFFFFFFFFU;
     while (graphics_surfaces_.count(scratch) != 0) {
         --scratch;
@@ -37,10 +72,34 @@ bool VM::draw_window_plane(uint32_t window, int32_t x, int32_t y,
     };
     graphics_surfaces_.emplace(scratch, std::move(plane));
     try {
-        const bool result = record_bitmap_blit(scratch, bitmap, x, y, mode, opacity);
+        const bool result = record_bitmap_blit(scratch, bitmap, x - local_x, y - local_y, mode, opacity);
         if (result) {
             auto& result = graphics_surfaces_.at(scratch);
-            if (overlay && state.valid_region_set) {
+            if (local_plane) {
+                int32_t left = local_x, top = local_y;
+                int32_t right = local_x + static_cast<int32_t>(result.width) - 1;
+                int32_t bottom = local_y + static_cast<int32_t>(result.height) - 1;
+                if (overlay && state.valid_region_set) {
+                    left = std::max(left, state.valid_x0);
+                    top = std::max(top, state.valid_y0);
+                    right = std::min(right, state.valid_x1);
+                    bottom = std::min(bottom, state.valid_y1);
+                }
+                // Publish only after the original operation succeeded. A
+                // rejected/throwing draw has not touched the owned plane.
+                if (left <= right && top <= bottom) {
+                    const auto* source = std::as_const(result.pixels).data();
+                    auto* destination = owned.data();
+                    const auto length = static_cast<std::size_t>(right - left + 1) * 4U;
+                    for (int32_t row = top; row <= bottom; ++row) {
+                        const auto from = static_cast<std::size_t>(row - local_y) * result.stride +
+                            static_cast<std::size_t>(left - local_x) * 4U;
+                        const auto to = (static_cast<std::size_t>(row) * state.width +
+                            static_cast<std::size_t>(left)) * 4U;
+                        std::copy_n(source + from, length, destination + to);
+                    }
+                }
+            } else if (overlay && state.valid_region_set) {
                 owned.resize(result.pixels.size(), 0);
                 const int32_t left = std::max(state.valid_x0, 0);
                 const int32_t top = std::max(state.valid_y0, 0);
