@@ -6947,8 +6947,8 @@ public:
     }
     void release_display_frame_cpu_pixels() {
         if(!display_frame_readback_provider_ || display_frame_.pixels.empty())return;
-        std::vector<uint8_t>().swap(display_frame_.pixels);
-        std::vector<uint8_t>().swap(display_frame_.rgba);
+        PixelBuffer{}.swap(display_frame_.pixels);
+        PixelBuffer{}.swap(display_frame_.rgba);
         display_frame_gpu_cached_=true;
     }
     void invalidate_display_frame_gpu_cache() { display_frame_gpu_cached_=false; }
