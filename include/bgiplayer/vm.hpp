@@ -17228,78 +17228,7 @@ public:
     bitmap_load_errors() const {
         return bitmap_load_errors_;
     }
-    void set_surface_command(uint32_t type, uint32_t value) {
-        graphics_surface_commands_[type] = value;
-        const auto surface = graphics_surfaces_.find(type);
-        if (surface == graphics_surfaces_.end()) {
-            return;
-        }
-        GraphicsSurface& target = surface->second;
-        const std::size_t size =
-            static_cast<std::size_t>(target.stride) * target.height;
-        target.pixels.assign(size, 0);
-        if (value != 0) {
-            if (target.format == 0U) {
-                const uint16_t packed = static_cast<uint16_t>(
-                    ((value >> 9U) & 0x7C00U) |
-                    ((value >> 6U) & 0x03E0U) |
-                    ((value >> 3U) & 0x001FU));
-                for (std::size_t offset = 0; offset + 1U < size;
-                     offset += 2U) {
-                    target.pixels[offset] =
-                        static_cast<uint8_t>(packed);
-                    target.pixels[offset + 1U] =
-                        static_cast<uint8_t>(packed >> 8U);
-                }
-            } else if (target.format == 1U) {
-                const uint32_t pixel = value & 0x00FFFFFFU;
-                for (std::size_t offset = 0; offset + 3U < size;
-                     offset += 4U) {
-                    target.pixels[offset] =
-                        static_cast<uint8_t>(pixel);
-                    target.pixels[offset + 1U] =
-                        static_cast<uint8_t>(pixel >> 8U);
-                    target.pixels[offset + 2U] =
-                        static_cast<uint8_t>(pixel >> 16U);
-                    target.pixels[offset + 3U] = 0;
-                }
-            } else if (target.format == 2U) {
-                for (std::size_t offset = 0; offset + 3U < size;
-                     offset += 4U) {
-                    target.pixels[offset] =
-                        static_cast<uint8_t>(value);
-                    target.pixels[offset + 1U] =
-                        static_cast<uint8_t>(value >> 8U);
-                    target.pixels[offset + 2U] =
-                        static_cast<uint8_t>(value >> 16U);
-                    target.pixels[offset + 3U] =
-                        static_cast<uint8_t>(value >> 24U);
-                }
-            } else if (target.format == 3U) {
-                std::fill(
-                    target.pixels.begin(), target.pixels.end(),
-                    static_cast<uint8_t>(value));
-            }
-        }
-        const std::size_t pixel_count =
-            static_cast<std::size_t>(target.width) * target.height;
-        target.rgba.assign(pixel_count * 4U, 0);
-        if (target.format == 1U || target.format == 2U) {
-            for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
-                const std::size_t source = pixel * 4U;
-                target.rgba[source] = target.pixels[source + 2U];
-                target.rgba[source + 1U] =
-                    target.pixels[source + 1U];
-                target.rgba[source + 2U] =
-                    target.pixels[source];
-                target.rgba[source + 3U] =
-                    target.format == 1U
-                        ? 0xFFU
-                        : target.pixels[source + 3U];
-            }
-        }
-        display_dirty_ = true;
-    }
+    void set_surface_command(uint32_t type, uint32_t value);
     [[nodiscard]] const std::map<uint32_t, uint32_t>&
     graphics_surface_commands() const {
         return graphics_surface_commands_;
