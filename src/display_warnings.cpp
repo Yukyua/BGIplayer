@@ -70,7 +70,7 @@ bool VM::fail_display_draw(uint32_t destination, uint32_t object,
     out << "warning: DRAW_UNSUPPORTED renderer=" << renderer
         << " reason=" << std::quoted(std::string(reason))
         << " object=0x" << std::hex << object << " class=0x" << object_class_id(handle)
-        << " profile=" << (compact_64_opcodes_ ? "PE64" : "legacy32")
+        << " profile=" << (compact_64_opcodes_ ? "PE64" : "PE32")
         << " raw_mode=0x" << object_raw_field(handle, 0x144U)
         << " api_mode=0x" << api << " blend_mode=0x" << object_raw_field(handle, 0xB0U)
         << " branch=0x" << branch << " target=0x" << target

@@ -464,14 +464,13 @@ public:
     // not a semantic alternative.
     void set_compact_64_opcodes(bool enabled) { compact_64_opcodes_ = enabled; }
     bool compact_64_opcodes() const { return compact_64_opcodes_; }
-    // Host metadata follows the original configure core's checked selector
-    // bound. A bootstrap opcode is not evidence of renderer capabilities.
+    // Kept for snapshot/API compatibility. The detected source-engine bound
+    // is diagnostic metadata; every runtime uses the shared mode 0..5 renderer.
     void set_effector_mode_limit(uint32_t limit) {
         if(limit!=1U && limit!=5U)throw BpFault("unsupported effector mode capability");
         effector_mode_limit_=limit;
     }
-    uint32_t effector_mode_limit() const { return compact_64_opcodes_ ? 5U : effector_mode_limit_; }
-    bool extended_effector_modes() const { return effector_mode_limit()>=5U; }
+    uint32_t effector_mode_limit() const { return 5U; }
     static constexpr bool is_compact_64_opcode(uint8_t opcode) {
         switch (opcode) {
         case 0x03: case 0x0D: case 0x0E: case 0x13:
@@ -21066,7 +21065,7 @@ private:
     RequiredResourceHandler required_resource_handler_;
     std::string game_identifier_;
     bool compact_64_opcodes_ = false;
-    uint32_t effector_mode_limit_ = 1;
+    uint32_t effector_mode_limit_ = 5;
     RegistryValueProvider registry_value_provider_;
     RegistryDeleteHandler registry_delete_handler_;
     DirectInputStateProvider direct_input_state_provider_;

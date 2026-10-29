@@ -180,7 +180,6 @@ int run(const Options& options) {
     });
     ClickInput click_input(vm, options.trace_clicks, options.record_clicks, options.replay_clicks);
     vm.set_compact_64_opcodes(engine_profile.compact_64);
-    vm.set_effector_mode_limit(engine_profile.effector_mode_limit);
     if (debug_enabled()) {
         std::cout << "ENGINE_PROFILE compact64=" << (engine_profile.compact_64 ? 1 : 0)
               << " evidence=" << engine_profile.evidence << '\n';

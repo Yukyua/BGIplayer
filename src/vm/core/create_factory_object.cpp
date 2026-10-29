@@ -49,7 +49,7 @@ std::optional<VM::FactoryObject> VM::create_factory_object(
         case FactoryObjectKind::Grp1Primary:
             object.display_class = DisplayObjectClass::CDspObjEffector;
             object.object_size = 0x1D8U;
-            object.vtable = 0x0050FA58U;
+            object.vtable = 0x00513E58U;
             object.renderer_slot = -1;
             break;
         case FactoryObjectKind::Grp1Secondary:
@@ -80,11 +80,12 @@ std::optional<VM::FactoryObject> VM::create_factory_object(
         refresh_filter_display_geometry(handle);
     }
 
-    if (extended_effector_modes() && kind == FactoryObjectKind::Grp1Primary) {
+    if (kind == FactoryObjectKind::Grp1Primary) {
         // PE64 852D0→5C100 allocates218 bytes and constructs an initially
         // disabled CDspObjEffector. vtable is retained as an RVA in this
         // diagnostic32-bit field; native pointers are never stored here.
-        // Mini32 4473B0→425A70 keeps the 32-bit 1D8 layout/vtable513E58.
+        // All PE32 targets use the verified Mini32 4473B0→425A70
+        // constructor and 1D8 layout/vtable513E58, including old snapshots.
         object.object_size = compact_64_opcodes_ ? 0x218U : 0x1D8U;
         object.vtable = compact_64_opcodes_ ? 0x0017F808U : 0x00513E58U;
         for (auto it=object_raw_fields_.begin();it!=object_raw_fields_.end();) {

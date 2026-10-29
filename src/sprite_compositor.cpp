@@ -404,7 +404,7 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
     }
     // 56900 crops the scene descriptor before entering the callback. The
     // full-primary fast path is equivalent only when no crop is needed.
-    if(extended_effector_modes()) {
+    {
         const auto effect=effector_effects_.find(callback.display_object);
         const auto [primary_width,primary_height]=current_mode_dimensions();
         // A capture may target a larger backing bitmap while its scene is
@@ -596,7 +596,7 @@ bool VM::execute_display_callback(const DisplayBitmapDraw& callback,
                 : filter_states_.contains(callback.display_object)
                 ? compose_filter_at(scratch, callback.display_object,
                                     uint32_t(callback.source_left),uint32_t(callback.source_top))
-                : extended_effector_modes() && effector_effects_.contains(callback.display_object)
+                : effector_effects_.contains(callback.display_object)
                 ? compose_effector_at(scratch, callback.display_object,
                     uint32_t(callback.destination_left),uint32_t(callback.destination_top))
                 : sprites_.count(callback.display_object) != 0

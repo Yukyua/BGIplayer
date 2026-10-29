@@ -43,7 +43,7 @@ bool VM::configure_effector_bitmaps(uint32_t handle,uint32_t primary,uint32_t se
     finish_effector_configuration(handle,effect,query);return true;
 }
 bool VM::configure_effector_mode(uint32_t handle,uint32_t mode,uint32_t effect,uint32_t query) {
-    if(!effector_exists(handle) || mode>(extended_effector_modes()?5U:1U))return false;
+    if(!effector_exists(handle) || mode>effector_mode_limit())return false;
     auto& state=effector_effects_[handle];state.vector_records.clear();
     state.mode=1;state.mode_value=mode;finish_effector_configuration(handle,effect,query);return true;
 }

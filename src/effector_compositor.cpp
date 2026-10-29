@@ -9,7 +9,7 @@
 #include <iostream>
 namespace bgiplayer {
 void VM::refresh_effector_display_geometry(uint32_t handle){
-    if(!extended_effector_modes()||!effector_exists(handle))return;
+    if(!effector_exists(handle))return;
     if(!display_object_states_.contains(handle))register_display_object(handle,0,handle);
     display_object_states_.at(handle).evaluate_priority=true;
     // Mini32 4264A0 / PE64 5B5A0: zero-origin primary canvas dimensions.
@@ -18,7 +18,6 @@ void VM::refresh_effector_display_geometry(uint32_t handle){
 }
 bool VM::compose_effector_at(uint32_t destination,uint32_t handle,uint32_t left,uint32_t top){
     const auto fail=[&](std::string_view reason){return fail_display_draw(destination,handle,"effector",reason);};
-    if(!extended_effector_modes())return fail("effector pixels are not implemented for legacy32");
     if(!effector_exists(handle))return fail("effector object is missing");
     if(!object_draw_visible(handle))return true;
     const auto effect=effector_effects_.find(handle);auto target=graphics_surfaces_.find(destination);

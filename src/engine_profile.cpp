@@ -68,7 +68,6 @@ EngineProfileDecision analyze_engine_profile(
     const std::filesystem::path& game,
     const std::vector<uint8_t>& bootstrap) {
     EngineProfileDecision decision;
-    decision.effector_mode_limit = discover_effector_mode_limit(game).value_or(1U);
     if (const auto wide = discover_engine_64bit(game)) {
         decision.compact_64 = *wide;
         decision.evidence = "executable";

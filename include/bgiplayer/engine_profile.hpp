@@ -12,7 +12,7 @@ struct EngineProfileDecision {
     // "executable" (BGI PE machine type), "bootstrap" (the startup script
     // executed a 64-bit-only opcode) or "undetermined" (legacy default).
     std::string evidence = "undetermined";
-    uint32_t effector_mode_limit = 1;
+
 };
 
 // Executes the startup code under the legacy profile for up to `limit`
