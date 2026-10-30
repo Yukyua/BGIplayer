@@ -13,10 +13,20 @@ NativeSignal sys1_update_checksum_state(VM& vm, Thread& thread) {
         throw std::runtime_error(
             "Sys1:0xE9 checksum source and state must not be null");
     }
-    std::vector<uint8_t> data(size);
-    for (uint32_t index = 0; index < size; ++index) {
-        data[index] =
-            vm.memory().read_u8(source + index, thread.base);
+    std::vector<uint8_t> data;
+    if (source < 0x10000000U && (source & 0x0FFF0000U) == 0x0FFF0000U) {
+        // Slot aliases do not have ordinary pointer arithmetic. Keep the
+        // established per-byte resolution and full source capture here.
+        data.resize(size);
+        for (uint32_t index = 0; index < size; ++index)
+            data[index] = vm.memory().read_u8(source + index, thread.base);
+    } else if (const auto bytes=vm.memory().try_unobserved_writable_span(source,size,thread.base);
+               !bytes.empty()) {
+        // Capture a validated contiguous heap/frame source before updating
+        // state, even when source and state alias. No borrowed view escapes.
+        data.assign(bytes.begin(),bytes.end());
+    } else {
+        data = vm.memory().read_bytes(source, size, thread.base);
     }
     update_checksum_state(vm, thread, state, data);
     return NativeSignal::Continue;

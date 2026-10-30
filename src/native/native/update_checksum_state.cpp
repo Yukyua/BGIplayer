@@ -7,6 +7,28 @@ namespace bgiplayer {
 namespace {
 void update_checksum_state(VM& vm, Thread& thread, uint32_t state,
                            std::span<const uint8_t> data) {
+    if (data.empty()) return;
+    if (auto bytes = vm.memory().try_unobserved_writable_span(state, 8, thread.base);
+        !bytes.empty()) {
+        // Original 00401B10 / 140032950: the same modulo-32/8-bit
+        // recurrence, accumulated locally only when intermediate writes
+        // cannot trigger a VM watch or a partial-range fault.
+        uint32_t sum = uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8U) |
+            (uint32_t(bytes[2]) << 16U) | (uint32_t(bytes[3]) << 24U);
+        uint8_t lane4=bytes[4], lane5=bytes[5], lane6=bytes[6], lane7=bytes[7];
+        for (const uint8_t byte : data) {
+            sum = sum * 0xE9U + byte;
+            const auto low = static_cast<uint8_t>(sum);
+            lane4 = static_cast<uint8_t>(lane4 + low);
+            lane5 ^= low;
+            lane6 = static_cast<uint8_t>(lane6 + static_cast<int8_t>(byte));
+            lane7 ^= byte;
+        }
+        for (unsigned index=0;index<4;++index)
+            bytes[index]=static_cast<uint8_t>(sum >> (index*8U));
+        bytes[4]=lane4;bytes[5]=lane5;bytes[6]=lane6;bytes[7]=lane7;
+        return;
+    }
     uint32_t sum =
         data.empty() ? 0 : vm.memory().read_u32(state, thread.base);
     for (const uint8_t byte : data) {

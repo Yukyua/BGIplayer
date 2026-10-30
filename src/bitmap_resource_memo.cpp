@@ -8,6 +8,7 @@
 #include <list>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #if defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
 #endif
@@ -53,6 +54,17 @@ void trace_bitmap_resource_preparation(uint32_t id,size_t bytes,bool hit,bool su
     std::cerr<<"BITMAP_RESOURCE_COST id="<<id<<" encoded_bytes="<<bytes
         <<" memo_hit="<<hit<<" success="<<success<<" read_ns="<<read_ns
         <<" prepare_ns="<<prepare_ns<<'\n';
+}
+void trace_bitmap_resource_prepare_detail(uint32_t id,size_t bytes,bool hit,bool success,
+        const std::array<uint64_t,7>& phases) {
+    std::ostringstream line;
+    line<<"BITMAP_PREPARE_DETAIL id="<<id<<" encoded_bytes="<<bytes
+        <<" memo_hit="<<hit<<" success="<<success
+        <<" hash_lookup_ns="<<phases[0]<<" decode_ns="<<phases[1]
+        <<" layout_ns="<<phases[2]<<" mirror_ns="<<phases[3]
+        <<" memo_store_ns="<<phases[4]<<" install_ns="<<phases[5]
+        <<" other_ns="<<phases[6]<<'\n';
+    std::cerr<<line.str();
 }
 std::optional<BitmapResourceMemoValue> find_bitmap_resource_memo(const BitmapResourceMemoKey& key) {
     if(!bitmap_resource_memo_enabled()){clear_bitmap_resource_memo();return {};}

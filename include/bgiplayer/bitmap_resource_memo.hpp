@@ -28,4 +28,6 @@ void clear_bitmap_resource_memo();
 BitmapResourceMemoStatistics bitmap_resource_memo_statistics();
 void trace_bitmap_resource_preparation(uint32_t id,size_t bytes,bool hit,bool success,
     uint64_t read_ns,uint64_t prepare_ns);
+void trace_bitmap_resource_prepare_detail(uint32_t id,size_t bytes,bool hit,bool success,
+    const std::array<uint64_t,7>& phases);
 } // namespace bgiplayer

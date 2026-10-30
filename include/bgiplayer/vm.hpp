@@ -131,6 +131,11 @@ public:
                                     uint32_t base) const;
     void write_bytes(uint32_t address, std::span<const uint8_t> data,
                      uint32_t base);
+    // Immediate, non-owning access for a non-observable host calculation.
+    // Empty means use scalar accesses (watches, aliases, or invalid range).
+    // Do not retain across allocation, callbacks, or VM ownership changes.
+    [[nodiscard]] std::span<uint8_t> try_unobserved_writable_span(
+        uint32_t address, std::size_t size, uint32_t base);
     std::string read_cstring(uint32_t address, uint32_t base) const;
     void write_cstring(uint32_t address, std::string_view value, uint32_t base);
     uint32_t allocate(std::size_t size);
@@ -6580,6 +6585,24 @@ public:
     bool load_bitmap_resource_data(
         uint32_t type, std::string archive, std::string resource,
         std::vector<uint8_t> data) {
+        const bool profile=debug_trace(DebugTrace::GpuFrames);
+        auto phase_start=profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto encoded_bytes=data.size();
+        std::array<uint64_t,7> phases{};
+        bool hit=false;
+        const auto mark_phase=[&](size_t phase) {
+            if(!profile)return;
+            const auto now=std::chrono::steady_clock::now();
+            phases[phase]+=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now-phase_start).count());
+            phase_start=now;
+        };
+        const auto finish=[&](bool success) {
+            if(profile) {
+                mark_phase(6);
+                trace_bitmap_resource_prepare_detail(type,encoded_bytes,hit,success,phases);
+            }
+            return success;
+        };
         const bool compressed = data.size() >= 15U &&
             std::string_view(reinterpret_cast<const char*>(data.data()), 15U)
                 .starts_with("CompressedBG_");
@@ -6597,7 +6620,9 @@ public:
                 memo_key.reset();
             }
         }
+        mark_phase(0);
         if(memo_hit) {
+            hit=true;
             GraphicsSurface surface;
             surface.width=memo_hit->width; surface.height=memo_hit->height;
             surface.format=memo_hit->format; surface.bytes_per_pixel=memo_hit->bytes_per_pixel;
@@ -6606,11 +6631,13 @@ public:
             surface.pixels=std::move(memo_hit->pixels);
             surface.rgba=std::move(memo_hit->rgba);
             surface.archive=std::move(archive); surface.resource=std::move(resource);
+            mark_phase(2);
             // The immutable host bytes are shared; each VM load still
             // allocates/reuses its own manager token in the original order.
             install_allocated_graphics_surface(type,std::move(surface));
+            mark_phase(5);
             if(compressed)display_dirty_=true;
-            return true;
+            return finish(true);
         }
         const auto remember = [&memo_key](GraphicsSurface& surface) {
             if(!memo_key)return;
@@ -6628,6 +6655,7 @@ public:
         if (compressed) {
             std::string decode_error;
             auto decoded = decode_compressed_bg(data, &decode_error, archive + ":" + resource, true);
+            mark_phase(1);
             if (!decoded || decoded->width == 0 ||
                 decoded->height == 0 ||
                 (decoded->bits_per_pixel != 8U &&
@@ -6635,7 +6663,7 @@ public:
                  decoded->bits_per_pixel != 32U)) {
                 bitmap_load_errors_[type] =
                     "CompressedBG payload is invalid: " + decode_error;
-                return false;
+                return finish(false);
             }
             GraphicsSurface surface;
             surface.width = decoded->width;
@@ -6669,11 +6697,15 @@ public:
             surface.encoded = std::move(data);
             surface.archive = std::move(archive);
             surface.resource = std::move(resource);
+            mark_phase(2);
             refresh_bgra_mirror(surface);
+            mark_phase(3);
             remember(surface);
+            mark_phase(4);
             install_allocated_graphics_surface(type, std::move(surface));
+            mark_phase(5);
             display_dirty_ = true;
-            return true;
+            return finish(true);
         }
         if (data.size() >= 8) {
             const uint16_t width =
@@ -6685,7 +6717,7 @@ public:
                 bitmap_load_errors_[type] =
                     "bitmap header uses an unsupported format";
                 warn_decode_failure("bitmap", bitmap_load_errors_[type], data, archive + ":" + resource);
-                return false;
+                return finish(false);
             }
             const uint16_t compression =
                 static_cast<uint16_t>(data[6] | (data[7] << 8U));
@@ -6710,13 +6742,16 @@ public:
                             surface.encoded).subspan(16, pixel_bytes));
                 }
             }
+            mark_phase(2);
             remember(surface);
+            mark_phase(4);
             install_allocated_graphics_surface(type, std::move(surface));
-            return true;
+            mark_phase(5);
+            return finish(true);
         }
         bitmap_load_errors_[type] = "bitmap header is truncated";
         warn_decode_failure("bitmap", bitmap_load_errors_[type], data, archive + ":" + resource);
-        return false;
+        return finish(false);
     }
     bool cache_bitmap_resource(
         std::string archive, std::string resource,

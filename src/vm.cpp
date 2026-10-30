@@ -33,6 +33,7 @@
 #include "vm/memory/memory.cpp"
 #include "vm/core/set_code.cpp"
 #include "vm/core/resolve.cpp"
+#include "vm/memory/try_unobserved_writable_span.cpp"
 #include "vm/core/shared.cpp"
 #include "vm/core/shared_2.cpp"
 #include "vm/core/shared_3.cpp"
