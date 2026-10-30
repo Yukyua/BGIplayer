@@ -13,11 +13,19 @@ public:
     bool peek(unsigned count,uint32_t& result) const {
         if(count>24 || bit_offset_+count>bytes_.size()*8U)return false;
         if(!count){result=0;return true;}
-        const auto shift=static_cast<unsigned>(bit_offset_%8U);
-        const auto bytes=(shift+count+7U)/8U;
-        uint32_t word=0;
-        for(unsigned n=0;n<bytes;++n)word=(word<<8U)|bytes_[bit_offset_/8U+n];
-        result=(word>>(bytes*8U-shift-count))&((1U<<count)-1U);
+        // Reuse a bounded big-endian window across Huffman lookups and LZ
+        // distances. Refill never assumes padding after the physical stream.
+        if(bit_offset_<window_start_ || bit_offset_+count>window_end_) {
+            const auto byte_offset=bit_offset_/8U;
+            const auto bytes=std::min<std::size_t>(8U,bytes_.size()-byte_offset);
+            uint64_t word=0;
+            for(std::size_t n=0;n<bytes;++n)word=(word<<8U)|bytes_[byte_offset+n];
+            window_=bytes==8U?word:word<<((8U-bytes)*8U);
+            window_start_=byte_offset*8U;
+            window_end_=window_start_+bytes*8U;
+        }
+        const auto shift=static_cast<unsigned>(bit_offset_-window_start_);
+        result=static_cast<uint32_t>(window_>>(64U-shift-count))&((1U<<count)-1U);
         return true;
     }
     void skip(unsigned count) {bit_offset_+=count;}
@@ -30,6 +38,8 @@ public:
 private:
     std::span<const uint8_t> bytes_;
     std::size_t bit_offset_;
+    mutable uint64_t window_=0;
+    mutable std::size_t window_start_=0,window_end_=0;
 };
 }  // namespace
 }  // namespace bgiplayer

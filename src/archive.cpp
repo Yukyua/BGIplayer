@@ -8,6 +8,13 @@
 #include "bgiplayer/dsc.hpp"
 #include "bgiplayer/resource_decode_memo.hpp"
 
+#include "bgiplayer/debug.hpp"
+#include <chrono>
+#include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <fstream>

@@ -1,6 +1,10 @@
 #include "bgiplayer/resource_decode_memo.hpp"
 #include "bgiplayer/dsc.hpp"
 #include "bgiplayer/render_policy.hpp"
+#include "bgiplayer/debug.hpp"
+#include <chrono>
+#include <iostream>
+#include <sstream>
 #include <algorithm>
 #include <exception>
 #include <cstdlib>
@@ -51,14 +55,34 @@ void store_resource_decode_memo(const ResourceDecodeMemoKey& key,std::shared_ptr
     m.entries.push_front({key,std::move(pixels),bytes});m.bytes+=bytes;
 }
 std::vector<uint8_t> decode_archive_resource(std::span<const uint8_t> encoded) {
+    const char* trace_io=debug_trace(DebugTrace::GpuFrames)?std::getenv("BGI_TRACE_RESOURCE_IO"):nullptr;
+    const bool profile=trace_io && std::strcmp(trace_io,"1")==0;
+    const auto time=[&]{return profile?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};};
+    const auto start=time();
+    uint64_t hash_ns=0,readback_ns=0,decode_ns=0,upload_ns=0;
+    const auto ns=[](auto a,auto b){return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b-a).count());};
+    const auto trace=[&](size_t bytes,bool hit) {
+        if(!profile)return;
+        const auto end=time();
+        std::ostringstream line;
+        line<<"RESOURCE_DECODE input_bytes="<<encoded.size()<<" output_bytes="<<bytes
+            <<" memo_hit="<<hit<<" hash_ns="<<hash_ns<<" readback_ns="<<readback_ns
+            <<" decode_ns="<<decode_ns<<" upload_ns="<<upload_ns<<" total_ns="<<ns(start,end)<<'\n';
+        std::cerr<<line.str();
+    };
     std::optional<ResourceDecodeMemoKey> key;
     if(!resource_decode_memo_enabled())clear_resource_decode_memo();
     else {
         try {
+            const auto hash_start=time();
             key=bitmap_resource_memo_key(encoded,false);
+            if(profile)hash_ns=ns(hash_start,time());
             if(auto cached=find_resource_decode_memo(*key)) {
+                const auto read_start=time();
                 std::vector<uint8_t> output(cached->size());
-                if(cached->read(output))return output;
+                const bool read=cached->read(output);
+                if(profile)readback_ns=ns(read_start,time());
+                if(read){trace(output.size(),true);return output;}
                 ++memo().read_failures;discard(*key);
             }
         } catch(const std::exception&) {
@@ -68,11 +92,16 @@ std::vector<uint8_t> decode_archive_resource(std::span<const uint8_t> encoded) {
             key.reset();
         }
     }
+    const auto decode_start=time();
     auto output=dsc_decode(encoded); // Failed decodes are never memoized.
+    if(profile)decode_ns=ns(decode_start,time());
+    const auto upload_start=time();
     if(key && output.size()>=minimum_bytes && output.size()<=maximum_bytes) {
         try {store_resource_decode_memo(*key,store_host_pixel_storage(output));}
         catch(const std::exception&) {} // Preserve the successful decoder result.
     }
+    if(profile)upload_ns=ns(upload_start,time());
+    trace(output.size(),false);
     return output;
 }
 } // namespace bgiplayer

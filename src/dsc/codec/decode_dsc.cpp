@@ -26,14 +26,15 @@ std::vector<uint8_t> decode_dsc(std::span<const uint8_t> data) {
     // Resolve only prefixes already proven to be present in the physical
     // bitstream. Short final symbols and invalid paths retain the scalar
     // walk, its consumed bit count and its exact failure messages.
+    constexpr unsigned prefix_bits=11;
     struct Prefix {int32_t node=0;unsigned depth=0;};
-    std::array<Prefix,512> prefixes{};
+    std::array<Prefix,1U<<prefix_bits> prefixes{};
     const bool use_prefix=output_size>=16384 && decode_count>=512;
     if(use_prefix)for(uint32_t code=0;code<prefixes.size();++code) {
         auto& entry=prefixes[code];
-        while(entry.node>=0 && entry.depth<9 && tree[static_cast<size_t>(entry.node)].symbol<0) {
+        while(entry.node>=0 && entry.depth<prefix_bits && tree[static_cast<size_t>(entry.node)].symbol<0) {
             const auto& current=tree[static_cast<size_t>(entry.node)];
-            entry.node=(code&(1U<<(8U-entry.depth)))?current.right:current.left;
+            entry.node=(code&(1U<<(prefix_bits-1U-entry.depth)))?current.right:current.left;
             ++entry.depth;
         }
     }
@@ -45,7 +46,7 @@ std::vector<uint8_t> decode_dsc(std::span<const uint8_t> data) {
         int32_t node = 0;
         std::size_t depth = 0;
         uint32_t prefix=0;
-        if(use_prefix && bits.peek(9,prefix)) {
+        if(use_prefix && bits.peek(prefix_bits,prefix)) {
             node=prefixes[prefix].node;depth=prefixes[prefix].depth;
             bits.skip(prefixes[prefix].depth);
             if(node<0)throw Error("invalid DSC Huffman path");

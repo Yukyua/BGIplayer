@@ -5,7 +5,12 @@
 
 namespace bgiplayer {
 std::vector<uint8_t> Archive::read_raw(const ArchiveEntry& entry) const {
+    const char* trace_io=debug_trace(DebugTrace::GpuFrames)?std::getenv("BGI_TRACE_RESOURCE_IO"):nullptr;
+    const bool profile=trace_io && std::strcmp(trace_io,"1")==0;
+    const auto time=[&]{return profile?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};};
+    const auto start=time();
     auto input = host_files::open_read(path_);
+    const auto opened=time();
     if (!input) {
         throw Error("cannot reopen archive: " + path_.string());
     }
@@ -15,11 +20,22 @@ std::vector<uint8_t> Archive::read_raw(const ArchiveEntry& entry) const {
     if (!input) {
         throw Error("cannot seek archive entry: " + entry.name);
     }
+    const auto positioned=time();
     std::vector<uint8_t> payload(entry.size);
+    const auto allocated=time();
     input.read(reinterpret_cast<char*>(payload.data()),
                static_cast<std::streamsize>(payload.size()));
     if (static_cast<std::size_t>(input.gcount()) != payload.size()) {
         throw Error("short archive entry read: " + entry.name);
+    }
+    if(profile) {
+        const auto end=time();
+        const auto ns=[](auto a,auto b){return std::chrono::duration_cast<std::chrono::nanoseconds>(b-a).count();};
+        std::ostringstream line;
+        line<<"RESOURCE_IO archive="<<std::quoted(path_.filename().string())<<" name="<<std::quoted(entry.name)
+            <<" bytes="<<entry.size<<" open_ns="<<ns(start,opened)<<" seek_ns="<<ns(opened,positioned)
+            <<" allocate_ns="<<ns(positioned,allocated)<<" read_ns="<<ns(allocated,end)<<'\n';
+        std::cerr<<line.str();
     }
     return payload;
 }

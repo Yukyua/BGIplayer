@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <array>
-#include <iterator>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -63,7 +62,21 @@ std::ofstream open_write(const std::filesystem::path& path, std::ios::openmode m
 std::vector<uint8_t> read(const std::filesystem::path& path) {
     auto input = open_read(path);
     if (!input) throw Error("cannot open file: " + path.string());
-    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    // Read the current stream to EOF as before, including a partial final
+    // block. Avoid per-byte iterator dispatch and vector growth checks. The
+    // size is only a capped allocation hint: changed/non-regular files still
+    // determine the returned bytes through the stream, not the path metadata.
+    std::vector<uint8_t> bytes;
+    std::error_code error;
+    const auto hint=host_files::file_size(path,error);
+    if(!error)bytes.reserve(static_cast<std::size_t>(std::min<uintmax_t>(hint,16U*1024U*1024U)));
+    std::array<char,64U*1024U> block;
+    while(input) {
+        input.read(block.data(),static_cast<std::streamsize>(block.size()));
+        const auto count=input.gcount();
+        if(count>0)bytes.insert(bytes.end(),block.data(),block.data()+count);
+    }
+    return bytes;
 }
 bool write(const std::filesystem::path& path, std::span<const uint8_t> bytes) {
     auto output = open_write(path);
