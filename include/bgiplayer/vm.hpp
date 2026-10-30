@@ -90,7 +90,13 @@ public:
                     std::size_t heap_size = 0x400000U);
 
     void set_code(std::vector<uint8_t> code);
-    void swap_code(std::vector<uint8_t>& code) { code_.swap(code); }
+    void swap_code(std::vector<uint8_t>& code) { materialize_code(); code_.swap(code); root_code_view_=code_; }
+    // Scheduler-only immutable root binding. The owner outlives the slice;
+    // snapshots and ownership-changing operations materialize on demand.
+    void select_code_view(std::span<const uint8_t> code) {
+        root_code_view_=code;
+    }
+    void materialize_code();
     void set_active_code(std::span<const uint8_t> code,
                          uint32_t base = 0) {
         active_code_ = code;
@@ -99,7 +105,7 @@ public:
     void set_code_fallbacks(std::vector<CodeRegion> code_fallbacks) {
         code_fallbacks_ = std::move(code_fallbacks);
     }
-    [[nodiscard]] std::span<const uint8_t> code() const { return code_; }
+    [[nodiscard]] std::span<const uint8_t> code() const { return root_code_view_; }
     [[nodiscard]] std::span<const uint8_t> active_code() const {
         return active_code_;
     }
@@ -217,6 +223,7 @@ private:
                                    std::size_t width) const;
 
     std::vector<uint8_t> code_;
+    std::span<const uint8_t> root_code_view_; // transient selected root, never serialized
     std::span<const uint8_t> active_code_;
     uint32_t active_code_base_ = 0;
     std::vector<CodeRegion> code_fallbacks_;

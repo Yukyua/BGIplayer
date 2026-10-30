@@ -8,6 +8,11 @@ std::span<const uint8_t> VM::current_code() const {
     if (!has_active_code_resource_) {
         return memory_.code();
     }
+    // Existing binding is pinned by the active resource/return frames. A
+    // snapshot transfer clears it before rebuilding against the new owners.
+    if(memory_.active_code_.data() &&
+            memory_.active_code_base_==active_code_resource_base_)
+        return memory_.active_code_;
     const auto resource =
         resource_segments_.find(active_code_resource_base_);
     if (resource == resource_segments_.end()) {

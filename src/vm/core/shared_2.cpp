@@ -8,7 +8,7 @@ uint16_t Memory::read_u16(uint32_t address, uint32_t base) const {
     const Location location = resolve(address, base, 2);
     const auto* source = [&]() {
         if (location.space == Space::Code) {
-            return code_.data();
+            return code().data();
         }
         if (location.space == Space::ActiveCode) {
             return active_code_.data();

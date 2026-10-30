@@ -7,7 +7,7 @@ namespace bgiplayer {
 uint8_t Memory::read_u8(uint32_t address, uint32_t base) const {
     const Location location = resolve(address, base, 1);
     if (location.space == Space::Code) {
-        return code_[location.offset];
+        return code()[location.offset];
     }
     if (location.space == Space::ActiveCode) {
         return active_code_[location.offset];

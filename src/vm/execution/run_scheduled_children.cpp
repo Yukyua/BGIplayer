@@ -9,7 +9,16 @@ bool VM::run_scheduled_children() {
     const uint32_t main_id = thread_.id;
     const NativeSignal pending = thread_.scheduler_signal;
     thread_.scheduler_signal = NativeSignal::Continue;
-    scheduler_saved_thread_ = thread_;
+    // Trace callbacks may inspect the parked records: retain their old mirror
+    // behavior. Normal execution transfers container ownership, not contents.
+    const bool mirror_contexts=bool(step_trace_);
+    if(mirror_contexts)scheduler_saved_thread_=thread_;
+    else {
+        scheduler_saved_thread_.emplace();
+        // Never expose a dummy ID0 through find_thread_object before the first
+        // worker. The live main remains authoritative until moved below.
+        scheduler_saved_thread_->id=main_id;
+    }
     bool main_has_resource = has_active_code_resource_;
     uint32_t main_resource_base = active_code_resource_base_;
     bool executed = false;
@@ -30,7 +39,8 @@ bool VM::run_scheduled_children() {
             switch_target_id_ = 0;
             break;
         case NativeSignal::Pause:
-            scheduler_saved_thread_->status_flags |= 0x80000000U;
+            if(mirror_contexts)scheduler_saved_thread_->status_flags |= 0x80000000U;
+            else thread_.status_flags |= 0x80000000U;
             current = main_id;
             break;
         case NativeSignal::EndPass:
@@ -46,7 +56,7 @@ bool VM::run_scheduled_children() {
 
     const auto select_code = [this](const std::vector<uint8_t>& code,
                                     bool has_resource, uint32_t base) {
-        memory_.set_code(code);
+        memory_.select_code_view(code);
         memory_.set_active_code({});
         has_active_code_resource_ = has_resource;
         active_code_resource_base_ = base;
@@ -107,11 +117,15 @@ bool VM::run_scheduled_children() {
             }
         }
         if (is_main) {
-            thread_ = *scheduler_saved_thread_;
+            if(mirror_contexts)thread_ = *scheduler_saved_thread_;
             active_child_handle_ = 0;
             select_code(main_code_, main_has_resource, main_resource_base);
         } else {
-            thread_ = found->second.thread;
+            if(mirror_contexts)thread_=found->second.thread;
+            else {
+                *scheduler_saved_thread_=std::move(thread_);
+                thread_=std::move(found->second.thread);
+            }
             active_child_handle_ = current;
             if (frame_owner != nullptr) memory_.swap_thread_frame(frame_owner->frame);
             select_code(found->second.code, found->second.has_code_resource,
@@ -196,27 +210,30 @@ bool VM::run_scheduled_children() {
         const uint32_t next = advance
             ? next_thread_in_tree(current) : explicit_next;
         if (is_main) {
-            *scheduler_saved_thread_ = thread_;
+            if(mirror_contexts)*scheduler_saved_thread_ = thread_;
             main_has_resource = has_active_code_resource_;
             main_resource_base = active_code_resource_base_;
         } else {
             if (frame_owner != nullptr) memory_.swap_thread_frame(frame_owner->frame);
-            found->second.thread = thread_;
+            if(mirror_contexts)found->second.thread=thread_;
+            else found->second.thread=std::move(thread_);
             found->second.has_code_resource = has_active_code_resource_;
             found->second.code_resource_base = active_code_resource_base_;
         }
         active_child_handle_ = 0;
-        thread_ = *scheduler_saved_thread_;
+        if(mirror_contexts)thread_=*scheduler_saved_thread_;
+        else if(!is_main)thread_=std::move(*scheduler_saved_thread_);
         thread_id_ = main_id;
         if (cleanup) {
             if (is_main) {
                 std::erase(root_children_, main_id);
                 std::erase(root_container_thread_.children, main_id);
-                scheduler_saved_thread_->state = ThreadState::Done;
+                if(mirror_contexts)scheduler_saved_thread_->state=ThreadState::Done;
+                else thread_.state=ThreadState::Done;
             } else {
                 remove_thread_subtree(current);
                 // Cleanup can release shared ranges in the saved main owner.
-                *scheduler_saved_thread_ = thread_;
+                if(mirror_contexts)*scheduler_saved_thread_ = thread_;
             }
         }
         if (faulted) {
@@ -225,12 +242,14 @@ bool VM::run_scheduled_children() {
         current = next;
     }
     if (faulted) {
-        scheduler_saved_thread_->state = ThreadState::Faulted;
+        if(mirror_contexts)scheduler_saved_thread_->state=ThreadState::Faulted;
+        else thread_.state=ThreadState::Faulted;
     }
-    thread_ = *scheduler_saved_thread_;
+    if(mirror_contexts)thread_=*scheduler_saved_thread_;
     thread_id_ = main_id;
     active_child_handle_ = 0;
     select_code(main_code_, main_has_resource, main_resource_base);
+    memory_.materialize_code();
     scheduler_saved_thread_.reset();
     collect_retired_resource_records();
     return executed;

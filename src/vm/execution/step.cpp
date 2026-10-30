@@ -31,7 +31,10 @@ VM::StepResult VM::step() {
         if (compact_64_opcodes_ && is_compact_64_opcode(opcode)) {
             return op_compact();
         }
-        return (this->*make_dispatch()[opcode])();
+        // Construct once at compile time, not a 4 KiB automatic table per
+        // ordinary instruction. Compact-profile selection remains above.
+        static constexpr auto dispatch=make_dispatch();
+        return (this->*dispatch[opcode])();
     } catch (const std::exception& error) {
         std::ostringstream message;
         message << error.what()

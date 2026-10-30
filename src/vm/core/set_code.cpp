@@ -6,5 +6,14 @@
 namespace bgiplayer {
 void Memory::set_code(std::vector<uint8_t> code) {
     code_ = std::move(code);
+    root_code_view_=code_;
+}
+void Memory::materialize_code() {
+    if(root_code_view_.data()==code_.data() && root_code_view_.size()==code_.size())return;
+    // Avoid copying the unchanged main root after every scheduler pass.
+    if(code_.size()!=root_code_view_.size() ||
+            !std::equal(code_.begin(),code_.end(),root_code_view_.begin()))
+        code_=std::vector<uint8_t>(root_code_view_.begin(),root_code_view_.end());
+    root_code_view_=code_;
 }
 }  // namespace bgiplayer

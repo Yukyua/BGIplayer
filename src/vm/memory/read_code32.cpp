@@ -5,6 +5,13 @@
 
 namespace bgiplayer {
 uint32_t VM::read_code32() {
+    const auto code=current_code();
+    const size_t offset=thread_.ip;
+    if(offset<=code.size() && code.size()-offset>=4U) {
+        thread_.ip+=4U;
+        return static_cast<uint32_t>((static_cast<uint32_t>(code[offset+0]) << 0U) | (static_cast<uint32_t>(code[offset+1]) << 8U) | (static_cast<uint32_t>(code[offset+2]) << 16U) | (static_cast<uint32_t>(code[offset+3]) << 24U));
+    }
+    // Preserve byte-by-byte consumption and exact IP on truncated input.
     const uint32_t low = read_code16();
     return low | (static_cast<uint32_t>(read_code16()) << 16U);
 }

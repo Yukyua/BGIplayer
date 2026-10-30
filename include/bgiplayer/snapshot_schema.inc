@@ -437,14 +437,18 @@ static void transfer(bgiplayer::MediaSourceRequest& dst, bgiplayer::MediaSourceR
     move_value(dst.encoding, src.encoding);
 }
 template<class A> static void fields(A& a, bgiplayer::Memory& v) {
+    v.materialize_code();
     a(v.code_);
+    v.root_code_view_=v.code_;
     a(v.active_code_base_);
     a(v.frame_);
     a(v.local_frame_);
     a(v.heap_allocations_);
 }
 static void transfer(bgiplayer::Memory& dst, bgiplayer::Memory& src) {
+    dst.active_code_={}; dst.code_fallbacks_.clear();
     move_value(dst.code_, src.code_);
+    dst.root_code_view_=dst.code_;
     move_value(dst.active_code_base_, src.active_code_base_);
     move_value(dst.frame_, src.frame_);
     move_value(dst.local_frame_, src.local_frame_);

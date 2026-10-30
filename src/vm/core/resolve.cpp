@@ -49,7 +49,7 @@ Memory::Location Memory::resolve(uint32_t address, uint32_t /*base*/,
                     index};
             }
         }
-        check(absolute, code_.size());
+        check(absolute, code().size());
         return {Space::Code, absolute};
     }
     if (address_space == 2U) {
