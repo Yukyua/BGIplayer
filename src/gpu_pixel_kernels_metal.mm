@@ -1,4 +1,5 @@
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/gpu_bg_decode.hpp"
 #include "bgiplayer/debug.hpp"
 #include "bgiplayer/sprite_scaled_alpha.hpp"
 #include "bgiplayer/sprite_crossfade.hpp"
@@ -488,10 +489,13 @@ std::shared_ptr<MetalPixelStorage> metal_storage(const std::shared_ptr<GpuPixelS
 struct GpuPixelKernels::Impl {
     id<MTLDevice> device=nil;
     id<MTLCommandQueue> queue=nil;
+    id<MTLComputePipelineState> bg_idct=nil,bg_color=nil;
+    bool bg_attempted=false;
     id<MTLComputePipelineState> pipeline=nil,crossfade_pipeline=nil,affine_pipeline=nil,mask_pipeline=nil,layer_pipeline=nil,transfer_pipeline=nil;
     id<MTLComputePipelineState> blur_horizontal=nil,blur_vertical=nil,blur_horizontal_pixels=nil,blur_vertical_pixels=nil,displacement_pipeline=nil,vector_pipeline=nil,transform_pipeline=nil,temporal_pipeline=nil,temporal_retain_pipeline=nil;
     id<MTLBuffer> destination=nil,source=nil,second=nil,auxiliary=nil;
     ~Impl() {
+        [bg_idct release];[bg_color release];
         [blur_horizontal release];[blur_vertical release];[displacement_pipeline release];[vector_pipeline release];[transform_pipeline release];[temporal_pipeline release];[temporal_retain_pipeline release];[auxiliary release];
         [blur_horizontal_pixels release];[blur_vertical_pixels release];
         [source release];[second release];[destination release];[pipeline release];[crossfade_pipeline release];[affine_pipeline release];[mask_pipeline release];[layer_pipeline release];[transfer_pipeline release];[queue release];[device release];
@@ -554,6 +558,95 @@ GpuPixelKernels::GpuPixelKernels(bool enabled) : impl_(std::make_unique<Impl>())
         impl_->temporal_retain_pipeline=[impl_->device newComputePipelineStateWithFunction:function error:&error];
         [function release];[library release];
         if(impl_->pipeline && impl_->crossfade_pipeline)impl_->queue=[impl_->device newCommandQueue];
+    }
+}
+bool GpuPixelKernels::background_decode_available() const {
+    return available() && (!impl_->bg_attempted || (impl_->bg_idct && impl_->bg_color));
+}
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::decode_background(const BgDecodePixels& p) {
+    if(!available() || !valid_gpu_bg_decode(p))return {};
+    @autoreleasepool {
+        auto& state=*impl_;
+        if(!state.bg_attempted) {
+            state.bg_attempted=true;
+            std::string shader=R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+#pragma clang fp contract(off)
+#define BG_PRECISE
+#define BG_LANE thread float* x
+#define BG_FLOAT_BITS(v) as_type<float>(v)
+)MSL"+std::string(bg_decode_detail::math_source())+R"MSL(
+kernel void bg_idct(device uint* samples [[buffer(0)]],device const short* coeff [[buffer(1)]],
+ device const float* tables [[buffer(2)]],device atomic_uint* error [[buffer(3)]],
+ constant uint4& shape [[buffer(4)]],threadgroup float* scratch [[threadgroup(0)]],
+ uint local_id [[thread_index_in_threadgroup]],uint2 group [[threadgroup_position_in_grid]]) {
+ uint component=local_id&7u,group_slot=local_id/8u,block=(group.y*shape.z+group.x)*4u+group_slot;
+ uint blocks_x=shape.x,stripes=shape.y;
+#define BG_WORK(i) scratch[group_slot*64u+(i)]
+#define BG_SYNC() threadgroup_barrier(mem_flags::mem_threadgroup)
+#define BG_COEFF(i) int(coeff[i])
+#define BG_TABLE(i) tables[i]
+#define BG_SAMPLE_WORD(i,v) samples[i]=v
+#define BG_ERROR() atomic_fetch_or_explicit(error,1u,memory_order_relaxed)
+)MSL"+std::string(bg_decode_detail::idct_source())+R"MSL(
+}
+kernel void bg_color(device uint* output [[buffer(0)]],device const uint* samples [[buffer(1)]],
+ device const float* tables [[buffer(2)]],device const uchar* alpha [[buffer(3)]],
+ constant uint4& shape [[buffer(4)]],uint2 pos [[thread_position_in_grid]]) {
+ if(alpha[0]!=0u)return;
+ uint x=pos.x,y=pos.y,width=shape.x,height=shape.y,blocks_x=shape.z,has_alpha=shape.w;
+#define BG_SAMPLE(i) int((samples[(i)/4u]>>(((i)%4u)*8u))&255u)
+#define BG_ALPHA(i) uint(alpha[4u+(i)])
+#define BG_OUTPUT(i,v) output[i]=v
+)MSL"+std::string(bg_decode_detail::color_source())+"\n}\n";
+            MTLCompileOptions* options=[MTLCompileOptions new];options.fastMathEnabled=NO;
+            NSError* error=nil;
+            id<MTLLibrary> library=[state.device newLibraryWithSource:[NSString stringWithUTF8String:shader.c_str()] options:options error:&error];
+            [options release];
+            if(library) {
+                id<MTLFunction> function=[library newFunctionWithName:@"bg_idct"];
+                state.bg_idct=[state.device newComputePipelineStateWithFunction:function error:&error];[function release];
+                function=[library newFunctionWithName:@"bg_color"];
+                state.bg_color=[state.device newComputePipelineStateWithFunction:function error:&error];[function release];[library release];
+            }
+            if(!state.bg_idct || !state.bg_color)
+                std::cerr<<"warning: GPU_BG_SHADER_COMPILE_FAILED "<<(error?[[error localizedDescription] UTF8String]:"pipeline unavailable")<<'\n';
+        }
+        if(!state.bg_idct || !state.bg_color)return {};
+        const auto tables=bg_decode_detail::tables(p);
+        const size_t bytes=size_t(p.width)*p.height*4;
+        id<MTLBuffer> coeff=[[state.device newBufferWithBytes:p.coefficients.data() length:p.coefficients.size_bytes() options:MTLResourceStorageModeShared] autorelease];
+        id<MTLBuffer> table=[[state.device newBufferWithBytes:tables.data() length:sizeof(tables) options:MTLResourceStorageModeShared] autorelease];
+        id<MTLBuffer> samples=[[state.device newBufferWithLength:p.coefficients.size()*64 options:MTLResourceStorageModePrivate] autorelease];
+        id<MTLBuffer> alpha=[[state.device newBufferWithLength:4+p.alpha.size() options:MTLResourceStorageModeShared] autorelease];
+        if(alpha) {
+            std::memset(alpha.contents,0,4);
+            if(!p.alpha.empty())std::memcpy(static_cast<uint8_t*>(alpha.contents)+4,p.alpha.data(),p.alpha.size());
+        }
+        id<MTLBuffer> output=[[state.device newBufferWithLength:bytes options:MTLResourceStorageModeShared] autorelease];
+        if(!coeff || !table || !samples || !alpha || !output)return {};
+        id<MTLCommandBuffer> command=[state.queue commandBuffer];if(!command)return {};
+        const uint32_t blocks_x=(p.width+7)/8,stripes=(p.height+7)/8;
+        const size_t groups=(p.coefficients.size()+3)/4;
+        const uint32_t groups_y=static_cast<uint32_t>((groups+65534)/65535);
+        const uint32_t groups_x=static_cast<uint32_t>((groups+groups_y-1)/groups_y);
+        const std::array<uint32_t,4> idct_shape{blocks_x,stripes,groups_x,0};
+        id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];if(!encoder)return {};
+        [encoder setComputePipelineState:state.bg_idct];[encoder setBuffer:samples offset:0 atIndex:0];
+        [encoder setBuffer:coeff offset:0 atIndex:1];[encoder setBuffer:table offset:0 atIndex:2];
+        [encoder setBuffer:alpha offset:0 atIndex:3];[encoder setBytes:idct_shape.data() length:sizeof(idct_shape) atIndex:4];
+        [encoder setThreadgroupMemoryLength:256*sizeof(float) atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(groups_x,groups_y,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];[encoder endEncoding];
+        encoder=[command computeCommandEncoder];if(!encoder)return {};
+        const std::array<uint32_t,4> color_shape{p.width,p.height,blocks_x,p.alpha.empty()?0U:1U};
+        [encoder setComputePipelineState:state.bg_color];[encoder setBuffer:output offset:0 atIndex:0];
+        [encoder setBuffer:samples offset:0 atIndex:1];[encoder setBuffer:table offset:0 atIndex:2];
+        [encoder setBuffer:alpha offset:0 atIndex:3];[encoder setBytes:color_shape.data() length:sizeof(color_shape) atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(p.width,p.height,1) threadsPerThreadgroup:MTLSizeMake(16,8,1)];[encoder endEncoding];
+        [command commit];[command waitUntilCompleted];
+        if(command.status!=MTLCommandBufferStatusCompleted || *static_cast<const uint32_t*>(alpha.contents))return {};
+        return std::make_shared<MetalPixelStorage>(state.device,state.queue,output);
     }
 }
 GpuPixelKernels::~GpuPixelKernels()=default;

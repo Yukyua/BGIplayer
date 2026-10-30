@@ -16,6 +16,9 @@ bool bmv_idct_block(const std::array<int16_t,64>& coefficients,
                     const std::array<float,64>& scaled_quantization,
                     std::array<int16_t,64>& samples);
 
+// Immutable host-built original lookup bytes, shared with the GPU decoder.
+const std::array<float,1024>& bmv_color_table_data();
+
 // Original 004A9180 float lookup tables + 004AB5C0 output conversion.
 // Input samples must be the IDCT's already-clamped 0..255 values.
 bool bmv_ycbcr_to_bgr(int16_t y, int16_t cb, int16_t cr,

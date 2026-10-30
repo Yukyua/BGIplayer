@@ -2,6 +2,7 @@
 #include "bgiplayer/bmv_idct.hpp"
 #include "bgiplayer/validation.hpp"
 #include "bgiplayer/host_resource_jobs.hpp"
+#include "bgiplayer/gpu_bg_decode.hpp"
 
 #include <algorithm>
 #include <array>
@@ -184,7 +185,7 @@ std::vector<uint8_t> decode_alpha(std::span<const uint8_t> encoded,
 }  // namespace
 
 std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
-    std::span<const uint8_t> encoded, std::string* error) {
+    std::span<const uint8_t> encoded, std::string* error, bool allow_resident) {
     try {
         if (encoded.size() < 0x30U ||
             std::string_view(reinterpret_cast<const char*>(encoded.data()), 16) !=
@@ -232,9 +233,12 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
         std::vector<uint32_t> offsets(stripes + (bits_per_pixel == 32U ? 1U : 0U));
         for (auto& offset : offsets) { offset = dword(encoded,cursor); cursor += 4U; }
         CompressedBgV2Decoded result{width,height,bits_per_pixel,bits_per_pixel == 32U ? 2U : 1U,{}};
-        result.pixels.resize(static_cast<std::size_t>(width) * height * bytes_per_pixel);
+        const bool use_gpu=allow_resident && gpu_bg_decode_enabled(uint64_t(width)*height) && host_background_decode_available();
+        if(!use_gpu)result.pixels.resize(static_cast<std::size_t>(width) * height * bytes_per_pixel);
         const std::size_t flags_size = (blocks_x + 7U) / 8U;
         const std::size_t block_count = static_cast<std::size_t>(blocks_x) * 3U;
+        std::vector<std::array<int16_t,64>> resident_coefficients;
+        if(use_gpu)resident_coefficients.resize(block_count*stripes);
         prepare_resource_parts(stripes,static_cast<size_t>(width)*height,[&](size_t stripe_index) {
             const auto stripe=static_cast<uint32_t>(stripe_index);
             const uint64_t start64 = static_cast<uint64_t>(data_base) + offsets[stripe];
@@ -252,7 +256,11 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
             const uint32_t coefficients_count = varint(encoded,position);
             if (coefficients_count != block_count * 64U || position > end64)
                 throw DecodeFailure("v2 coefficient count");
-            std::vector<std::array<int16_t,64>> coefficients(block_count);
+            std::vector<std::array<int16_t,64>> local_coefficients;
+            if(!use_gpu)local_coefficients.resize(block_count);
+            std::span<std::array<int16_t,64>> coefficients=use_gpu
+                ?std::span(resident_coefficients).subspan(stripe_index*block_count,block_count)
+                :std::span(local_coefficients);
             Bits dc{encoded.subspan(position,static_cast<std::size_t>(end64)-position)};
             uint32_t previous_dc = 0;
             for (auto& block : coefficients) {
@@ -273,6 +281,7 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
                     block[zigzag[index++]] = static_cast<int16_t>(ac.magnitude(symbol >> 4U));
                 }
             }
+            if(use_gpu)return;
             std::vector<std::array<int16_t,64>> samples(block_count);
             for (std::size_t block = 0; block < block_count; ++block) {
                 if (!bmv_idct_block(coefficients[block],block < blocks_x ? y_quant : c_quant,samples[block]))
@@ -293,6 +302,19 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
                 }
             }
         });
+        if(use_gpu) {
+            std::vector<uint8_t> alpha;
+            if(bits_per_pixel==32U) {
+                const uint64_t start=uint64_t(data_base)+offsets.back();
+                if(start<cursor || start>encoded.size())throw DecodeFailure("v2 alpha offset bounds");
+                alpha=decode_alpha(encoded.subspan(size_t(start)),blocks_x*8U,stripes*8U);
+            }
+            result.resident_pixels=decode_host_background({width,height,resident_coefficients,y_quant,c_quant,alpha});
+            if(result.resident_pixels)return result;
+            // The original CPU route owns failure precedence as well as pixels.
+            // No partially decoded bitmap has been installed at this point.
+            return decode_compressed_bg_v2(encoded,error,false);
+        }
         if (bits_per_pixel == 32U) {
             const uint64_t alpha_start = static_cast<uint64_t>(data_base) + offsets.back();
             if (alpha_start < cursor || alpha_start > encoded.size())
@@ -307,8 +329,12 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
         }
         return result;
     } catch (const DecodeFailure& failure) {
+        if(allow_resident)return decode_compressed_bg_v2(encoded,error,false);
         if (error) *error = failure.what();
         return std::nullopt;
+    } catch (const std::bad_alloc&) {
+        if(allow_resident)return decode_compressed_bg_v2(encoded,error,false);
+        throw;
     }
 }
 }  // namespace bgiplayer

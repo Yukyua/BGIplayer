@@ -1,4 +1,5 @@
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/gpu_bg_decode.hpp"
 #include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include "bgiplayer/gpu_pixel_cache.hpp"
 #include "bgiplayer/layer_composite.hpp"
@@ -14,6 +15,8 @@
 #if !defined(__APPLE__) && !defined(__ANDROID__)
 namespace bgiplayer {
 struct GpuPixelKernels::Impl {};
+bool GpuPixelKernels::background_decode_available() const {return false;}
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::decode_background(const BgDecodePixels&) {return {};}
 std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_affine(const AffinePixels&,std::shared_ptr<GpuPixelStorage>) { return {}; }
 std::shared_ptr<GpuPixelStorage> GpuPixelKernels::resident_effector_blur(const EffectorBlurPixels&,std::shared_ptr<GpuPixelStorage>) { return {}; }
 std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const uint8_t>) { return {}; }
@@ -116,6 +119,27 @@ NativePixelContext host_native_pixel_context() {
 #else
     return {};
 #endif
+}
+bool host_background_decode_available() {
+    try {return backend(true).background_decode_available();}
+    catch(const std::exception&) {return false;}
+}
+std::shared_ptr<GpuPixelStorage> decode_host_background(const BgDecodePixels& pixels) {
+    if(!gpu_bg_decode_enabled(uint64_t(pixels.width)*pixels.height) || !valid_gpu_bg_decode(pixels))return {};
+    const bool trace=debug_trace(DebugTrace::GpuFrames);
+    const auto start=trace?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    std::shared_ptr<GpuPixelStorage> result;
+    try {result=backend(true).decode_background(pixels);}
+    catch(const std::exception&) {}
+    if(result && result->size()!=uint64_t(pixels.width)*pixels.height*4)result.reset();
+    if(!result) {
+        static thread_local bool warned=false;
+        if(!warned){warned=true;std::cerr<<"warning: GPU_BG_DECODE_FALLBACK GPU transform unavailable or rejected; original CPU decoder selected\n";}
+    }
+    if(trace)std::cerr<<"GPU_BG_DECODE width="<<pixels.width<<" height="<<pixels.height
+        <<" success="<<bool(result)<<" resident_bytes="<<(result?result->size():0)
+        <<" total_ns="<<std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count()<<'\n';
+    return result;
 }
 HostPixelKernelStatistics host_pixel_kernel_statistics() { return state().statistics; }
 PixelKernelResult compose_host_fast_affine(const AffinePixels& p) {

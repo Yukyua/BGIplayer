@@ -2,6 +2,7 @@
 // reference; EGL and packed SSBO words replace Metal's byte-addressed buffers.
 #ifdef __ANDROID__
 #include "bgiplayer/gpu_pixel_kernels.hpp"
+#include "bgiplayer/gpu_bg_decode.hpp"
 #include "bgiplayer/gpu_exact_pixel_ops.hpp"
 #include "bgiplayer/debug.hpp"
 #include "bgiplayer/rcpss_estimate_table.hpp"
@@ -260,8 +261,8 @@ struct RestoreContext {
 int32_t truncate_sse(double value){return value>=-2147483648.0&&value<2147483648.0?static_cast<int32_t>(value):INT32_MIN;}
 }
 struct GlesDevice {
- EGLDisplay display=EGL_NO_DISPLAY;EGLContext context=EGL_NO_CONTEXT;EGLSurface surface=EGL_NO_SURFACE;GLuint program=0,blur_program=0,displacement_program=0,vector_program=0,transform_program=0,temporal_program=0,buffers[5]{};size_t capacities[5]{};std::recursive_mutex mutex;std::string name="CPU";
- ~GlesDevice(){if(context!=EGL_NO_CONTEXT){RestoreContext restore;if(eglMakeCurrent(display,surface,surface,context)){glDeleteBuffers(5,buffers);if(program)glDeleteProgram(program);if(blur_program)glDeleteProgram(blur_program);if(displacement_program)glDeleteProgram(displacement_program);if(vector_program)glDeleteProgram(vector_program);if(transform_program)glDeleteProgram(transform_program);if(temporal_program)glDeleteProgram(temporal_program);}eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);eglDestroyContext(display,context);}if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);/* SDL owns the shared EGLDisplay lifetime. */}
+ EGLDisplay display=EGL_NO_DISPLAY;EGLContext context=EGL_NO_CONTEXT;EGLSurface surface=EGL_NO_SURFACE;GLuint bg_idct=0,bg_color=0;bool bg_attempted=false,bg_capable=false;GLuint program=0,blur_program=0,displacement_program=0,vector_program=0,transform_program=0,temporal_program=0,buffers[5]{};size_t capacities[5]{};std::recursive_mutex mutex;std::string name="CPU";
+ ~GlesDevice(){if(context!=EGL_NO_CONTEXT){RestoreContext restore;if(eglMakeCurrent(display,surface,surface,context)){glDeleteBuffers(5,buffers);if(bg_idct)glDeleteProgram(bg_idct);if(bg_color)glDeleteProgram(bg_color);if(program)glDeleteProgram(program);if(blur_program)glDeleteProgram(blur_program);if(displacement_program)glDeleteProgram(displacement_program);if(vector_program)glDeleteProgram(vector_program);if(transform_program)glDeleteProgram(transform_program);if(temporal_program)glDeleteProgram(temporal_program);}eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);eglDestroyContext(display,context);}if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);/* SDL owns the shared EGLDisplay lifetime. */}
  PixelKernelResult dispatch(std::span<uint8_t> dst,std::span<const uint8_t> src,std::span<const uint8_t> second,std::vector<uint32_t>& args,bool paired=false,bool approximate=false,GLuint resident_source=0,bool separable_blur=false,GLuint special_program=0,std::span<const uint8_t> auxiliary={},std::span<uint8_t> second_output={}){
   std::lock_guard lock(mutex);PixelKernelResult result;const bool timing=debug_enabled();auto start=timing?Clock::now():Clock::time_point{};
   if(!program||(separable_blur&&!blur_program)||dst.empty()||args[1]==0||args[2]==0)return result;
@@ -364,6 +365,7 @@ GpuPixelKernels::GpuPixelKernels(bool enabled):impl_(std::make_unique<Impl>()){
  EGLint contextAttrs[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE},surfaceAttrs[]={EGL_WIDTH,1,EGL_HEIGHT,1,EGL_NONE};impl_->device->surface=eglCreatePbufferSurface(impl_->device->display,config,surfaceAttrs);impl_->device->context=eglCreateContext(impl_->device->display,config,EGL_NO_CONTEXT,contextAttrs);
  if(impl_->device->surface==EGL_NO_SURFACE||impl_->device->context==EGL_NO_CONTEXT||!eglMakeCurrent(impl_->device->display,impl_->device->surface,impl_->device->surface,impl_->device->context))return;
  GLint glMajor=0,glMinor=0;glGetIntegerv(GL_MAJOR_VERSION,&glMajor);glGetIntegerv(GL_MINOR_VERSION,&glMinor);if(glMajor<3||(glMajor==3&&glMinor<1)){std::cerr<<"warning: ANDROID_GPU_UNAVAILABLE OpenGL ES 3.1 compute required; CPU composition selected\n";return;}
+ impl_->device->bg_capable=glMajor>3 || (glMajor==3 && glMinor>=2);
  impl_->device->program=make_compute_program(compute_source,"pixels");
  if(!impl_->device->program)return;
  impl_->device->blur_program=make_compute_program(effector_blur_source,"effector_blur");
@@ -386,6 +388,96 @@ std::shared_ptr<GpuPixelStorage> GpuPixelKernels::store_pixels(std::span<const u
  if(glGetError()!=GL_NO_ERROR){glDeleteBuffers(1,&buffer);return {};}
  // Only driver-owned GPU storage survives this call; no CPU pixel copy.
  return std::make_shared<GlesPixelStorage>(std::move(device),buffer,pixels.size());
+}
+bool GpuPixelKernels::background_decode_available()const {
+ const auto& d=*impl_->device;
+ return available() && d.bg_capable && (!d.bg_attempted || (d.bg_idct && d.bg_color));
+}
+std::shared_ptr<GpuPixelStorage> GpuPixelKernels::decode_background(const BgDecodePixels& p) {
+ if(!background_decode_available() || !valid_gpu_bg_decode(p))return {};
+ auto device=impl_->device;std::lock_guard lock(device->mutex);RestoreContext restore;
+ if(!eglMakeCurrent(device->display,device->surface,device->surface,device->context))return {};
+ for(unsigned n=0;n<16 && glGetError()!=GL_NO_ERROR;++n){}
+ if(!device->bg_attempted) {
+  device->bg_attempted=true;
+  std::string idct=R"GLSL(#version 320 es
+precision highp float;precision highp int;
+layout(local_size_x=32) in;
+shared float scratch[256];
+layout(std430,binding=0) writeonly buffer Samples {uint samples[];};
+layout(std430,binding=1) readonly buffer Coefficients {uint coeff[];};
+layout(std430,binding=2) readonly buffer Tables {float tables[];};
+layout(std430,binding=3) buffer ErrorAlpha {uint error_alpha[];};
+layout(location=0) uniform uvec3 shape;
+#define BG_PRECISE precise
+#define BG_LANE inout float x[8]
+#define BG_FLOAT_BITS(v) uintBitsToFloat(v)
+int coefficient(uint i){uint value=coeff[i>>1u]>>((i&1u)*16u);return int(value<<16u)>>16;}
+#define BG_COEFF(i) coefficient(i)
+#define BG_TABLE(i) tables[i]
+#define BG_SAMPLE_WORD(i,v) samples[i]=v
+#define BG_ERROR() atomicOr(error_alpha[0],1u)
+#define BG_WORK(i) scratch[group_slot*64u+(i)]
+#define BG_SYNC() barrier()
+)GLSL"+std::string(bg_decode_detail::math_source())+R"GLSL(
+void main(){uint component=gl_LocalInvocationID.x&7u,group_slot=gl_LocalInvocationID.x/8u;
+uint block=(gl_WorkGroupID.y*shape.z+gl_WorkGroupID.x)*4u+group_slot,blocks_x=shape.x,stripes=shape.y;
+)GLSL"+std::string(bg_decode_detail::idct_source())+"\n}\n";
+  std::string color=R"GLSL(#version 320 es
+precision highp float;precision highp int;
+layout(local_size_x=16,local_size_y=8) in;
+layout(std430,binding=0) writeonly buffer Output {uint output_pixels[];};
+layout(std430,binding=1) readonly buffer Samples {uint samples[];};
+layout(std430,binding=2) readonly buffer Tables {float tables[];};
+layout(std430,binding=3) readonly buffer ErrorAlpha {uint error_alpha[];};
+layout(location=0) uniform uvec4 shape;
+#define BG_PRECISE precise
+#define BG_TABLE(i) tables[i]
+#define BG_SAMPLE(i) int((samples[(i)/4u]>>(((i)%4u)*8u))&255u)
+#define BG_ALPHA(i) ((error_alpha[1u+(i)/4u]>>(((i)&3u)*8u))&255u)
+#define BG_OUTPUT(i,v) output_pixels[i]=v
+void main(){if(error_alpha[0]!=0u)return;
+uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y,width=shape.x,height=shape.y,blocks_x=shape.z,has_alpha=shape.w;
+)GLSL"+std::string(bg_decode_detail::color_source())+"\n}\n";
+  device->bg_idct=make_compute_program(idct.c_str(),"bg_idct");
+  device->bg_color=make_compute_program(color.c_str(),"bg_color");
+ }
+ if(!device->bg_idct || !device->bg_color)return {};
+ const size_t bytes=size_t(p.width)*p.height*4,sample_bytes=p.coefficients.size()*64;
+ GLint64 maximum=0;glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE,&maximum);
+ for(size_t size:{bytes,sample_bytes,p.coefficients.size_bytes(),4+p.alpha.size()})
+  if(size>uint64_t(maximum))return {};
+ struct Buffers {GLuint values[5]{};~Buffers(){glDeleteBuffers(5,values);}} buffers;
+ glGenBuffers(5,buffers.values);
+ const auto allocate=[&](unsigned slot,size_t size,const void* data) {
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers.values[slot]);
+  glBufferData(GL_SHADER_STORAGE_BUFFER,static_cast<GLsizeiptr>(size),data,GL_STATIC_DRAW);
+ };
+ const auto tables=bg_decode_detail::tables(p);
+ allocate(0,sample_bytes,nullptr);allocate(1,p.coefficients.size_bytes(),p.coefficients.data());
+ allocate(2,sizeof(tables),tables.data());allocate(3,4+p.alpha.size(),nullptr);
+ const uint32_t zero=0;glBufferSubData(GL_SHADER_STORAGE_BUFFER,0,4,&zero);
+ if(!p.alpha.empty())glBufferSubData(GL_SHADER_STORAGE_BUFFER,4,static_cast<GLsizeiptr>(p.alpha.size()),p.alpha.data());
+ allocate(4,bytes,nullptr);if(glGetError()!=GL_NO_ERROR)return {};
+ for(GLuint n=0;n<4;++n)glBindBufferBase(GL_SHADER_STORAGE_BUFFER,n,buffers.values[n]);
+ const size_t groups=(p.coefficients.size()+3)/4;
+ const auto groups_y=static_cast<GLuint>((groups+65534)/65535);
+ const auto groups_x=static_cast<GLuint>((groups+groups_y-1)/groups_y);
+ glUseProgram(device->bg_idct);glUniform3ui(0,(p.width+7)/8,(p.height+7)/8,groups_x);
+ glDispatchCompute(groups_x,groups_y,1);
+ glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+ glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,buffers.values[4]);glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,buffers.values[0]);
+ glUseProgram(device->bg_color);glUniform4ui(0,p.width,p.height,(p.width+7)/8,p.alpha.empty()?0u:1u);
+ glDispatchCompute((p.width+15)/16,(p.height+7)/8,1);
+ glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT|GL_SHADER_STORAGE_BARRIER_BIT);
+ GLsync fence=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);if(!fence)return {};
+ const GLenum status=glClientWaitSync(fence,GL_SYNC_FLUSH_COMMANDS_BIT,1000000000ULL);glDeleteSync(fence);
+ if((status!=GL_ALREADY_SIGNALED && status!=GL_CONDITION_SATISFIED) || glGetError()!=GL_NO_ERROR)return {};
+ glBindBuffer(GL_COPY_READ_BUFFER,buffers.values[3]);
+ const void* mapped=glMapBufferRange(GL_COPY_READ_BUFFER,0,4,GL_MAP_READ_BIT);if(!mapped)return {};
+ uint32_t error;std::memcpy(&error,mapped,4);
+ if(glUnmapBuffer(GL_COPY_READ_BUFFER)!=GL_TRUE || glGetError()!=GL_NO_ERROR || error)return {};
+ auto output=std::make_shared<GlesPixelStorage>(device,buffers.values[4],bytes);buffers.values[4]=0;return output;
 }
 GpuPixelKernels::~GpuPixelKernels()=default;
 bool GpuPixelKernels::available()const{return impl_->device->program!=0;}

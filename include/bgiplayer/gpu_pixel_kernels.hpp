@@ -11,6 +11,7 @@
 
 namespace bgiplayer {
 struct NativePixelContext;
+struct BgDecodePixels;
 struct ScaledAlphaPixels {
     std::span<uint8_t> destination;
     uint32_t destination_width, destination_height, destination_stride;
@@ -116,6 +117,8 @@ public:
 #if defined(__ANDROID__)
     NativePixelContext native_context() const;
 #endif
+    bool background_decode_available() const;
+    std::shared_ptr<GpuPixelStorage> decode_background(const BgDecodePixels& pixels);
     PixelKernelResult scaled_alpha(const ScaledAlphaPixels& pixels);
     PixelKernelResult crossfade(const CrossfadePixels& pixels);
     PixelKernelResult affine(const AffinePixels& pixels);

@@ -5456,10 +5456,11 @@ public:
         uint32_t bits_per_pixel = 0;
         uint32_t format = 0;
         std::vector<uint8_t> pixels;
+        std::shared_ptr<GpuPixelStorage> resident_pixels{};
     };
     static std::optional<CompressedBgDecoded> decode_compressed_bg(
         std::span<const uint8_t> encoded,
-        std::string* error = nullptr, std::string_view resource = {}) {
+        std::string* error = nullptr, std::string_view resource = {}, bool allow_resident = false) {
         std::string local_error;
         if (error == nullptr) error = &local_error;
         const auto fail =
@@ -5510,10 +5511,10 @@ public:
         const uint32_t bits = word(0x14);
         const uint32_t format = word(0x18);
         if (word(0x2E) == 2U) {
-            auto decoded = decode_compressed_bg_v2(encoded, error);
+            auto decoded = decode_compressed_bg_v2(encoded, error, allow_resident);
             if (!decoded) return fail(*error);
             return CompressedBgDecoded{decoded->width, decoded->height,
-                decoded->bits_per_pixel, decoded->format, std::move(decoded->pixels)};
+                decoded->bits_per_pixel, decoded->format, std::move(decoded->pixels), std::move(decoded->resident_pixels)};
         }
         const uint32_t rle_size = dword(0x20);
         const uint32_t frequency_size = dword(0x28);
@@ -6469,7 +6470,7 @@ public:
         if (std::string_view(
                 reinterpret_cast<const char*>(bytes->data()), 15U).starts_with(
             "CompressedBG_")) {
-            const auto decoded = decode_compressed_bg(*bytes);
+            const auto decoded = decode_compressed_bg(*bytes,nullptr,{},true);
             if (!decoded || decoded->width == 0 ||
                 decoded->height == 0 ||
                 (decoded->bits_per_pixel != 8U &&
@@ -6491,7 +6492,9 @@ public:
             // PE64 140042BD0 maps the decoded selector7 to manager
             // format1; 1400429C0/140041790 copy its already padded BGRX.
             // The decoder result itself must retain selector7.
-            if (compact_64_opcodes_ && decoded->format == 7U) {
+            if(decoded->resident_pixels) {
+                surface.pixels.replace_gpu_storage(std::move(decoded->resident_pixels));
+            } else if (compact_64_opcodes_ && decoded->format == 7U) {
                 surface.format = 1U;
                 surface.pixels = decoded->pixels;
             } else {
@@ -6617,7 +6620,7 @@ public:
         };
         if (compressed) {
             std::string decode_error;
-            auto decoded = decode_compressed_bg(data, &decode_error, archive + ":" + resource);
+            auto decoded = decode_compressed_bg(data, &decode_error, archive + ":" + resource, true);
             if (!decoded || decoded->width == 0 ||
                 decoded->height == 0 ||
                 (decoded->bits_per_pixel != 8U &&
@@ -6641,7 +6644,9 @@ public:
             // PE64 140042BD0 maps the decoded selector7 to manager
             // format1; 1400429C0/140041790 copy its already padded BGRX.
             // The decoder result itself must retain selector7.
-            if (compact_64_opcodes_ && decoded->format == 7U) {
+            if(decoded->resident_pixels) {
+                surface.pixels.replace_gpu_storage(std::move(decoded->resident_pixels));
+            } else if (compact_64_opcodes_ && decoded->format == 7U) {
                 surface.format = 1U;
                 surface.pixels = std::move(decoded->pixels);
             } else if (surface.format != 1U && decoded->pixels.size() ==

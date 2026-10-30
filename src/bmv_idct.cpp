@@ -124,6 +124,19 @@ bool bmv_idct_block(const std::array<int16_t,64>& coefficients,
     return true;
 }
 
+const std::array<float,1024>& bmv_color_table_data() {
+    static const auto data=[] {
+        const ColorTables original;
+        std::array<float,1024> output;
+        std::copy(original.red_cr.begin(),original.red_cr.end(),output.begin());
+        std::copy(original.green_cb.begin(),original.green_cb.end(),output.begin()+256);
+        std::copy(original.green_cr.begin(),original.green_cr.end(),output.begin()+512);
+        std::copy(original.blue_cb.begin(),original.blue_cb.end(),output.begin()+768);
+        return output;
+    }();
+    return data;
+}
+
 bool bmv_ycbcr_to_bgr(int16_t y, int16_t cb, int16_t cr,
                       std::array<uint8_t,3>& bgr) {
     if (y<0 || y>255 || cb<0 || cb>255 || cr<0 || cr>255) return false;
