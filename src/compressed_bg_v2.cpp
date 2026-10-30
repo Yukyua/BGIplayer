@@ -41,6 +41,19 @@ struct Huffman {
     std::vector<Node> nodes;
     uint32_t alphabet = 0;
     int root = -1;
+    struct Prefix { int16_t node; uint8_t bits; };
+    static constexpr uint32_t prefix_bits=9;
+    std::array<Prefix,1U<<prefix_bits> prefixes{};
+    void prepare_prefixes() {
+        for(uint32_t prefix=0;prefix<prefixes.size();++prefix) {
+            int node=root;uint8_t depth=0;
+            while(node>=static_cast<int>(alphabet) && depth<prefix_bits) {
+                node=nodes[static_cast<size_t>(node)].child[(prefix>>(prefix_bits-1U-depth))&1U];
+                ++depth;
+            }
+            prefixes[prefix]={static_cast<int16_t>(node),depth};
+        }
+    }
     explicit Huffman(std::span<const uint32_t> frequencies)
         : nodes(frequencies.size() * 2U - 1U),
           alphabet(static_cast<uint32_t>(frequencies.size())) {
@@ -72,7 +85,7 @@ struct Huffman {
             }
             nodes[next].active = true;
             nodes[next].weight = sum;
-            if (sum >= total) { root = static_cast<int>(next); return; }
+            if (sum >= total) { root = static_cast<int>(next); prepare_prefixes(); return; }
         }
         throw DecodeFailure("v2 Huffman tree");
     }
@@ -80,18 +93,28 @@ struct Huffman {
 struct Bits {
     std::span<const uint8_t> bytes;
     std::size_t position = 0;
+    uint32_t peek(uint32_t count) const {
+        if(count==0)return 0;
+        const uint32_t width=static_cast<uint32_t>(position&7U)+count;
+        const uint32_t byte_count=(width+7U)/8U;
+        const size_t start=position/8U;
+        uint32_t value=bytes[start];
+        for(uint32_t byte=1;byte<byte_count;++byte)value=(value<<8U)|bytes[start+byte];
+        return (value>>(byte_count*8U-width))&((1U<<count)-1U);
+    }
     uint32_t read(uint32_t count) {
         if (count > 16U || position + count > bytes.size() * 8U)
             throw DecodeFailure("v2 bitstream bounds");
-        uint32_t value = 0;
-        for (uint32_t bit = 0; bit < count; ++bit, ++position)
-            value = (value << 1U) |
-                ((static_cast<uint32_t>(bytes[position / 8U]) >>
-                  (7U - (position & 7U))) & 1U);
+        const uint32_t value=peek(count);
+        position+=count;
         return value;
     }
     uint32_t symbol(const Huffman& tree) {
         int node = tree.root;
+        if(bytes.size()*8U-position>=Huffman::prefix_bits) {
+            const auto prefix=tree.prefixes[peek(Huffman::prefix_bits)];
+            node=prefix.node;position+=prefix.bits;
+        }
         while (node >= static_cast<int>(tree.alphabet))
             node = tree.nodes[static_cast<std::size_t>(node)].child[read(1)];
         if (node < 0) throw DecodeFailure("v2 missing Huffman branch");
@@ -238,7 +261,17 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
         const std::size_t flags_size = (blocks_x + 7U) / 8U;
         const std::size_t block_count = static_cast<std::size_t>(blocks_x) * 3U;
         std::vector<std::array<int16_t,64>> resident_coefficients;
-        if(use_gpu)resident_coefficients.resize(block_count*stripes);
+        std::shared_ptr<BgCoefficientWorkspace> workspace;
+        std::span<std::array<int16_t,64>> resident;
+        if(use_gpu) {
+            workspace=allocate_host_background_coefficients(block_count*stripes);
+            if(workspace && workspace->coefficients.size()==block_count*stripes)
+                resident=workspace->coefficients;
+            else {
+                workspace.reset();resident_coefficients.resize(block_count*stripes);
+                resident=resident_coefficients;
+            }
+        }
         prepare_resource_parts(stripes,static_cast<size_t>(width)*height,[&](size_t stripe_index) {
             const auto stripe=static_cast<uint32_t>(stripe_index);
             const uint64_t start64 = static_cast<uint64_t>(data_base) + offsets[stripe];
@@ -259,7 +292,7 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
             std::vector<std::array<int16_t,64>> local_coefficients;
             if(!use_gpu)local_coefficients.resize(block_count);
             std::span<std::array<int16_t,64>> coefficients=use_gpu
-                ?std::span(resident_coefficients).subspan(stripe_index*block_count,block_count)
+                ?resident.subspan(stripe_index*block_count,block_count)
                 :std::span(local_coefficients);
             Bits dc{encoded.subspan(position,static_cast<std::size_t>(end64)-position)};
             uint32_t previous_dc = 0;
@@ -309,7 +342,7 @@ std::optional<CompressedBgV2Decoded> decode_compressed_bg_v2(
                 if(start<cursor || start>encoded.size())throw DecodeFailure("v2 alpha offset bounds");
                 alpha=decode_alpha(encoded.subspan(size_t(start)),blocks_x*8U,stripes*8U);
             }
-            result.resident_pixels=decode_host_background({width,height,resident_coefficients,y_quant,c_quant,alpha});
+            result.resident_pixels=decode_host_background({width,height,resident,y_quant,c_quant,alpha,workspace});
             if(result.resident_pixels)return result;
             // The original CPU route owns failure precedence as well as pixels.
             // No partially decoded bitmap has been installed at this point.

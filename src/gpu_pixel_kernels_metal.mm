@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <iostream>
+#include <sstream>
 
 namespace bgiplayer {
 namespace {
@@ -430,6 +431,16 @@ kernel void layer_composite(device uchar* dst [[buffer(0)]], device const uchar*
 )MSL";
 }
 namespace {
+class MetalBgCoefficientWorkspace final:public BgCoefficientWorkspace {
+public:
+    id<MTLBuffer> buffer;
+    explicit MetalBgCoefficientWorkspace(id<MTLBuffer> value,size_t blocks):buffer([value retain]) {
+        auto* data=static_cast<std::array<int16_t,64>*>(buffer.contents);
+        std::uninitialized_value_construct_n(data,blocks);
+        coefficients={data,blocks};
+    }
+    ~MetalBgCoefficientWorkspace() override {[buffer release];}
+};
 class MetalPixelStorage final : public GpuPixelStorage {
 public:
     id<MTLDevice> device;id<MTLCommandQueue> queue;id<MTLBuffer> buffer;
@@ -471,6 +482,20 @@ public:
         }
     }
 };
+}
+std::shared_ptr<BgCoefficientWorkspace> allocate_host_background_coefficients(size_t blocks) {
+    if(!blocks || blocks>SIZE_MAX/sizeof(std::array<int16_t,64>))return {};
+    try {
+        @autoreleasepool {
+            id<MTLDevice> device=MTLCreateSystemDefaultDevice();
+            id<MTLBuffer> buffer=nil;
+            if(device.hasUnifiedMemory)
+                buffer=[[device newBufferWithLength:blocks*sizeof(std::array<int16_t,64>)
+                    options:MTLResourceStorageModeShared] autorelease];
+            [device release];
+            return buffer?std::make_shared<MetalBgCoefficientWorkspace>(buffer,blocks):nullptr;
+        }
+    } catch(const std::exception&) {return {};}
 }
 namespace {
 std::shared_ptr<MetalPixelStorage> metal_storage(const std::shared_ptr<GpuPixelStorage>& value,bool allow_concrete=true) {
@@ -567,6 +592,8 @@ std::shared_ptr<GpuPixelStorage> GpuPixelKernels::decode_background(const BgDeco
     if(!available() || !valid_gpu_bg_decode(p))return {};
     @autoreleasepool {
         auto& state=*impl_;
+        const bool timing=debug_trace(DebugTrace::GpuFrames);
+        const auto start=timing?Clock::now():Clock::time_point{};
         if(!state.bg_attempted) {
             state.bg_attempted=true;
             std::string shader=R"MSL(
@@ -589,6 +616,7 @@ kernel void bg_idct(device uint* samples [[buffer(0)]],device const short* coeff
 #define BG_TABLE(i) tables[i]
 #define BG_SAMPLE_WORD(i,v) samples[i]=v
 #define BG_ERROR() atomic_fetch_or_explicit(error,1u,memory_order_relaxed)
+#define BG_QUAD_ALL(v) ((uint(v)&simd_shuffle_xor(uint(v),1u)&simd_shuffle_xor(uint(v),2u)&simd_shuffle_xor(uint(v),3u))!=0u)
 )MSL"+std::string(bg_decode_detail::idct_source())+R"MSL(
 }
 kernel void bg_color(device uint* output [[buffer(0)]],device const uint* samples [[buffer(1)]],
@@ -616,7 +644,14 @@ kernel void bg_color(device uint* output [[buffer(0)]],device const uint* sample
         if(!state.bg_idct || !state.bg_color)return {};
         const auto tables=bg_decode_detail::tables(p);
         const size_t bytes=size_t(p.width)*p.height*4;
-        id<MTLBuffer> coeff=[[state.device newBufferWithBytes:p.coefficients.data() length:p.coefficients.size_bytes() options:MTLResourceStorageModeShared] autorelease];
+        const auto workspace=std::dynamic_pointer_cast<MetalBgCoefficientWorkspace>(p.workspace);
+        const bool direct=workspace && workspace->buffer.device==state.device &&
+            workspace->buffer.contents==p.coefficients.data() &&
+            workspace->coefficients.data()==p.coefficients.data() &&
+            workspace->coefficients.size()==p.coefficients.size() &&
+            workspace->buffer.length==p.coefficients.size_bytes();
+        id<MTLBuffer> coeff=direct?workspace->buffer:
+            [[state.device newBufferWithBytes:p.coefficients.data() length:p.coefficients.size_bytes() options:MTLResourceStorageModeShared] autorelease];
         id<MTLBuffer> table=[[state.device newBufferWithBytes:tables.data() length:sizeof(tables) options:MTLResourceStorageModeShared] autorelease];
         id<MTLBuffer> samples=[[state.device newBufferWithLength:p.coefficients.size()*64 options:MTLResourceStorageModePrivate] autorelease];
         id<MTLBuffer> alpha=[[state.device newBufferWithLength:4+p.alpha.size() options:MTLResourceStorageModeShared] autorelease];
@@ -626,6 +661,7 @@ kernel void bg_color(device uint* output [[buffer(0)]],device const uint* sample
         }
         id<MTLBuffer> output=[[state.device newBufferWithLength:bytes options:MTLResourceStorageModeShared] autorelease];
         if(!coeff || !table || !samples || !alpha || !output)return {};
+        const auto prepared=timing?Clock::now():Clock::time_point{};
         id<MTLCommandBuffer> command=[state.queue commandBuffer];if(!command)return {};
         const uint32_t blocks_x=(p.width+7)/8,stripes=(p.height+7)/8;
         const size_t groups=(p.coefficients.size()+3)/4;
@@ -644,8 +680,19 @@ kernel void bg_color(device uint* output [[buffer(0)]],device const uint* sample
         [encoder setBuffer:samples offset:0 atIndex:1];[encoder setBuffer:table offset:0 atIndex:2];
         [encoder setBuffer:alpha offset:0 atIndex:3];[encoder setBytes:color_shape.data() length:sizeof(color_shape) atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(p.width,p.height,1) threadsPerThreadgroup:MTLSizeMake(16,8,1)];[encoder endEncoding];
+        const auto encoded=timing?Clock::now():Clock::time_point{};
         [command commit];[command waitUntilCompleted];
         if(command.status!=MTLCommandBufferStatusCompleted || *static_cast<const uint32_t*>(alpha.contents))return {};
+        if(timing) {
+            const auto ns=[](auto a,auto b){return std::chrono::duration_cast<std::chrono::nanoseconds>(b-a).count();};
+            const auto gpu_time=command.GPUEndTime-command.GPUStartTime;
+            std::ostringstream line;
+            line<<"GPU_BG_PREPARE backend=metal width="<<p.width<<" height="<<p.height
+                <<" direct_coefficients="<<direct<<" coefficient_bytes="<<p.coefficients.size_bytes()
+                <<" prepare_ns="<<ns(start,prepared)<<" encode_ns="<<ns(prepared,encoded)
+                <<" wait_ns="<<ns(encoded,Clock::now())<<" gpu_ns="<<static_cast<uint64_t>(std::max(0.0,gpu_time)*1e9)<<'\n';
+            std::cerr<<line.str();
+        }
         return std::make_shared<MetalPixelStorage>(state.device,state.queue,output);
     }
 }

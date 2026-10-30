@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 namespace bgiplayer {
+#if !defined(__APPLE__)
+std::shared_ptr<BgCoefficientWorkspace> allocate_host_background_coefficients(size_t) {return {};}
+#endif
 bool gpu_bg_decode_enabled(uint64_t pixels) {
     const char* enabled=std::getenv("BGI_GPU_DECODE");
     const char* gpu=std::getenv("BGI_GPU");

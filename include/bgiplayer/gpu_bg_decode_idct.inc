@@ -2,17 +2,27 @@ R"BGI(
 uint total_blocks=blocks_x*stripes*3u;
 if(block<total_blocks) {
     uint base=block*64u,q=(block%(blocks_x*3u))<blocks_x?0u:64u;
+    BG_PRECISE float column[8];
+#ifdef BG_QUAD_ALL
+    bool column_zero=true;
+    for(uint row=0u;row<8u;++row) {
+        int value=BG_COEFF(base+row*8u+component);
+        column[row]=float(value)*BG_TABLE(q+row*8u+component);
+        if(row!=0u)column_zero=column_zero && value==0;
+    }
+    bool zero_ac=BG_QUAD_ALL(column_zero);
+#else
     bool zero_ac=true;
     uint first=component&~3u;
     for(uint row=1u;row<8u;++row)for(uint col=first;col<first+4u;++col)
         zero_ac=zero_ac && BG_COEFF(base+row*8u+col)==0;
-    BG_PRECISE float column[8];
     for(uint row=0u;row<8u;++row)column[row]=float(BG_COEFF(base+row*8u+component))*BG_TABLE(q+row*8u+component);
+#endif
     if(zero_ac)for(uint row=1u;row<8u;++row)column[row]=column[0];
     else bgi_inverse(column);
     for(uint row=0u;row<8u;++row)BG_WORK(row*8u+component)=column[row];
 }
-// Four independent blocks share one 32-thread group. Invalid tail blocks
+// Independent eight-thread blocks share a work group. Invalid tail blocks
 // still participate in the transpose barrier, then leave without reading.
 BG_SYNC();
 if(block>=total_blocks)return;
